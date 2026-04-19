@@ -1,0 +1,33 @@
+# Secrets
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Node (if you add any bundling later)
+node_modules/
+
+# IDEs
+.vscode/
+.idea/
+.DS_Store
+
+# Local preview artefacts
+preview_*.png
+craig_preview.png
+
+# Playwright
+.cache/
+.claude/

@@ -1,0 +1,213 @@
+{
+  "business_cards": {
+    "name": "Business Cards",
+    "description": "Single or double-sided. 400gsm silk.",
+    "sizes": [
+      "85x55mm",
+      "90x50mm"
+    ],
+    "finishes": [
+      "gloss",
+      "matte",
+      "soft-touch"
+    ],
+    "price_per": "100 cards",
+    "double_sided_surcharge": false,
+    "prices": {
+      "100": 30.0,
+      "250": 60.0,
+      "500": 38.0,
+      "1000": 30.0,
+      "2500": 24.0
+    },
+    "notes": "Double-sided no extra charge. Soft-touch +25%."
+  },
+  "flyers_a6": {
+    "name": "Flyers \u2014 A6",
+    "description": "170gsm Gloss or matte finish. 148x105mm.",
+    "sizes": [
+      "A6 (148x105mm)"
+    ],
+    "finishes": [
+      "gloss",
+      "matte"
+    ],
+    "price_per": "100 flyers",
+    "double_sided_surcharge": true,
+    "prices": {
+      "100": 35.0,
+      "250": 25.0,
+      "500": 17.0,
+      "1000": 13.0,
+      "2500": 10.0
+    },
+    "notes": "Double-sided add 20%. Good for inserts and handouts."
+  },
+  "flyers_a5": {
+    "name": "Flyers \u2014 A5",
+    "description": "170gsm Gloss or matte finish. 210x148mm.",
+    "sizes": [
+      "A5 (210x148mm)"
+    ],
+    "finishes": [
+      "gloss",
+      "matte"
+    ],
+    "price_per": "100 flyers",
+    "double_sided_surcharge": true,
+    "prices": {
+      "100": 45.0,
+      "250": 30.0,
+      "500": 22.0,
+      "1000": 14.5,
+      "2500": 10.0
+    },
+    "notes": "Double-sided add 20%. Most popular flyer size."
+  },
+  "flyers_a4": {
+    "name": "Flyers \u2014 A4",
+    "description": "170gsm Gloss or matte finish. 297x210mm.",
+    "sizes": [
+      "A4 (297x210mm)"
+    ],
+    "finishes": [
+      "gloss",
+      "matte"
+    ],
+    "price_per": "100 flyers",
+    "double_sided_surcharge": true,
+    "prices": {
+      "100": 55.0,
+      "250": 45.0,
+      "500": 36.0,
+      "1000": 22.0,
+      "2500": 21.0
+    },
+    "notes": "Double-sided add 20%. Confirm with supplier for larger runs."
+  },
+  "flyers_dl": {
+    "name": "Flyers \u2014 DL",
+    "description": "170gsm Gloss or matte finish. 210x99mm.",
+    "sizes": [
+      "DL (210x99mm)"
+    ],
+    "finishes": [
+      "gloss",
+      "matte"
+    ],
+    "price_per": "100 flyers",
+    "double_sided_surcharge": true,
+    "prices": {
+      "100": 37.5,
+      "250": 27.0,
+      "500": 19.0,
+      "1000": 13.0,
+      "2500": 12.0
+    },
+    "notes": "Double-sided add 20%. Fits standard DL envelope."
+  },
+  "brochures_a4": {
+    "name": "Brochures \u2014 A4 (folds to A5/DL)",
+    "description": "170gsm Bi-fold or tri-fold, includes folding. 297x210mm flat.",
+    "sizes": [
+      "A4 folded"
+    ],
+    "finishes": [
+      "gloss",
+      "matte"
+    ],
+    "price_per": "100 brochures",
+    "double_sided_surcharge": true,
+    "prices": {
+      "100": 95.0,
+      "250": 95.0,
+      "500": 78.0,
+      "1000": 26.0,
+      "2500": 48.0
+    },
+    "notes": "Min qty 100. Tri-fold same price. Z-fold POA."
+  },
+  "compliment_slips": {
+    "name": "Compliment Slips",
+    "description": "Single-sided. Standard 120gsm uncoated.",
+    "sizes": [
+      "DL (210x99mm)",
+      "A5"
+    ],
+    "finishes": [
+      "uncoated"
+    ],
+    "price_per": "100 slips",
+    "double_sided_surcharge": true,
+    "prices": {
+      "100": 35.0,
+      "250": 32.0,
+      "500": 22.0,
+      "1000": 12.0,
+      "2500": 9.0
+    },
+    "notes": "Min qty 100. Double-sided add 20%."
+  },
+  "letterheads": {
+    "name": "Letterheads",
+    "description": "Single-sided. 120gsm uncoated bond.",
+    "sizes": [
+      "A4"
+    ],
+    "finishes": [
+      "uncoated"
+    ],
+    "price_per": "100 letterheads",
+    "double_sided_surcharge": true,
+    "prices": {
+      "100": 95.0,
+      "250": 55.0,
+      "500": 44.0,
+      "1000": 12.0,
+      "2500": 26.0
+    },
+    "notes": "Min qty 100. Double-sided add 20%."
+  },
+  "ncr_pads_a5": {
+    "name": "NCR Pads \u2014 A5",
+    "description": "Duplicate - perforated & stitched - 50 sets per book. A5 size.",
+    "sizes": [
+      "A5"
+    ],
+    "finishes": [
+      "duplicate",
+      "triplicate"
+    ],
+    "price_per": "5 pads",
+    "double_sided_surcharge": false,
+    "prices": {
+      "5": 130.0,
+      "10": 90.0,
+      "20": 70.0,
+      "30": 60.0,
+      "50": 50.0
+    },
+    "notes": "Standard one side. Black & sequential numbering. Triplicate add 10%."
+  },
+  "ncr_pads_a4": {
+    "name": "NCR Pads \u2014 A4",
+    "description": "Duplicate - perforated & stitched - 50 sets per book. A4 size.",
+    "sizes": [
+      "A4"
+    ],
+    "finishes": [
+      "duplicate",
+      "triplicate"
+    ],
+    "price_per": "5 pads",
+    "double_sided_surcharge": false,
+    "prices": {
+      "5": 160.0,
+      "10": 110.0,
+      "20": 85.0,
+      "30": 75.0,
+      "50": 60.0
+    },
+    "notes": "Standard one side. Black & sequential numbering. Triplicate add 10%."
+  }
+}

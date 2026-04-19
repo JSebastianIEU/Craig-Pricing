@@ -1,0 +1,19 @@
+{
+  "surcharges": {
+    "double_sided": 0.2,
+    "soft_touch": 0.25,
+    "triplicate": 0.1
+  },
+  "artwork_rate_eur": 65.0,
+  "vat_rate": 0.23,
+  "standard_turnaround": "3-5 working days",
+  "poa_items": [
+    "z-fold",
+    "die-cut labels",
+    "die-cut",
+    "installation",
+    "custom sizes not listed",
+    "frame hardware",
+    "rush job"
+  ]
+}

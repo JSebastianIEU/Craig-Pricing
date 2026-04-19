@@ -1,0 +1,203 @@
+"""
+Unit tests for the escalation contact gate and the confirm_order tool.
+
+These tests exercise `_exec_tool()` directly (no LLM, no HTTP). They use
+an isolated in-memory SQLite so they don't disturb the shared `craig.db`
+file that test_pricing.py reads product/tier data from.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from db.models import Base, Conversation, Quote, DEFAULT_ORG_SLUG
+from llm.craig_agent import _exec_tool
+
+
+# Isolated in-memory DB, separate from the project's real craig.db. Tables
+# are created once per module import and each test gets a fresh session.
+_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+Base.metadata.create_all(bind=_engine)
+_TestSession = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+
+
+def _fresh_tables():
+    """Reset the schema between tests so row IDs are predictable."""
+    Base.metadata.drop_all(bind=_engine)
+    Base.metadata.create_all(bind=_engine)
+
+
+def _new_conversation(db, *, with_contact: bool = False) -> Conversation:
+    conv = Conversation(
+        organization_slug=DEFAULT_ORG_SLUG,
+        external_id="test-session",
+        channel="web",
+        messages=[],
+    )
+    if with_contact:
+        conv.customer_name = "Test Customer"
+        conv.customer_email = "test@example.com"
+    db.add(conv)
+    db.flush()
+    return conv
+
+
+# ---------------------------------------------------------------------------
+# Escalation contact gate
+# ---------------------------------------------------------------------------
+
+
+def test_escalate_without_contact_returns_error():
+    """Craig must refuse to escalate when name/email/phone are all empty."""
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        conv = _new_conversation(db, with_contact=False)
+        result = _exec_tool(
+            db,
+            "escalate_to_justin",
+            {"reason": "custom job", "summary": "5 A6 flyers (below min)"},
+            conversation_id=conv.id,
+        )
+        assert result["escalated"] is False, f"Should have been gated, got: {result}"
+        assert "contact" in result["error"].lower()
+        assert result.get("retry_after") == "save_customer_info"
+    finally:
+        db.close()
+
+
+def test_escalate_with_contact_succeeds():
+    """Once contact info is on the row, escalation should proceed."""
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        conv = _new_conversation(db, with_contact=True)
+        result = _exec_tool(
+            db,
+            "escalate_to_justin",
+            {"reason": "custom job", "summary": "5 A6 flyers (below min)"},
+            conversation_id=conv.id,
+        )
+        assert result["escalated"] is True, f"Should have escalated, got: {result}"
+        assert result["reason"] == "custom job"
+    finally:
+        db.close()
+
+
+def test_escalate_phone_only_also_passes():
+    """Phone number alone should satisfy the gate (WhatsApp flow)."""
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        conv = _new_conversation(db, with_contact=False)
+        conv.customer_phone = "+353871234567"
+        db.flush()
+        result = _exec_tool(
+            db,
+            "escalate_to_justin",
+            {"reason": "rush", "summary": "needs it tomorrow"},
+            conversation_id=conv.id,
+        )
+        assert result["escalated"] is True
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# confirm_order
+# ---------------------------------------------------------------------------
+
+
+def _seed_quote(db, conversation_id: int, *, status: str = "pending_approval") -> Quote:
+    q = Quote(
+        organization_slug=DEFAULT_ORG_SLUG,
+        conversation_id=conversation_id,
+        product_key="business_cards",
+        specs={"quantity": 500},
+        base_price=219.0,
+        surcharges=[],
+        final_price_ex_vat=219.0,
+        vat_amount=50.37,
+        final_price_inc_vat=269.37,
+        artwork_cost=0.0,
+        total=269.37,
+        status=status,
+    )
+    db.add(q)
+    db.flush()
+    return q
+
+
+def test_confirm_order_flips_status():
+    """Calling confirm_order with a valid quote_id should mark both rows."""
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        conv = _new_conversation(db, with_contact=True)
+        q = _seed_quote(db, conv.id)
+        qid = q.id
+
+        result = _exec_tool(
+            db,
+            "confirm_order",
+            {"quote_id": qid, "notes": "Deliver to Dublin"},
+            conversation_id=conv.id,
+        )
+        assert result["confirmed"] is True, f"Expected confirmed=True, got: {result}"
+        assert result["ref"] == f"JP-{qid:04d}"
+
+        db.refresh(q)
+        db.refresh(conv)
+        assert q.status == "confirmed"
+        assert q.notes == "Deliver to Dublin"
+        assert conv.status == "order_placed"
+    finally:
+        db.close()
+
+
+def test_confirm_order_rejects_wrong_conversation():
+    """A quote_id that belongs to a different conversation must be rejected."""
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        conv_a = _new_conversation(db, with_contact=True)
+        conv_b = Conversation(
+            organization_slug=DEFAULT_ORG_SLUG,
+            external_id="other-session",
+            channel="web",
+            messages=[],
+            customer_email="b@example.com",
+        )
+        db.add(conv_b)
+        db.flush()
+
+        q = _seed_quote(db, conv_a.id)
+
+        result = _exec_tool(
+            db,
+            "confirm_order",
+            {"quote_id": q.id},
+            conversation_id=conv_b.id,  # wrong conversation
+        )
+        assert result["confirmed"] is False
+        assert "not found" in result["error"].lower()
+    finally:
+        db.close()
+
+
+def test_confirm_order_missing_quote_id_returns_error():
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        conv = _new_conversation(db, with_contact=True)
+        result = _exec_tool(db, "confirm_order", {}, conversation_id=conv.id)
+        assert result["confirmed"] is False
+        assert "quote_id" in result["error"]
+    finally:
+        db.close()

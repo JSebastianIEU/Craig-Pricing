@@ -1,0 +1,12 @@
+craig.db
+craig.db-journal
+.env
+__pycache__/
+*.pyc
+.cache/
+.git/
+*.zip
+demo.ipynb
+demo_extractor.ipynb
+preview_*.png
+.claude/

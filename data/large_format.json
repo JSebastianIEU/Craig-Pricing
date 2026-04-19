@@ -1,0 +1,178 @@
+{
+  "roller_banners": {
+    "name": "Roller Banners / Pull-Up Banners",
+    "description": "Portable retractable banners for exhibitions, events and retail display",
+    "sizes": [
+      "850x2000mm",
+      "1000x2000mm",
+      "1200x2000mm"
+    ],
+    "unit_price": 120.0,
+    "bulk_price": 110.0,
+    "bulk_threshold": 5,
+    "pricing_unit": "per banner",
+    "min_qty": 1,
+    "notes": "Hardware included."
+  },
+  "foamex_boards": {
+    "name": "Foamex Boards (5mm)",
+    "description": "Rigid lightweight PVC foam boards for indoor signage and displays",
+    "sizes": [
+      "up to 2440x1220mm",
+      "custom cut available"
+    ],
+    "unit_price": 35.0,
+    "bulk_price": 28.0,
+    "bulk_threshold": 10,
+    "pricing_unit": "per A1 board",
+    "min_qty": 1,
+    "notes": ""
+  },
+  "dibond_boards": {
+    "name": "Dibond / Aluminium Composite Boards (3mm)",
+    "description": "Durable aluminium-faced composite panels for indoor and outdoor signage",
+    "sizes": [
+      "up to 3000x1500mm",
+      "custom cut available"
+    ],
+    "unit_price": 50.0,
+    "bulk_price": 45.0,
+    "bulk_threshold": 10,
+    "pricing_unit": "per A1 board",
+    "min_qty": 1,
+    "notes": ""
+  },
+  "corri_boards": {
+    "name": "Corri Boards (5mm)",
+    "description": "Lightweight fluted polypropylene boards for outdoor temporary signage",
+    "sizes": [
+      "A1",
+      "A0",
+      "600x400mm",
+      "1200x800mm"
+    ],
+    "unit_price": 30.0,
+    "bulk_price": 25.0,
+    "bulk_threshold": 20,
+    "pricing_unit": "per A1 board",
+    "min_qty": 1,
+    "notes": ""
+  },
+  "pvc_banners": {
+    "name": "PVC Banners",
+    "description": "Hemmed and eyeleted heavy-duty vinyl banners for outdoor advertising",
+    "sizes": [
+      "custom",
+      "up to 5000mm wide"
+    ],
+    "unit_price": 28.0,
+    "bulk_price": 23.0,
+    "bulk_threshold": 10,
+    "pricing_unit": "per sq/m",
+    "min_qty": 1,
+    "notes": "Price per sq/m."
+  },
+  "canvas_prints": {
+    "name": "Canvas Prints",
+    "description": "Gallery-wrapped canvas prints for interior decor and offices",
+    "sizes": [
+      "A2",
+      "A1",
+      "A0",
+      "custom up to 1500x3000mm"
+    ],
+    "unit_price": 55.0,
+    "bulk_price": 50.0,
+    "bulk_threshold": 5,
+    "pricing_unit": "per A1",
+    "min_qty": 1,
+    "notes": ""
+  },
+  "window_graphics": {
+    "name": "Window Graphics / Vinyl",
+    "description": "Perforated or solid vinyl for window graphics, branding and frosted films",
+    "sizes": [
+      "custom cut",
+      "up to 1372mm wide"
+    ],
+    "unit_price": 55.0,
+    "bulk_price": 45.0,
+    "bulk_threshold": 1,
+    "pricing_unit": "per sq/m",
+    "min_qty": 1,
+    "notes": "Installation POA."
+  },
+  "floor_graphics": {
+    "name": "Floor Graphics",
+    "description": "Anti-slip laminated vinyl graphics for retail floors and wayfinding",
+    "sizes": [
+      "custom cut",
+      "400x600mm",
+      "600x900mm"
+    ],
+    "unit_price": 65.0,
+    "bulk_price": 55.0,
+    "bulk_threshold": 1,
+    "pricing_unit": "per sq/m",
+    "min_qty": 1,
+    "notes": "Anti-slip laminate included."
+  },
+  "mesh_banners": {
+    "name": "Mesh Banners",
+    "description": "Wind-resistant mesh vinyl for scaffolding and outdoor events",
+    "sizes": [
+      "custom",
+      "up to 5000mm wide"
+    ],
+    "unit_price": 30.0,
+    "bulk_price": 25.0,
+    "bulk_threshold": 20,
+    "pricing_unit": "per sq/m",
+    "min_qty": 1,
+    "notes": ""
+  },
+  "fabric_displays": {
+    "name": "Fabric Displays",
+    "description": "Dye-sublimation printed fabric for exhibition backdrops and pop-ups",
+    "sizes": [
+      "custom",
+      "2000x2000mm",
+      "3000x2300mm"
+    ],
+    "unit_price": 60.0,
+    "bulk_price": 55.0,
+    "bulk_threshold": 1,
+    "pricing_unit": "per sq/m",
+    "min_qty": 1,
+    "notes": "Frame hardware POA."
+  },
+  "vehicle_magnetics": {
+    "name": "Vehicle Magnetics",
+    "description": "Removable magnetic panels for vehicle branding",
+    "sizes": [
+      "custom",
+      "600x400mm",
+      "800x600mm"
+    ],
+    "unit_price": 90.0,
+    "bulk_price": 80.0,
+    "bulk_threshold": 5,
+    "pricing_unit": "per 600x1000mm panel",
+    "min_qty": 1,
+    "notes": ""
+  },
+  "vinyl_labels": {
+    "name": "Vinyl Labels",
+    "description": "Durable self-adhesive vinyl labels for product ID and branding",
+    "sizes": [
+      "custom cut",
+      "up to 1500mm wide"
+    ],
+    "unit_price": 45.0,
+    "bulk_price": 40.0,
+    "bulk_threshold": 10,
+    "pricing_unit": "per sq/m",
+    "min_qty": 1,
+    "notes": "Die-cut POA."
+  }
+}
