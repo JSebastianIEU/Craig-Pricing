@@ -1,0 +1,67 @@
+# Cloud Build pipeline triggered on every push to `main` of
+# https://github.com/JSebastianIEU/Craig-Pricing
+#
+# Steps:
+#   1. Build the Docker image from the repo root.
+#   2. Push it to Artifact Registry (same repository Cloud Run uses for
+#      its automatic `--source` deploys, so permissions are already set).
+#   3. Deploy the image as a new revision of the `craig-pricing` Cloud Run
+#      service. Only the IMAGE is updated — service-level settings
+#      (CRAIG_DATABASE_URL env var, DEEPSEEK_API_KEY, Cloud SQL socket,
+#      --min-instances=1, --no-cpu-throttling) stay attached because
+#      Cloud Run preserves them across image-only deploys.
+#
+# No special secrets injected here — everything lives on the Cloud Run
+# service itself.
+
+substitutions:
+    _REGION: europe-west1
+    _SERVICE: craig-pricing
+    _REPO: cloud-run-source-deploy
+
+steps:
+    # 1. Build — tagged with the short SHA so every commit is immutable +
+    #    traceable from the Cloud Run revision list.
+    - name: gcr.io/cloud-builders/docker
+      id: build
+      args:
+          - build
+          - -t
+          - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+          - -t
+          - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+          - .
+
+    # 2. Push both tags to Artifact Registry.
+    - name: gcr.io/cloud-builders/docker
+      id: push
+      args:
+          - push
+          - --all-tags
+          - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}
+
+    # 3. Deploy to Cloud Run, updating only the image.
+    - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+      id: deploy
+      entrypoint: gcloud
+      args:
+          - run
+          - deploy
+          - ${_SERVICE}
+          - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+          - --region=${_REGION}
+          - --platform=managed
+          - --quiet
+
+images:
+    - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+    - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+
+options:
+    # Required when the build doesn't specify a logsBucket. Also means
+    # build logs stream live to Cloud Logging and can be read via
+    # `gcloud run services logs` alongside the service's own logs.
+    logging: CLOUD_LOGGING_ONLY
+    machineType: E2_HIGHCPU_8
+
+timeout: 900s   # 15 min — our Docker build takes ~3-5, headroom is cheap.
