@@ -1,5 +1,6 @@
 # Cloud Build pipeline triggered on every push to `main` of
 # https://github.com/JSebastianIEU/Craig-Pricing
+# (auto-deploys to Cloud Run in project just-print-craig, region europe-west1)
 #
 # Steps:
 #   1. Build the Docker image from the repo root.
