@@ -1116,17 +1116,28 @@ def chat_with_craig(
     # Done once, here, so both the persisted history and the API reply are clean.
     final_reply = _humanize_reply(final_reply)
 
-    # Hallucinated-quote gate: if the LLM emitted [QUOTE_READY] but no
-    # pricing tool actually ran (quote_generated=False), the quoted figure
-    # is fabricated — there's no Quote row, no PDF, and the Overview
-    # metrics won't count it. Strip the marker and append a visible note
-    # so the customer knows the "quote" they just read is not binding.
-    # This is a belt-and-suspenders over the GOLDEN RULE in the prompt.
-    if "[QUOTE_READY]" in final_reply and not quote_generated:
+    # Hallucinated-quote gate.
+    #
+    # If the LLM emitted [QUOTE_READY] without any real Quote row existing
+    # on this conversation, the figure in the reply is fabricated — there's
+    # no PDF, no DB audit trail, nothing for Justin to approve. Strip the
+    # marker and warn the customer the number isn't binding yet.
+    #
+    # Important: "any real Quote row" means either (a) a pricing tool ran
+    # THIS turn (quote_generated=True), or (b) one ran on an earlier turn
+    # of the same conversation. The web widget flow routinely emits
+    # [QUOTE_READY] several turns AFTER the pricing call — e.g. the contact
+    # -collection turn gates the PDF but reuses the Quote from the verbal
+    # -price turn. `existing_quotes` was already queried at the top of
+    # this function, before chat_with_craig ran any tools, so it reflects
+    # quotes persisted in prior turns only — which is exactly what we want.
+    _had_prior_quote = bool(existing_quotes)
+    if "[QUOTE_READY]" in final_reply and not (quote_generated or _had_prior_quote):
         print(
             f"[craig] HALLUCINATED-QUOTE GUARD: stripped [QUOTE_READY] from "
-            f"reply because no pricing tool was called this turn. channel={channel!r} "
-            f"org={organization_slug!r}. Reply head: {final_reply[:200]!r}",
+            f"reply because no pricing tool has run on this conversation. "
+            f"channel={channel!r} org={organization_slug!r}. "
+            f"Reply head: {final_reply[:200]!r}",
             flush=True,
         )
         final_reply = final_reply.replace("[QUOTE_READY]", "").rstrip()

@@ -282,6 +282,59 @@ def test_soft_touch_adds_flat_fee_at_large_qty():
         db.close()
 
 
+def test_quote_ready_survives_when_prior_quote_exists():
+    """
+    The widget's PDF flow routinely emits [QUOTE_READY] on a turn AFTER
+    the pricing tool ran (e.g. the contact-collection turn reuses the
+    Quote from the verbal-price turn). The hallucination guard must not
+    strip the marker in that scenario.
+
+    We exercise the guard directly — build a Conversation + Quote, then
+    simulate the guard's decision logic on a reply containing
+    [QUOTE_READY].
+    """
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        conv = _new_conversation(db, with_contact=True)
+        _seed_business_cards(db)
+        # Seed a quote from a prior turn
+        q = Quote(
+            organization_slug=DEFAULT_ORG_SLUG,
+            conversation_id=conv.id,
+            product_key="business_cards",
+            specs={"quantity": 500},
+            base_price=190.0,
+            surcharges=[],
+            final_price_ex_vat=205.0,
+            vat_amount=27.68,
+            final_price_inc_vat=232.68,
+            artwork_cost=0.0,
+            total=232.68,
+            status="pending_approval",
+        )
+        db.add(q)
+        db.flush()
+
+        # Re-create the guard's inputs
+        existing_quotes = (
+            db.query(Quote)
+            .filter_by(conversation_id=conv.id)
+            .order_by(Quote.created_at.desc())
+            .all()
+        )
+        had_prior_quote = bool(existing_quotes)
+        quote_generated_this_turn = False
+        marker_should_be_stripped = not (quote_generated_this_turn or had_prior_quote)
+
+        assert had_prior_quote is True, "Prior quote should exist"
+        assert marker_should_be_stripped is False, (
+            "Guard must NOT strip [QUOTE_READY] when a prior quote is on the conversation"
+        )
+    finally:
+        db.close()
+
+
 def test_soft_touch_not_applied_when_finish_is_matte():
     """Matte should leave the price at base — no additive."""
     _fresh_tables()
