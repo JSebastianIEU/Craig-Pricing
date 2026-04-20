@@ -308,6 +308,21 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "You are drafting a business email on behalf of Justin. You ARE Justin\n"
         "for this message. Do not mention Craig or AI. Do not use a chat voice.\n"
         "\n"
+        "## GOLDEN RULE (this overrides EVERYTHING else — including the examples below)\n"
+        "NEVER invent, estimate, or recall a price from memory. Every single\n"
+        "quoted number MUST come from a pricing tool call (quote_small_format,\n"
+        "quote_large_format, or quote_booklet) made earlier in this same turn.\n"
+        "If you have enough information to price → CALL THE TOOL FIRST, then\n"
+        "compose the reply using the tool's `final_price_inc_vat` field. If\n"
+        "you can't call the tool (missing specs, product not on the sheet),\n"
+        "DO NOT emit [QUOTE_READY], DO NOT mention a PDF attachment, DO NOT\n"
+        "state any number — instead ask for the one missing spec or escalate.\n"
+        "\n"
+        "The server checks whether the tool was actually called before this\n"
+        "reply. If you emit [QUOTE_READY] without a tool call, the marker is\n"
+        "stripped, the PDF won't attach, and the customer just sees a\n"
+        "hallucinated figure \u2014 which is a contractual breach. Don't do it.\n"
+        "\n"
         "## Forbidden phrases (never write ANY of these in an email reply)\n"
         "- \"Nice one!\"\n"
         "- \"That comes to\" / \"That'll be\"\n"
@@ -342,11 +357,16 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "\n"
         "## Example \u2014 first contact, full specs (this is the exact voice to use)\n"
         "Input: \"I need 500 business cards, soft-touch, double-sided\"\n"
-        "Good reply:\n"
+        "\n"
+        "Before composing ANY reply you MUST call:\n"
+        "    quote_small_format(product_key=\"business_cards\", quantity=500,\n"
+        "                       double_sided=true, finish=\"soft-touch\")\n"
+        "Take the `final_price_inc_vat` the tool returns. THEN write:\n"
+        "\n"
         "Hi Juan,\n"
         "\n"
         "Thanks for reaching out. For 500 business cards with a soft-touch finish,\n"
-        "double-sided, the total comes to \u20ac269.56 including VAT.\n"
+        "double-sided, the total comes to \u20ac<final_price_inc_vat from tool> including VAT.\n"
         "\n"
         "I've attached the full branded quote as a PDF for your records. Turnaround\n"
         "is 3-5 working days from when we have print-ready artwork. Reply to this\n"
@@ -1095,6 +1115,26 @@ def chat_with_craig(
     # Guardrail: scrub any markdown the LLM snuck in despite the prompt rules.
     # Done once, here, so both the persisted history and the API reply are clean.
     final_reply = _humanize_reply(final_reply)
+
+    # Hallucinated-quote gate: if the LLM emitted [QUOTE_READY] but no
+    # pricing tool actually ran (quote_generated=False), the quoted figure
+    # is fabricated — there's no Quote row, no PDF, and the Overview
+    # metrics won't count it. Strip the marker and append a visible note
+    # so the customer knows the "quote" they just read is not binding.
+    # This is a belt-and-suspenders over the GOLDEN RULE in the prompt.
+    if "[QUOTE_READY]" in final_reply and not quote_generated:
+        print(
+            f"[craig] HALLUCINATED-QUOTE GUARD: stripped [QUOTE_READY] from "
+            f"reply because no pricing tool was called this turn. channel={channel!r} "
+            f"org={organization_slug!r}. Reply head: {final_reply[:200]!r}",
+            flush=True,
+        )
+        final_reply = final_reply.replace("[QUOTE_READY]", "").rstrip()
+        final_reply += (
+            "\n\n(Note: I need to run the exact numbers through our pricing "
+            "sheet before I can commit to a figure \u2014 I'll get that over "
+            "to you shortly.)"
+        )
 
     # Hard gate for the PDF/order flow — only enforced for channels where
     # the customer can be anonymous (the web widget). Email/SMS/WhatsApp
