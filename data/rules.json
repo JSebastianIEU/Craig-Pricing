@@ -1,8 +1,21 @@
 {
   "surcharges": {
-    "double_sided": 0.2,
-    "soft_touch": 0.25,
-    "triplicate": 0.1
+    "double_sided": {
+      "kind": "multiplier",
+      "amount": 0.2,
+      "description": "Double-sided print: +20% on the base price. Skipped for products where double_sided_surcharge is false (e.g. business cards)."
+    },
+    "soft_touch": {
+      "kind": "additive",
+      "amount": 15.0,
+      "applies_to_category": "small_format",
+      "description": "Soft-touch laminate finish. Flat +€15 per job. Only available on business cards."
+    },
+    "triplicate": {
+      "kind": "multiplier",
+      "amount": 0.1,
+      "description": "NCR triplicate (vs duplicate): +10% on the base price."
+    }
   },
   "artwork_rate_eur": 65.0,
   "vat_rate": 0.23,

@@ -91,13 +91,48 @@ def _get_surcharge(
     name: str,
     organization_slug: str = DEFAULT_ORG_SLUG,
 ) -> float:
-    """Return the multiplier for a named surcharge (e.g. 0.20 for double_sided)."""
+    """
+    Return the amount for a named surcharge.
+
+    Kept for backwards compat — callers that don't care about the kind
+    just get the raw multiplier/amount. New code should prefer
+    `_get_surcharge_rule` which returns (amount, kind) so the caller can
+    apply it correctly:
+
+        - kind='multiplier' → price_after = price_before * (1 + amount)
+        - kind='additive'   → price_after = price_before + amount (per job)
+    """
     rule = (
         db.query(SurchargeRule)
         .filter_by(organization_slug=organization_slug, name=name)
         .first()
     )
     return rule.multiplier if rule else 0.0
+
+
+def _get_surcharge_rule(
+    db: Session,
+    name: str,
+    organization_slug: str = DEFAULT_ORG_SLUG,
+) -> tuple[float, str]:
+    """
+    Return `(amount, kind)` for a named surcharge. Kind is either
+    'multiplier' (fraction, e.g. 0.20 for +20%) or 'additive' (flat
+    euro amount added once per job, e.g. 15.0 for +€15). Returns
+    `(0.0, 'multiplier')` when the rule isn't configured for this tenant
+    — i.e. applying a zero multiplier is a no-op.
+    """
+    rule = (
+        db.query(SurchargeRule)
+        .filter_by(organization_slug=organization_slug, name=name)
+        .first()
+    )
+    if not rule:
+        return (0.0, "multiplier")
+    kind = (rule.kind or "multiplier").strip().lower()
+    if kind not in ("multiplier", "additive"):
+        kind = "multiplier"
+    return (float(rule.multiplier or 0.0), kind)
 
 
 def _parse_unit_base(price_per: str) -> int:
@@ -205,28 +240,50 @@ def quote_small_format(
     base_price = round(unit_price * qty_multiplier, 2)
 
     surcharges_applied: list[str] = []
-    multiplier = 1.0
+    multiplier = 1.0   # collects all multiplier-kind surcharges (e.g. +20%)
+    additive = 0.0     # collects all additive-kind surcharges (e.g. +€15 flat)
+
+    def _apply(name: str, label_pct: str, label_flat: str) -> None:
+        """Look up a surcharge by name and fold it into the right accumulator
+        based on its kind. Centralised so every surcharge (double_sided,
+        soft_touch, triplicate, ...) shares the same branch logic."""
+        nonlocal multiplier, additive
+        amount, kind = _get_surcharge_rule(db, name, organization_slug=organization_slug)
+        if amount == 0.0:
+            return
+        if kind == "additive":
+            additive += amount
+            surcharges_applied.append(label_flat.format(amount=amount))
+        else:
+            multiplier *= (1 + amount)
+            surcharges_applied.append(label_pct.format(pct=int(amount * 100)))
 
     # Double-sided surcharge (skipped for products flagged as no-surcharge, e.g. business cards)
     if double_sided and product.double_sided_surcharge:
-        ds = _get_surcharge(db, "double_sided", organization_slug=organization_slug)
-        multiplier *= (1 + ds)
-        surcharges_applied.append(f"Double-sided: +{int(ds * 100)}%")
+        _apply(
+            "double_sided",
+            label_pct="Double-sided: +{pct}%",
+            label_flat="Double-sided: +\u20ac{amount:.2f}",
+        )
 
     # Finish surcharges (soft-touch, triplicate)
     if finish:
         normalized = finish.strip().lower().replace("-", "_").replace(" ", "_")
 
         if normalized == "soft_touch":
-            st = _get_surcharge(db, "soft_touch", organization_slug=organization_slug)
-            multiplier *= (1 + st)
-            surcharges_applied.append(f"Soft-touch finish: +{int(st * 100)}%")
+            _apply(
+                "soft_touch",
+                label_pct="Soft-touch finish: +{pct}%",
+                label_flat="Soft-touch finish: +\u20ac{amount:.2f}",
+            )
 
         elif normalized == "triplicate":
             if product.key in ("ncr_pads_a5", "ncr_pads_a4"):
-                tp = _get_surcharge(db, "triplicate", organization_slug=organization_slug)
-                multiplier *= (1 + tp)
-                surcharges_applied.append(f"Triplicate: +{int(tp * 100)}%")
+                _apply(
+                    "triplicate",
+                    label_pct="Triplicate: +{pct}%",
+                    label_flat="Triplicate: +\u20ac{amount:.2f}",
+                )
             else:
                 return EscalationResult(
                     reason="Triplicate finish only applies to NCR pads.",
@@ -243,7 +300,11 @@ def quote_small_format(
                     message=f"Available finishes: {product.finishes}. Escalate if the customer needs something else.",
                 )
 
-    final_ex = round(base_price * multiplier, 2)
+    # Apply multiplier first, then add the flat adjustments. The order
+    # matters because additive surcharges are fixed euros — they should
+    # NOT scale with the multiplier (otherwise €15 flat on a double-sided
+    # job becomes €18).
+    final_ex = round(base_price * multiplier + additive, 2)
     surcharge_amount = round(final_ex - base_price, 2)
 
     vat_rate = _get_vat_rate_for_product(db, product, organization_slug)

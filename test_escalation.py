@@ -16,8 +16,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from db.models import Base, Conversation, Quote, DEFAULT_ORG_SLUG
+from db.models import Base, Conversation, Product, PriceTier, Quote, SurchargeRule, DEFAULT_ORG_SLUG
 from llm.craig_agent import _exec_tool
+from pricing_engine import quote_small_format
 
 
 # Isolated in-memory DB, separate from the project's real craig.db. Tables
@@ -199,5 +200,100 @@ def test_confirm_order_missing_quote_id_returns_error():
         result = _exec_tool(db, "confirm_order", {}, conversation_id=conv.id)
         assert result["confirmed"] is False
         assert "quote_id" in result["error"]
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Soft-touch is now a flat +€15 additive surcharge on business cards only
+# (was previously a +25% multiplier globally — see V10 migration).
+# ---------------------------------------------------------------------------
+
+
+def _seed_business_cards(db) -> None:
+    """Bare-minimum products/tiers for the quote_small_format test."""
+    p = Product(
+        organization_slug=DEFAULT_ORG_SLUG,
+        key="business_cards",
+        name="Business Cards",
+        category="small_format",
+        price_per="100 cards",
+        finishes=["gloss", "matte", "soft-touch"],
+        double_sided_surcharge=False,  # business cards: no double-sided surcharge
+    )
+    db.add(p)
+    db.flush()
+    # Justin's actual tiers
+    for qty, price in [(100, 30.0), (250, 60.0), (500, 38.0), (1000, 30.0), (2500, 24.0)]:
+        db.add(PriceTier(product_id=p.id, spec_key="", quantity=qty, price=price))
+    db.flush()
+
+
+def _seed_soft_touch_additive(db, amount: float = 15.0) -> None:
+    db.add(SurchargeRule(
+        organization_slug=DEFAULT_ORG_SLUG,
+        name="soft_touch",
+        multiplier=amount,
+        kind="additive",
+        applies_to_category="small_format",
+    ))
+    db.flush()
+
+
+def test_soft_touch_adds_flat_fee_at_small_qty():
+    """100 business cards base = €30. Soft-touch should bring it to €45 (+€15), not €37.50 (+25%)."""
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        _seed_business_cards(db)
+        _seed_soft_touch_additive(db)
+        result = quote_small_format(
+            db, "business_cards", 100, double_sided=False, finish="soft-touch",
+        )
+        assert result.success, f"Expected success, got: {result}"
+        assert abs(result.base_price - 30.0) < 0.01
+        # Base €30 + flat €15 = €45 ex VAT
+        assert abs(result.final_price_ex_vat - 45.0) < 0.01, (
+            f"Expected €45 ex VAT, got €{result.final_price_ex_vat}"
+        )
+    finally:
+        db.close()
+
+
+def test_soft_touch_adds_flat_fee_at_large_qty():
+    """
+    2500 business cards base = €600. Soft-touch should be €615 (+€15 flat),
+    NOT €750 (+25% which would be €135 over-charged).
+    """
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        _seed_business_cards(db)
+        _seed_soft_touch_additive(db)
+        result = quote_small_format(
+            db, "business_cards", 2500, double_sided=False, finish="soft-touch",
+        )
+        assert result.success, f"Expected success, got: {result}"
+        assert abs(result.base_price - 600.0) < 0.01, f"base_price wrong: {result.base_price}"
+        assert abs(result.final_price_ex_vat - 615.0) < 0.01, (
+            f"Expected €615 ex VAT (base €600 + €15 flat), got €{result.final_price_ex_vat}"
+        )
+    finally:
+        db.close()
+
+
+def test_soft_touch_not_applied_when_finish_is_matte():
+    """Matte should leave the price at base — no additive."""
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        _seed_business_cards(db)
+        _seed_soft_touch_additive(db)
+        result = quote_small_format(
+            db, "business_cards", 500, double_sided=False, finish="matte",
+        )
+        assert result.success
+        # 500 cards × (€38/100) = €190. No surcharge.
+        assert abs(result.final_price_ex_vat - 190.0) < 0.01
     finally:
         db.close()

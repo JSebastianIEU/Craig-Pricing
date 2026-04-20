@@ -62,6 +62,7 @@ def main() -> None:
     from scripts.v7_patch_contact_contradiction import migrate as v7_migrate
     from scripts.v8_refresh_default_rules import migrate as v8_migrate
     from scripts.v9_missive_settings_seed import seed as v9_seed
+    from scripts.v10_soft_touch_flat_fee import migrate as v10_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -71,6 +72,7 @@ def main() -> None:
     _run("v7 patch contact contradiction", v7_migrate)
     _run("v8 refresh default rules", v8_migrate)
     _run("v9 missive settings seed", v9_seed)
+    _run("v10 soft-touch flat fee", v10_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

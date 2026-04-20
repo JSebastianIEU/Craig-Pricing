@@ -149,13 +149,31 @@ def migrate():
         print(f"  → {alias_count} aliases")
 
         # ---------- SURCHARGE RULES ----------
+        # Two shapes supported for backwards compat:
+        #   - scalar: "double_sided": 0.2 → kind=multiplier, amount=0.2
+        #   - rich:   "soft_touch": {"kind":"additive","amount":15.0,"applies_to_category":"small_format"}
         print("Loading surcharge rules...")
         rules = _load_json("rules.json")
-        for name, multiplier in rules["surcharges"].items():
+        for name, spec in rules["surcharges"].items():
+            if isinstance(spec, (int, float)):
+                kind = "multiplier"
+                amount = float(spec)
+                applies_to_category = None
+                description = f"{name.replace('_', ' ').title()} surcharge: +{int(amount * 100)}%"
+            else:
+                kind = (spec.get("kind") or "multiplier").strip().lower()
+                amount = float(spec.get("amount") or spec.get("multiplier") or 0.0)
+                applies_to_category = spec.get("applies_to_category")
+                description = spec.get("description") or (
+                    f"{name.replace('_', ' ').title()} surcharge: "
+                    + (f"+€{amount:.2f} flat" if kind == "additive" else f"+{int(amount * 100)}%")
+                )
             db.add(SurchargeRule(
                 name=name,
-                multiplier=float(multiplier),
-                description=f"{name.replace('_', ' ').title()} surcharge: +{int(multiplier * 100)}%",
+                multiplier=amount,
+                kind=kind,
+                applies_to_category=applies_to_category,
+                description=description,
             ))
         print(f"  → {len(rules['surcharges'])} surcharge rules")
 
