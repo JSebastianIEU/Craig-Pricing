@@ -110,6 +110,44 @@ def _get_surcharge(
     return rule.multiplier if rule else 0.0
 
 
+def _get_client_multiplier(
+    db: Session,
+    organization_slug: str = DEFAULT_ORG_SLUG,
+) -> float:
+    """
+    Return the tenant's client multiplier (default 1.0 = no adjustment).
+
+    This is the "base price + per-client percentage multiplier" Roi
+    asked for: a single tenant-wide scalar applied AFTER surcharges and
+    BEFORE VAT. Used so Justin can mark up (or down) prices per client
+    without editing every product tier.
+
+    Stored as a string in the `settings` table under key
+    `pricing_client_multiplier`. Parses to a float; silently falls back
+    to 1.0 on any parse error so a typo in the dashboard never breaks
+    a live quote.
+    """
+    # Read the raw string directly — bypass `_get_setting`'s value_type
+    # cast, because a dashboard typo ("not-a-number" on a value_type=float
+    # row) would raise inside float() before we ever saw it.
+    row = (
+        db.query(Setting)
+        .filter_by(organization_slug=organization_slug, key="pricing_client_multiplier")
+        .first()
+    )
+    if row is None:
+        return 1.0
+    try:
+        mult = float(row.value)
+    except (TypeError, ValueError):
+        return 1.0
+    # Sanity clamp — reject negative or absurdly large multipliers outright
+    # rather than scaling prices to zero or infinity.
+    if mult <= 0 or mult > 10.0:
+        return 1.0
+    return mult
+
+
 def _get_surcharge_rule(
     db: Session,
     name: str,
@@ -305,6 +343,16 @@ def quote_small_format(
     # NOT scale with the multiplier (otherwise €15 flat on a double-sided
     # job becomes €18).
     final_ex = round(base_price * multiplier + additive, 2)
+
+    # Client multiplier: tenant-wide markup applied AFTER surcharges,
+    # BEFORE VAT. Default 1.0 = no-op. Roi + Justin's pricing lever.
+    client_mult = _get_client_multiplier(db, organization_slug=organization_slug)
+    if abs(client_mult - 1.0) > 1e-6:
+        final_ex = round(final_ex * client_mult, 2)
+        pct = int(round((client_mult - 1.0) * 100))
+        sign = "+" if pct >= 0 else ""
+        surcharges_applied.append(f"Client adjustment: {sign}{pct}%")
+
     surcharge_amount = round(final_ex - base_price, 2)
 
     vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
@@ -388,6 +436,16 @@ def quote_large_format(
         applied = []
 
     total_ex = round(unit_price * quantity, 2)
+
+    # Client multiplier — applied AFTER surcharges, BEFORE VAT. See
+    # `_get_client_multiplier` for the full rationale.
+    client_mult = _get_client_multiplier(db, organization_slug=organization_slug)
+    if abs(client_mult - 1.0) > 1e-6:
+        total_ex = round(total_ex * client_mult, 2)
+        pct = int(round((client_mult - 1.0) * 100))
+        sign = "+" if pct >= 0 else ""
+        applied.append(f"Client adjustment: {sign}{pct}%")
+
     vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
     vat = round(total_ex * vat_rate, 2)
 
@@ -481,12 +539,23 @@ def quote_booklet(
         )
 
     base_price = tier.price  # booklets are "per job" — no unit multiplier
+
+    # Client multiplier — applied BEFORE VAT like the other product families.
+    final_ex = base_price
+    applied: list[str] = []
+    client_mult = _get_client_multiplier(db, organization_slug=organization_slug)
+    if abs(client_mult - 1.0) > 1e-6:
+        final_ex = round(base_price * client_mult, 2)
+        pct = int(round((client_mult - 1.0) * 100))
+        sign = "+" if pct >= 0 else ""
+        applied.append(f"Client adjustment: {sign}{pct}%")
+
     vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
-    vat = round(base_price * vat_rate, 2)
+    vat = round(final_ex * vat_rate, 2)
 
     artwork_ex = None
     artwork_inc = None
-    total = round(base_price + vat, 2)
+    total = round(final_ex + vat, 2)
     if needs_artwork and artwork_hours > 0:
         artwork_rate = _get_setting(db, "artwork_rate_eur", 65.0, organization_slug=organization_slug)
         artwork_ex = round(artwork_rate * artwork_hours, 2)
@@ -522,11 +591,11 @@ def quote_booklet(
         quantity=quantity,
         quantity_unit="copies",
         base_price=base_price,
-        surcharges_applied=[],
-        surcharge_amount=0.0,
-        final_price_ex_vat=base_price,
+        surcharges_applied=applied,
+        surcharge_amount=round(final_ex - base_price, 2),
+        final_price_ex_vat=final_ex,
         vat_amount=vat,
-        final_price_inc_vat=round(base_price + vat, 2),
+        final_price_inc_vat=round(final_ex + vat, 2),
         artwork_cost_ex_vat=artwork_ex,
         artwork_cost_inc_vat=artwork_inc,
         total_inc_everything=total,

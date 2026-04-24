@@ -66,6 +66,7 @@ def main() -> None:
     from scripts.v11_silk_finish import migrate as v11_migrate
     from scripts.v12_printlogic_cols import migrate as v12_migrate
     from scripts.v13_printlogic_settings_seed import seed as v13_seed
+    from scripts.v14_client_multiplier_seed import seed as v14_seed
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -79,6 +80,7 @@ def main() -> None:
     _run("v11 silk finish for flyers", v11_migrate)
     _run("v12 printlogic columns on quotes", v12_migrate)
     _run("v13 printlogic settings seed", v13_seed)
+    _run("v14 client multiplier seed", v14_seed)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

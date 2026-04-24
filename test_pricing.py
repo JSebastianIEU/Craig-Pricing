@@ -85,7 +85,7 @@ def test_business_cards_500_double_sided_no_surcharge():
 
 
 def test_business_cards_250_soft_touch():
-    """250 biz cards @ €60/100 = €150, +25% soft-touch = €187.50."""
+    """250 biz cards @ €60/100 = €150, +€15 flat soft-touch (v10) = €165."""
     r = client.post("/quote/small-format", json={
         "product_key": "business_cards",
         "quantity": 250,
@@ -95,7 +95,7 @@ def test_business_cards_250_soft_touch():
     data = r.json()
     assert data["success"] is True
     assert data["base_price"] == 150.00  # 60 * (250/100)
-    assert data["final_price_ex_vat"] == 187.50  # 150 * 1.25
+    assert data["final_price_ex_vat"] == 165.00  # 150 + 15 flat fee
     assert len(data["surcharges_applied"]) == 1
 
 
@@ -451,6 +451,147 @@ def test_artwork_addon():
     assert data["artwork_cost_inc_vat"] == 159.90  # 130 * 1.23
     # Total = (150 + 20.25 VAT@13.5%) + 159.90 artwork inc VAT = 330.15
     assert data["total_inc_everything"] == 330.15
+
+
+# =============================================================================
+# CLIENT MULTIPLIER — tenant-wide markup applied AFTER surcharges, BEFORE VAT
+# =============================================================================
+
+
+def _set_client_multiplier(value: str | None) -> None:
+    """Test helper — upsert or delete `pricing_client_multiplier` on the
+    default org so we don't leak state between tests."""
+    from db import db_session
+    from db.models import Setting, DEFAULT_ORG_SLUG
+
+    with db_session() as s:
+        row = (
+            s.query(Setting)
+            .filter_by(organization_slug=DEFAULT_ORG_SLUG, key="pricing_client_multiplier")
+            .first()
+        )
+        if value is None:
+            if row:
+                s.delete(row)
+            return
+        if row:
+            row.value = value
+        else:
+            s.add(Setting(
+                organization_slug=DEFAULT_ORG_SLUG,
+                key="pricing_client_multiplier",
+                value=value,
+                value_type="float",
+            ))
+
+
+def test_client_multiplier_default_is_noop():
+    """Missing setting = 1.0 = price unchanged."""
+    from pricing_engine import _get_client_multiplier
+    from db import db_session
+
+    _set_client_multiplier(None)
+    with db_session() as s:
+        assert _get_client_multiplier(s) == 1.0
+
+
+def test_client_multiplier_parses_float():
+    from pricing_engine import _get_client_multiplier
+    from db import db_session
+
+    _set_client_multiplier("1.10")
+    try:
+        with db_session() as s:
+            assert _get_client_multiplier(s) == 1.10
+    finally:
+        _set_client_multiplier(None)
+
+
+def test_client_multiplier_clamps_invalid():
+    """Negative, zero, absurdly large, or garbage all fall back to 1.0 —
+    a dashboard typo must never scale a live quote to zero."""
+    from pricing_engine import _get_client_multiplier
+    from db import db_session
+
+    for bad in ["-0.5", "0", "99", "not-a-number", ""]:
+        _set_client_multiplier(bad)
+        with db_session() as s:
+            assert _get_client_multiplier(s) == 1.0, f"value {bad!r} should clamp to 1.0"
+    _set_client_multiplier(None)
+
+
+def test_client_multiplier_applied_after_surcharges_small_format():
+    """+10% applied after surcharges, before VAT. 500 biz cards = €190 →
+    €209 ex VAT, with a 'Client adjustment: +10%' line."""
+    _set_client_multiplier("1.10")
+    try:
+        r = client.post("/quote/small-format", json={
+            "product_key": "business_cards",
+            "quantity": 500,
+            "double_sided": False,
+            "finish": "gloss",
+        })
+        data = r.json()
+        assert data["success"] is True
+        assert data["base_price"] == 190.00
+        assert data["final_price_ex_vat"] == 209.00  # 190 * 1.10
+        assert any("Client adjustment" in s for s in data["surcharges_applied"])
+    finally:
+        _set_client_multiplier(None)
+
+
+def test_client_multiplier_negative_discount_small_format():
+    """-10% (0.90) applied cleanly."""
+    _set_client_multiplier("0.90")
+    try:
+        r = client.post("/quote/small-format", json={
+            "product_key": "business_cards",
+            "quantity": 500,
+            "double_sided": False,
+            "finish": "gloss",
+        })
+        data = r.json()
+        assert data["final_price_ex_vat"] == 171.00  # 190 * 0.90
+        assert any("-10%" in s for s in data["surcharges_applied"])
+    finally:
+        _set_client_multiplier(None)
+
+
+def test_client_multiplier_stacks_after_surcharge():
+    """Soft-touch (+25%) THEN client +10% — confirms order-of-ops."""
+    _set_client_multiplier("1.10")
+    try:
+        r = client.post("/quote/small-format", json={
+            "product_key": "business_cards",
+            "quantity": 500,
+            "double_sided": False,
+            "finish": "soft_touch",
+        })
+        data = r.json()
+        # 190 base + 15 soft-touch flat fee = 205, then * 1.10 = 225.50
+        # (soft-touch is a €15 flat fee per v10, not a multiplier)
+        assert data["final_price_ex_vat"] == round(205.00 * 1.10, 2)
+    finally:
+        _set_client_multiplier(None)
+
+
+def test_client_multiplier_not_applied_to_vat():
+    """VAT is still computed on the adjusted ex-VAT price, not double-scaled."""
+    _set_client_multiplier("1.10")
+    try:
+        r = client.post("/quote/small-format", json={
+            "product_key": "business_cards",
+            "quantity": 500,
+            "double_sided": False,
+            "finish": "gloss",
+        })
+        data = r.json()
+        ex = data["final_price_ex_vat"]
+        inc = data["final_price_inc_vat"]
+        # Printed matter VAT = 13.5%
+        assert round(ex * 1.135, 2) == inc
+    finally:
+        _set_client_multiplier(None)
 
 
 # =============================================================================
