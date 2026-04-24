@@ -1014,13 +1014,35 @@ def list_conversations(
     status: Optional[str] = None,
     channel: Optional[str] = None,
     search: Optional[str] = None,
+    include_noise: bool = Query(False),
     claims: StrategosClaims = Depends(require_claims),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    """
+    List conversations for the org.
+
+    By default, returns only "meaningful" conversations — those with at
+    least one Quote attached, OR whose status has been promoted past the
+    initial 'open' state (to quoted / awaiting_contact / escalated /
+    order_placed). This hides the noise Craig generates when someone
+    emails a non-pricing message (e.g. "hi, can you send me your address?"
+    via Missive) — Craig still responds politely in the draft, but the
+    Conversation row doesn't clog up the dashboard.
+
+    Pass `?include_noise=true` to see everything (useful for debugging).
+    Passing an explicit `?status=open` also implicitly shows all 'open'
+    conversations regardless of whether quotes exist.
+    """
+    from sqlalchemy import exists, or_
+
     access_guard(org_slug, claims)
     q = _scope(db.query(Conversation), Conversation, claims, org_slug)
     if status:
         q = q.filter(Conversation.status == status)
+    elif not include_noise:
+        # Default filter: hide 'open' rows that have no quote attached.
+        quote_exists = exists().where(Quote.conversation_id == Conversation.id)
+        q = q.filter(or_(Conversation.status != "open", quote_exists))
     if channel:
         q = q.filter(Conversation.channel == channel)
     if search:
