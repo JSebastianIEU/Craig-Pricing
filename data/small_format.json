@@ -30,7 +30,8 @@
     ],
     "finishes": [
       "gloss",
-      "matte"
+      "matte",
+      "silk"
     ],
     "price_per": "100 flyers",
     "double_sided_surcharge": true,
@@ -51,7 +52,8 @@
     ],
     "finishes": [
       "gloss",
-      "matte"
+      "matte",
+      "silk"
     ],
     "price_per": "100 flyers",
     "double_sided_surcharge": true,
@@ -72,7 +74,8 @@
     ],
     "finishes": [
       "gloss",
-      "matte"
+      "matte",
+      "silk"
     ],
     "price_per": "100 flyers",
     "double_sided_surcharge": true,
@@ -93,7 +96,8 @@
     ],
     "finishes": [
       "gloss",
-      "matte"
+      "matte",
+      "silk"
     ],
     "price_per": "100 flyers",
     "double_sided_surcharge": true,
