@@ -273,6 +273,18 @@ class Quote(Base):
     printlogic_last_error = Column(Text, nullable=True)
     printlogic_push_attempts = Column(Integer, nullable=False, default=0, server_default="0")
 
+    # Stripe payment links (Phase B). We create a Stripe Payment Link when the
+    # customer confirms a quote and store the URL + status here. `payment_status`
+    # transitions: null → "unpaid" (link sent) → "paid" (webhook confirmed)
+    # → "refunded"/"failed". `stripe_payment_link_id` is the idempotency guard
+    # — if non-null we never create a second link for the same quote.
+    stripe_payment_link_id = Column(String(128), nullable=True, index=True)
+    stripe_payment_link_url = Column(Text, nullable=True)
+    stripe_checkout_session_id = Column(String(128), nullable=True, index=True)
+    stripe_payment_status = Column(String(32), nullable=True)  # unpaid / paid / refunded / failed
+    stripe_paid_at = Column(DateTime, nullable=True)
+    stripe_last_error = Column(Text, nullable=True)
+
     conversation = relationship("Conversation", back_populates="quotes")
 
     __table_args__ = (

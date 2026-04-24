@@ -18,7 +18,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -942,6 +942,15 @@ def _quote_to_dict(q: Quote) -> dict[str, Any]:
         ),
         "printlogic_last_error": getattr(q, "printlogic_last_error", None),
         "printlogic_push_attempts": getattr(q, "printlogic_push_attempts", 0) or 0,
+        # Stripe payment link state — dashboard renders a badge per state
+        "stripe_payment_link_id": getattr(q, "stripe_payment_link_id", None),
+        "stripe_payment_link_url": getattr(q, "stripe_payment_link_url", None),
+        "stripe_payment_status": getattr(q, "stripe_payment_status", None),
+        "stripe_paid_at": (
+            q.stripe_paid_at.isoformat()
+            if getattr(q, "stripe_paid_at", None) else None
+        ),
+        "stripe_last_error": getattr(q, "stripe_last_error", None),
     }
 
 
@@ -1067,6 +1076,131 @@ def cancel_printlogic_order(
         "quote": _quote_to_dict(q),
         "result": result,
     }
+
+
+# ============================================================================
+# Stripe payment links
+# ============================================================================
+
+
+@router.post("/orgs/{org_slug}/quotes/{quote_id}/create-payment-link")
+def create_stripe_payment_link(
+    org_slug: str,
+    quote_id: int,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Manually create a Stripe Payment Link for a quote. Mirrors the PrintLogic
+    push endpoint's shape. Requires `client_owner` — only the client admin
+    should be creating payment links.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+    q = _scope(db.query(Quote), Quote, claims, org_slug).filter(Quote.id == quote_id).first()
+    if not q:
+        raise HTTPException(status_code=404, detail="Quote not found")
+
+    from stripe_push import create_link_for_quote
+    result = create_link_for_quote(db, q, org_slug)
+    db.commit()
+    db.refresh(q)
+    return {"quote": _quote_to_dict(q), "result": result}
+
+
+@router.post("/orgs/{org_slug}/quotes/{quote_id}/cancel-payment-link")
+def cancel_stripe_payment_link(
+    org_slug: str,
+    quote_id: int,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Deactivate a previously created Payment Link (Stripe won't let you delete,
+    only flip active=false). Clears the local link fields so the dashboard
+    shows "Create" again. Does NOT affect any payment that already went
+    through — refunds go through Stripe's UI directly.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+    q = _scope(db.query(Quote), Quote, claims, org_slug).filter(Quote.id == quote_id).first()
+    if not q:
+        raise HTTPException(status_code=404, detail="Quote not found")
+
+    if not q.stripe_payment_link_id:
+        return {"quote": _quote_to_dict(q), "result": {"ok": True, "error": "no_link"}}
+
+    import asyncio
+    import stripe_client
+    from pricing_engine import _get_setting
+    api_key = _get_setting(db, "stripe_secret_key", default="", organization_slug=org_slug)
+    result = asyncio.run(stripe_client.deactivate_payment_link(api_key, q.stripe_payment_link_id))
+    if result.get("ok"):
+        q.stripe_payment_link_id = None
+        q.stripe_payment_link_url = None
+        # Preserve payment_status — if it was "paid" we don't want to forget that.
+        if q.stripe_payment_status == "unpaid":
+            q.stripe_payment_status = None
+    db.commit()
+    db.refresh(q)
+    return {"quote": _quote_to_dict(q), "result": result}
+
+
+# ============================================================================
+# Stripe webhook — receives payment.succeeded / checkout.session.completed etc.
+# ============================================================================
+
+
+@router.post("/webhooks/stripe/{org_slug}")
+async def stripe_webhook(
+    org_slug: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Public endpoint — Stripe POSTs events here. NOT behind JWT: auth is by
+    HMAC on the Stripe-Signature header using the tenant's stored
+    `stripe_webhook_secret`. Rejects anything whose signature doesn't match.
+
+    Endpoint URL per tenant:
+        POST /admin/api/webhooks/stripe/<org_slug>
+
+    Configure this URL in the tenant's Stripe dashboard → Developers →
+    Webhooks. Subscribe at minimum to:
+        - checkout.session.completed
+        - payment_intent.succeeded
+        - payment_intent.payment_failed
+        - charge.refunded
+    """
+    import stripe_client
+    from stripe_push import apply_webhook_event
+    from pricing_engine import _get_setting
+
+    secret = _get_setting(db, "stripe_webhook_secret", default="", organization_slug=org_slug)
+    if not secret:
+        # Webhook configured before secret stored — refuse rather than
+        # silently accepting unsigned events.
+        raise HTTPException(status_code=503, detail="webhook_secret_not_configured")
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    try:
+        stripe_client.verify_webhook_signature(payload, sig_header, secret)
+    except stripe_client.InvalidSignature as e:
+        # Non-leaky 400. Stripe will retry with backoff — that's fine,
+        # a genuine misconfiguration will surface quickly in their UI.
+        raise HTTPException(status_code=400, detail=f"invalid_signature:{e}")
+
+    try:
+        import json as _json
+        event = _json.loads(payload.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="malformed_json")
+
+    result = apply_webhook_event(db, event, org_slug)
+    db.commit()
+    return {"received": True, "result": result}
 
 
 # ============================================================================

@@ -842,15 +842,41 @@ def _exec_tool(
                 # (import error, DB weirdness), we keep the customer path alive.
                 pl = {"ok": False, "error": f"push_crashed:{type(e).__name__}"}
 
+            # Best-effort Stripe payment link. Respects the tenant's
+            # `stripe_enabled` flag (default false → disabled=True, zero
+            # network). Like PrintLogic, any failure is swallowed so the
+            # customer still sees the confirmation message.
+            sp: dict[str, object] = {"ok": False, "error": "not_attempted", "disabled": True}
+            try:
+                from stripe_push import create_link_for_quote
+                sp = create_link_for_quote(db, q, organization_slug)
+            except Exception as e:
+                sp = {"ok": False, "error": f"stripe_crashed:{type(e).__name__}", "disabled": False}
+
+            # Customer-facing message becomes "here's your payment link"
+            # when we have one; otherwise falls back to the original.
+            pay_url = sp.get("url")
+            if pay_url:
+                customer_msg = (
+                    "Order confirmed. You can pay securely here: "
+                    f"{pay_url} — Justin will be in touch with next steps."
+                )
+            else:
+                customer_msg = "Order confirmed. Justin will be in touch with next steps."
+
             return {
                 "confirmed": True,
                 "quote_id": qid,
                 "ref": f"JP-{qid:04d}",
-                "message": "Order confirmed. Justin will be in touch with next steps.",
+                "message": customer_msg,
                 "printlogic_pushed": bool(pl.get("ok")),
                 "printlogic_order_id": pl.get("order_id"),
                 "printlogic_dry_run": bool(pl.get("dry_run")),
                 "printlogic_error": pl.get("error"),
+                "stripe_link_created": bool(sp.get("ok")),
+                "stripe_link_url": sp.get("url"),
+                "stripe_disabled": bool(sp.get("disabled")),
+                "stripe_error": sp.get("error"),
             }
 
         return {"error": f"Unknown tool: {name}"}
