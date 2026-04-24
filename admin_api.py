@@ -933,6 +933,15 @@ def _quote_to_dict(q: Quote) -> dict[str, Any]:
         "approved_by": q.approved_by,
         "notes": q.notes,
         "created_at": q.created_at.isoformat() if q.created_at else None,
+        # PrintLogic integration state — dashboard renders a badge per state
+        "printlogic_order_id": getattr(q, "printlogic_order_id", None),
+        "printlogic_customer_id": getattr(q, "printlogic_customer_id", None),
+        "printlogic_pushed_at": (
+            q.printlogic_pushed_at.isoformat()
+            if getattr(q, "printlogic_pushed_at", None) else None
+        ),
+        "printlogic_last_error": getattr(q, "printlogic_last_error", None),
+        "printlogic_push_attempts": getattr(q, "printlogic_push_attempts", 0) or 0,
     }
 
 
@@ -982,6 +991,82 @@ def update_quote(
     db.commit()
     db.refresh(q)
     return {"quote": _quote_to_dict(q)}
+
+
+@router.post("/orgs/{org_slug}/quotes/{quote_id}/push-to-printlogic")
+def push_quote_to_printlogic(
+    org_slug: str,
+    quote_id: int,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Push a quote to the tenant's PrintLogic account.
+
+    Honors the tenant-level `printlogic_dry_run` Setting:
+      - `"true"` (default)  → returns a synthetic `DRY-xxxx` order_id,
+        zero real network traffic to PrintLogic.
+      - `"false"`           → real POST `create_order`, updates the
+        Quote row with the returned real `order_id`.
+
+    Idempotent: calling twice on a Quote that already has a real
+    PrintLogic order returns the existing id without re-pushing.
+
+    Requires `client_owner` (same role gate as settings edits) — we
+    don't want random viewers firing destructive pushes.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+    q = _scope(db.query(Quote), Quote, claims, org_slug).filter(Quote.id == quote_id).first()
+    if not q:
+        raise HTTPException(status_code=404, detail="Quote not found")
+
+    from printlogic_push import push_quote
+    result = push_quote(db, q, org_slug)
+    db.commit()
+    db.refresh(q)
+    return {
+        "quote": _quote_to_dict(q),
+        "result": result,
+    }
+
+
+@router.post("/orgs/{org_slug}/quotes/{quote_id}/cancel-printlogic")
+def cancel_printlogic_order(
+    org_slug: str,
+    quote_id: int,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Rollback path — ask PrintLogic to mark a pushed order as Cancelled.
+    Required when a real push happened by mistake. If PrintLogic refuses
+    the cancellation (their UI may have already moved the order into
+    production), Justin deletes manually from his side.
+
+    If the order_id starts with `DRY-`, we just clear the local row —
+    there's nothing upstream to cancel.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+    q = _scope(db.query(Quote), Quote, claims, org_slug).filter(Quote.id == quote_id).first()
+    if not q:
+        raise HTTPException(status_code=404, detail="Quote not found")
+
+    from printlogic_push import cancel_pushed_order
+    result = cancel_pushed_order(db, q, org_slug)
+    if result.get("ok"):
+        # Clear the local ids so the "Push" button becomes available again
+        q.printlogic_order_id = None
+        q.printlogic_customer_id = None
+        q.printlogic_pushed_at = None
+        q.printlogic_last_error = None
+    db.commit()
+    db.refresh(q)
+    return {
+        "quote": _quote_to_dict(q),
+        "result": result,
+    }
 
 
 # ============================================================================

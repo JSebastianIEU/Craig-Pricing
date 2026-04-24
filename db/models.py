@@ -262,6 +262,17 @@ class Quote(Base):
     notes = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
+    # PrintLogic integration (Phase A). `printlogic_order_id` stores either
+    # a real PrintLogic order id (pushed from the dashboard or from
+    # confirm_order) OR a synthetic "DRY-xxxxxxxx" id when the tenant's
+    # `printlogic_dry_run` Setting is still true. Non-null is the idempotency
+    # signal that prevents duplicate pushes.
+    printlogic_order_id = Column(String(64), nullable=True, index=True)
+    printlogic_customer_id = Column(String(64), nullable=True)
+    printlogic_pushed_at = Column(DateTime, nullable=True)
+    printlogic_last_error = Column(Text, nullable=True)
+    printlogic_push_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+
     conversation = relationship("Conversation", back_populates="quotes")
 
     __table_args__ = (

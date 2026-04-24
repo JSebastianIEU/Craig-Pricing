@@ -822,11 +822,35 @@ def _exec_tool(
                 if conv:
                     conv.status = "order_placed"
             db.flush()
+
+            # Best-effort push to PrintLogic. Respects the tenant's
+            # `printlogic_dry_run` flag (default True → synthetic DRY-xxxx id,
+            # zero network). Never raises or blocks the customer-facing reply:
+            # if PrintLogic is down, the customer still gets their
+            # "Order confirmed" message and Justin can retry from the
+            # dashboard button.
+            #
+            # The LLM reply text does NOT mention PrintLogic — the extra
+            # fields below are for the API caller / logs, not the
+            # customer-facing draft.
+            pl: dict[str, object] = {"ok": False, "error": "not_attempted"}
+            try:
+                from printlogic_push import push_quote
+                pl = push_quote(db, q, organization_slug)
+            except Exception as e:
+                # Defense-in-depth: even if the push module itself blows up
+                # (import error, DB weirdness), we keep the customer path alive.
+                pl = {"ok": False, "error": f"push_crashed:{type(e).__name__}"}
+
             return {
                 "confirmed": True,
                 "quote_id": qid,
                 "ref": f"JP-{qid:04d}",
                 "message": "Order confirmed. Justin will be in touch with next steps.",
+                "printlogic_pushed": bool(pl.get("ok")),
+                "printlogic_order_id": pl.get("order_id"),
+                "printlogic_dry_run": bool(pl.get("dry_run")),
+                "printlogic_error": pl.get("error"),
             }
 
         return {"error": f"Unknown tool: {name}"}
