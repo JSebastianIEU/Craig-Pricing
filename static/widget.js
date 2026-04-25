@@ -377,6 +377,41 @@
             padding: 4px 10px;
         }
 
+        /* ===== Error banner ===== */
+        .jp-error-banner {
+            background: #fff4f4;
+            color: #040f2a;
+            border-left: 4px solid #d33;
+            padding: 10px 14px;
+            margin: 8px 0;
+            border-radius: 6px;
+            font-size: 13px;
+            line-height: 1.4;
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            animation: jp-fade-in 200ms ease;
+        }
+        .jp-error-banner.jp-hidden { display: none; }
+        .jp-error-banner-icon {
+            flex-shrink: 0;
+            font-size: 16px;
+            line-height: 1.2;
+        }
+        .jp-error-banner-close {
+            background: transparent;
+            border: 0;
+            color: #6b7a99;
+            cursor: pointer;
+            font-size: 18px;
+            line-height: 1;
+            padding: 0 0 0 8px;
+        }
+        @keyframes jp-fade-in {
+            from { opacity: 0; transform: translateY(-4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
         .jp-typing {
             align-self: flex-start;
             background: #fff;
@@ -822,6 +857,11 @@
 
             <div class="jp-body">
                 <div class="jp-view" id="jpChatView">
+                    <div class="jp-error-banner jp-hidden" id="jpErrorBanner" role="alert" aria-live="polite">
+                        <span class="jp-error-banner-icon">⚠</span>
+                        <span id="jpErrorBannerText">Couldn't reach Just Print's quoting agent. Try again in a moment, or email info@just-print.ie.</span>
+                        <button class="jp-error-banner-close" id="jpErrorBannerClose" aria-label="Dismiss">×</button>
+                    </div>
                     <div class="jp-messages" id="jpMessages"></div>
                     <div class="jp-input-area">
                         <input type="text" class="jp-input" id="jpInput" placeholder="What are you looking to print?" autocomplete="off">
@@ -952,6 +992,31 @@
         const messagesEl = $('jpMessages');
         const input = $('jpInput');
         const sendBtn = $('jpSendBtn');
+        const errorBanner = $('jpErrorBanner');
+        const errorBannerText = $('jpErrorBannerText');
+        const errorBannerClose = $('jpErrorBannerClose');
+
+        // Error banner state. Auto-hides after 8s, hides on next successful
+        // chat round-trip, or on click of the X. Shows on:
+        //   - any catch (network down, DNS, etc.)
+        //   - any res.status >= 500
+        //   - any data.error field returned from the server
+        let errorBannerTimer = null;
+        function showErrorBanner(msg) {
+            errorBannerText.textContent =
+                msg || "Couldn't reach Just Print's quoting agent. Try again in a moment, or email info@just-print.ie.";
+            errorBanner.classList.remove('jp-hidden');
+            if (errorBannerTimer) clearTimeout(errorBannerTimer);
+            errorBannerTimer = setTimeout(hideErrorBanner, 8000);
+        }
+        function hideErrorBanner() {
+            errorBanner.classList.add('jp-hidden');
+            if (errorBannerTimer) {
+                clearTimeout(errorBannerTimer);
+                errorBannerTimer = null;
+            }
+        }
+        errorBannerClose.addEventListener('click', hideErrorBanner);
 
         let lastQuoteId = null;
         let lastQuoteData = null;  // store full tool_calls data from pricing turn
@@ -1081,11 +1146,31 @@
                         organization_slug: CLIENT_SLUG,
                     }),
                 });
+                // 5xx → server is unhealthy; 429 → rate limited; both surface
+                // the banner so the user knows it's a transient infra issue,
+                // not Craig being weird at them.
+                if (res.status >= 500) {
+                    showErrorBanner();
+                    return { reply: '', _failed: true };
+                }
+                if (res.status === 429) {
+                    showErrorBanner('Too many messages too fast. Give it a few seconds and try again.');
+                    return { reply: '', _failed: true };
+                }
                 const data = await res.json();
                 conversationId = data.conversation_id || conversationId;
+                // Server may include an `error` field on otherwise-200 responses
+                // (e.g. when the LLM call partially succeeded).
+                if (data.error) {
+                    showErrorBanner();
+                } else {
+                    // Success — banner from any prior failure is now stale, hide it.
+                    hideErrorBanner();
+                }
                 return data;
             } catch (e) {
-                return { reply: 'Network error: ' + e.message };
+                showErrorBanner();
+                return { reply: '', _failed: true };
             }
         }
 

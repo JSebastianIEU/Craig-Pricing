@@ -229,3 +229,92 @@ def test_strict_pydantic_rejects_extra_fields():
         },
     )
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Integrations status endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_integrations_status_returns_three_blocks():
+    """Smoke: endpoint returns the three integrations + computed_at timestamp."""
+    r = client.get(
+        "/admin/api/orgs/just-print/integrations/status",
+        headers=_auth("client_member"),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body.keys()) >= {"missive", "printlogic", "stripe", "computed_at"}
+    for k in ("missive", "printlogic", "stripe"):
+        block = body[k]
+        # Every block has the same surface contract
+        assert "configured" in block
+        assert "enabled" in block
+        assert "health" in block
+        assert block["health"] in ("green", "yellow", "red", "unknown")
+        assert "stats_30d" in block
+
+
+def test_integrations_status_printlogic_yellow_in_dry_run():
+    """V13 seeds printlogic_dry_run=true → printlogic should be yellow."""
+    r = client.get(
+        "/admin/api/orgs/just-print/integrations/status",
+        headers=_auth("client_member"),
+    )
+    assert r.status_code == 200
+    pl = r.json()["printlogic"]
+    assert pl["dry_run"] is True
+    # In dry-run we expect yellow (or unknown if api_key empty, which is the
+    # local-dev case). Either way NOT green and NOT red.
+    assert pl["health"] in ("yellow", "unknown")
+
+
+def test_integrations_status_stripe_unknown_when_disabled():
+    """V16 seeds stripe_enabled=false by default → unknown."""
+    r = client.get(
+        "/admin/api/orgs/just-print/integrations/status",
+        headers=_auth("client_member"),
+    )
+    body = r.json()["stripe"]
+    assert body["enabled"] is False
+    assert body["health"] == "unknown"
+
+
+def test_integrations_status_requires_auth():
+    r = client.get("/admin/api/orgs/just-print/integrations/status")
+    assert r.status_code == 401
+
+
+def test_integrations_status_blocks_other_org_for_client_member():
+    r = client.get(
+        "/admin/api/orgs/some-other-tenant/integrations/status",
+        headers=_auth("client_member"),
+    )
+    # client_member can only see their own org
+    assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter integration smoke (just confirms 429 fires on /chat)
+# ---------------------------------------------------------------------------
+
+
+def test_chat_endpoint_rate_limit_fires_at_threshold():
+    """30 req/min on /chat (rate_limit('chat', 30)). 31st should 429.
+
+    Uses unique X-Forwarded-For per test so other tests don't bleed into this
+    bucket and vice versa.
+    """
+    import rate_limiter
+    rate_limiter._reset_for_tests()
+    headers = {"X-Forwarded-For": "203.0.113.99"}  # TEST-NET-3, can't be real
+    # 30 should pass (well, rate-limit-wise — they may fail on body validation,
+    # but that's after the dependency runs).
+    seen_429 = False
+    for _ in range(35):
+        r = client.post("/chat", json={"message": "test"}, headers=headers)
+        if r.status_code == 429:
+            seen_429 = True
+            break
+    assert seen_429, "Expected at least one 429 within 35 requests"
+    rate_limiter._reset_for_tests()

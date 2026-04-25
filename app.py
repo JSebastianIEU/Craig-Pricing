@@ -26,6 +26,7 @@ import os
 import re as _re
 
 import missive
+from rate_limiter import rate_limit
 from db import get_db, init_db, SessionLocal
 from db.models import Conversation, Quote
 from pricing_engine import (
@@ -199,7 +200,7 @@ def widget_config(client: str, db: Session = Depends(get_db)):
     }
 
 
-@app.post("/chat", tags=["Chat"])
+@app.post("/chat", tags=["Chat"], dependencies=[Depends(rate_limit("chat", 30))])
 def chat(req: ChatRequest, db: Session = Depends(get_db)):
     """
     Main conversational endpoint. Send a user message, get Craig's reply.
@@ -707,7 +708,11 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
         db.close()
 
 
-@app.post("/webhook/missive/{org_slug}", tags=["Missive"])
+@app.post(
+    "/webhook/missive/{org_slug}",
+    tags=["Missive"],
+    dependencies=[Depends(rate_limit("missive_webhook", 60))],
+)
 async def missive_webhook(
     org_slug: str,
     request: Request,

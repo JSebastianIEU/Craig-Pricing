@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
+
+from rate_limiter import rate_limit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -1079,6 +1081,34 @@ def cancel_printlogic_order(
 
 
 # ============================================================================
+# Integrations health / status
+# ============================================================================
+
+
+@router.get("/orgs/{org_slug}/integrations/status")
+def integrations_status(
+    org_slug: str,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Health summary per integration (Missive, PrintLogic, Stripe). Read-only.
+
+    Returns one block per integration with `configured` / `enabled` /
+    `health` (green|yellow|red|unknown) / `last_success_at` / `last_error`
+    / `stats_30d`. The dashboard renders this as a card on the Overview
+    tab plus colored pills inside each Connections sub-tab.
+
+    Cheap to call (3-4 indexed COUNTs + 3 ORDER BY DESC LIMIT 1) — fine to
+    poll every 30 seconds from the dashboard.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_member")
+    from integrations_status import compute_integration_status
+    return compute_integration_status(db, org_slug)
+
+
+# ============================================================================
 # Stripe payment links
 # ============================================================================
 
@@ -1151,7 +1181,10 @@ def cancel_stripe_payment_link(
 # ============================================================================
 
 
-@router.post("/webhooks/stripe/{org_slug}")
+@router.post(
+    "/webhooks/stripe/{org_slug}",
+    dependencies=[Depends(rate_limit("stripe_webhook", 120))],
+)
 async def stripe_webhook(
     org_slug: str,
     request: Request,
