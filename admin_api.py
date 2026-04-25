@@ -833,7 +833,18 @@ def delete_surcharge(
 
 
 def _setting_to_dict(s: Setting) -> dict[str, Any]:
-    return {"key": s.key, "value": s.value, "value_type": s.value_type, "description": s.description}
+    """
+    Serialize a Setting for the API response. SECRET KEYS are masked
+    here — the raw value never leaves the server. See settings_security
+    for the allowlist + rationale.
+    """
+    from settings_security import mask_value
+    return {
+        "key": s.key,
+        "value": mask_value(s.key, s.value),
+        "value_type": s.value_type,
+        "description": s.description,
+    }
 
 
 @router.get("/orgs/{org_slug}/settings")
@@ -873,6 +884,21 @@ def update_setting(
     """
     access_guard(org_slug, claims)
     require_role(claims, "client_owner")
+    # Block the round-trip footgun: if the dashboard fetched a masked secret
+    # and saves the form without retyping, body.value would be "********".
+    # We refuse to overwrite a real secret with the mask string.
+    from settings_security import is_secret, is_mask
+    if is_secret(key) and is_mask(body.value):
+        # No-op: return current state without touching the row
+        existing = (
+            _scope(db.query(Setting), Setting, claims, org_slug)
+            .filter(Setting.key == key)
+            .first()
+        )
+        if existing is None:
+            raise HTTPException(status_code=400, detail="cannot save mask as new secret")
+        return {"setting": _setting_to_dict(existing)}
+
     s = _scope(db.query(Setting), Setting, claims, org_slug).filter(Setting.key == key).first()
 
     if s is None:
@@ -907,7 +933,14 @@ def update_setting(
         except ValueError:
             raise HTTPException(status_code=400, detail=f"'{key}' must be valid JSON")
 
-    s.value = body.value
+    # Encrypt at rest if this is a secret key. Non-secret values are
+    # written as-is (no envelope) so JSON / float casts elsewhere keep
+    # working. See secrets_crypto for the threat model.
+    if is_secret(key):
+        from secrets_crypto import encrypt
+        s.value = encrypt(body.value)
+    else:
+        s.value = body.value
     db.commit()
     db.refresh(s)
     return {"setting": _setting_to_dict(s)}
@@ -1106,6 +1139,152 @@ def integrations_status(
     require_role(claims, "client_member")
     from integrations_status import compute_integration_status
     return compute_integration_status(db, org_slug)
+
+
+# ============================================================================
+# Connection tests — validate stored credentials without side effects
+# ============================================================================
+
+
+@router.post("/orgs/{org_slug}/integrations/printlogic/test")
+def test_printlogic_connection(
+    org_slug: str,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Read-only smoke test of the stored PrintLogic api_key. Calls
+    `find_customer` with a sentinel email — if PrintLogic returns 200
+    (whether or not the customer exists), auth + firm-binding are good.
+
+    Returns `{ok, message, raw}`. Never writes to PrintLogic. Never
+    crashes — wraps printlogic.find_customer's already-safe return.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    from pricing_engine import _get_setting
+    api_key = _get_setting(db, "printlogic_api_key", default="", organization_slug=org_slug)
+    if not api_key:
+        return {"ok": False, "message": "no api_key set", "raw": None}
+
+    import asyncio
+    import printlogic
+    try:
+        result = asyncio.run(printlogic.find_customer(
+            api_key, email="ping-from-craig-test@example.invalid"
+        ))
+    except Exception as e:
+        return {"ok": False, "message": f"crashed: {type(e).__name__}", "raw": None}
+
+    if result.get("error"):
+        # network / auth failure
+        return {
+            "ok": False,
+            "message": f"PrintLogic rejected the key: {result['error']}",
+            "raw": result.get("raw"),
+        }
+    # ok=True with customer=None is the expected "auth works, no such customer"
+    # response — that's a green light.
+    return {
+        "ok": True,
+        "message": "PrintLogic auth confirmed (api_key + firm binding valid)",
+        "raw": None,
+    }
+
+
+@router.post("/orgs/{org_slug}/integrations/stripe/test")
+def test_stripe_connection(
+    org_slug: str,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Validate the stored Stripe secret key by calling the lightest possible
+    Stripe endpoint (`GET /v1/account`). 200 = key works. 401 = wrong key.
+
+    Does NOT validate the webhook secret — that only proves itself when
+    Stripe actually delivers a signed event. We can only check it's
+    non-empty.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    from pricing_engine import _get_setting
+    api_key = _get_setting(db, "stripe_secret_key", default="", organization_slug=org_slug)
+    whsec = _get_setting(db, "stripe_webhook_secret", default="", organization_slug=org_slug)
+
+    if not api_key:
+        return {"ok": False, "message": "no stripe_secret_key set"}
+
+    # Lightweight whoami call. Don't pull the stripe SDK in — direct httpx.
+    import httpx
+    try:
+        r = httpx.get(
+            "https://api.stripe.com/v1/account",
+            auth=(api_key, ""),
+            timeout=httpx.Timeout(10.0, connect=5.0),
+        )
+    except httpx.HTTPError as e:
+        return {"ok": False, "message": f"network: {type(e).__name__}"}
+
+    if r.status_code == 401:
+        return {"ok": False, "message": "Stripe rejected the key (401 unauthorized)"}
+    if r.status_code >= 400:
+        try:
+            err = r.json().get("error", {}).get("message", "unknown")
+        except Exception:
+            err = r.text[:200]
+        return {"ok": False, "message": f"Stripe error: {err}"}
+
+    try:
+        info = r.json()
+        account_id = info.get("id")
+        country = info.get("country")
+        livemode = bool(info.get("charges_enabled")) and not info.get("details_submitted") is False
+    except Exception:
+        return {"ok": False, "message": "malformed response"}
+
+    msg = f"Connected to Stripe account {account_id} ({country})"
+    if not whsec:
+        msg += " — webhook secret not yet set"
+    return {"ok": True, "message": msg, "account_id": account_id, "webhook_secret_set": bool(whsec)}
+
+
+@router.post("/orgs/{org_slug}/integrations/missive/test")
+def test_missive_connection(
+    org_slug: str,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Validate the stored Missive API token by calling `GET /v1/users/me`
+    (cheapest authed endpoint). 200 = token works.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    from pricing_engine import _get_setting
+    token = _get_setting(db, "missive_api_token", default="", organization_slug=org_slug)
+    if not token:
+        return {"ok": False, "message": "no missive_api_token set"}
+
+    import httpx
+    try:
+        r = httpx.get(
+            "https://public.missiveapp.com/v1/users",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=httpx.Timeout(10.0, connect=5.0),
+        )
+    except httpx.HTTPError as e:
+        return {"ok": False, "message": f"network: {type(e).__name__}"}
+
+    if r.status_code == 401:
+        return {"ok": False, "message": "Missive rejected the token (401 unauthorized)"}
+    if r.status_code >= 400:
+        return {"ok": False, "message": f"Missive HTTP {r.status_code}: {r.text[:200]}"}
+
+    return {"ok": True, "message": "Missive token validated"}
 
 
 # ============================================================================

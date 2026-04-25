@@ -77,13 +77,17 @@ def _get_setting(
     )
     if row is None:
         return default
+    # Decrypt if needed. Non-secret rows pass through unchanged (no `enc::v1::`
+    # prefix → no-op). Secret rows get decrypted before any type cast below.
+    from secrets_crypto import decrypt
+    raw = decrypt(row.value)
     if row.value_type == "float":
-        return float(row.value)
+        return float(raw)
     if row.value_type == "int":
-        return int(row.value)
+        return int(raw)
     if row.value_type == "json":
-        return json.loads(row.value)
-    return row.value
+        return json.loads(raw)
+    return raw
 
 
 def _get_surcharge(

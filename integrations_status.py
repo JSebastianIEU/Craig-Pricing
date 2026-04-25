@@ -49,12 +49,16 @@ def _truthy(val: str | None) -> bool:
 
 
 def _setting(db: Session, organization_slug: str, key: str) -> str | None:
+    """Read a Setting value, transparently decrypting secret-keyed rows."""
+    from secrets_crypto import decrypt
     row = (
         db.query(Setting)
         .filter_by(organization_slug=organization_slug, key=key)
         .first()
     )
-    return row.value if row else None
+    if row is None:
+        return None
+    return decrypt(row.value)
 
 
 def _now() -> _dt.datetime:

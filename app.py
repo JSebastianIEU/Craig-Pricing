@@ -44,19 +44,30 @@ app = FastAPI(
 
 # CORS — required for widget embedded on just-print.ie AND
 # for the Strategos Dashboard calling /admin/api/* from Vercel.
+# CORS — production origins only by default. Local dev origins are added
+# only when CRAIG_ENV=dev, so a misconfigured prod deploy can't accept
+# requests from a developer's localhost.
+_PROD_ORIGINS = [
+    "https://just-print.ie",
+    "https://www.just-print.ie",
+    "https://strategos-dashboard.vercel.app",
+    "https://strategos-dashboard-jsebastianieus-projects.vercel.app",
+    "https://agents.strategos-ai.com",
+]
+_DEV_ORIGINS = [
+    "http://localhost:8000",
+    "http://localhost:8080",
+    "http://localhost:3000",
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:3000",
+]
+_allowed_origins = list(_PROD_ORIGINS)
+if os.environ.get("CRAIG_ENV", "").lower() == "dev":
+    _allowed_origins.extend(_DEV_ORIGINS)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://just-print.ie",
-        "https://www.just-print.ie",
-        "http://localhost:8000",
-        "http://localhost:8080",
-        "http://localhost:3000",           # strategos-dashboard dev
-        "http://127.0.0.1:8000",
-        "http://127.0.0.1:3000",
-        "https://strategos-dashboard.vercel.app",
-        "https://strategos-dashboard-jsebastianieus-projects.vercel.app",
-    ],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

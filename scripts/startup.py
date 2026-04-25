@@ -69,6 +69,7 @@ def main() -> None:
     from scripts.v14_client_multiplier_seed import seed as v14_seed
     from scripts.v15_stripe_cols import migrate as v15_migrate
     from scripts.v16_stripe_settings_seed import seed as v16_seed
+    from scripts.v17_encrypt_existing_secrets import migrate as v17_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -85,6 +86,7 @@ def main() -> None:
     _run("v14 client multiplier seed", v14_seed)
     _run("v15 stripe columns on quotes", v15_migrate)
     _run("v16 stripe settings seed", v16_seed)
+    _run("v17 encrypt existing secrets (soft-skips if no key)", v17_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

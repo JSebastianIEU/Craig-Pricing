@@ -11,3 +11,7 @@ pytest>=8.0.0
 # Postgres driver for Cloud SQL. Pure-Python = no compilation needed in the
 # slim container. SQLAlchemy talks to it via the postgresql+pg8000 dialect.
 pg8000>=1.30.0
+# Symmetric encryption for at-rest secrets (Fernet/AES-128). The Fernet key
+# itself is sourced from CRAIG_SECRETS_KEY env var (mounted by Cloud Run from
+# Secret Manager). See secrets_crypto.py.
+cryptography>=42.0.0
