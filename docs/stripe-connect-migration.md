@@ -1,124 +1,222 @@
-# TODO: Migrate to Stripe Connect for one-click onboarding
+# Stripe Connect runbook
 
-**Status:** documented for future work, NOT scheduled.
-**Priority:** medium — pays off from the second client onwards.
-**Effort:** 1-2 dev-days.
+**Status:** implemented and deployed.
+**What it replaces:** the manual paste-`sk_***` + paste-`whsec_***`
+flow that was the original Phase B.
 
----
-
-## Why this matters
-
-Today every new tenant has to:
-
-1. Generate `sk_live_...` from their Stripe dashboard
-2. Register a webhook endpoint and copy `whsec_...`
-3. Paste both into our dashboard
-4. Toggle `stripe_enabled=true`
-
-That's ~15 minutes of guided setup per tenant, and **we end up storing
-their secret API key** in our DB (encrypted, but still — defense in
-depth says don't store what you don't need to).
-
-**Stripe Connect** flips this:
-
-1. Tenant clicks **"Connect with Stripe"** in our dashboard
-2. Redirected to Stripe's OAuth flow → authenticates as their account
-3. Returned to us with a `stripe_user_id` and OAuth-scoped tokens
-4. We charge / refund / create payment links **on their behalf** using
-   our platform key + their `stripe_user_id`
-
-Benefits:
-- **One click** for the tenant — no copy-paste, no key generation
-- **We never see their secret key** — Stripe issues us a scoped token
-- **Webhook secret can be auto-provisioned** via Stripe Connect API
-- **Standard pattern** used by Shopify, Substack, Lemon Squeezy, every
-  modern SaaS that processes payments for clients
-
-Drawbacks:
-- Requires creating a **Strategos AI platform account** on Stripe (KYC
-  business verification, ~30 min for Roi)
-- We become subject to Stripe's platform-level rules (compliance reviews
-  if Strategos's volume grows past their thresholds — irrelevant
-  immediately)
-- Existing tenant (Just Print, configured manually) needs a one-time
-  migration to Connect
+This doc is the operator's runbook for getting Stripe Connect live for
+the platform (one-time, Roi's job) and for onboarding any new tenant
+(per-tenant, ~30 seconds for the user).
 
 ---
 
-## Implementation outline
+## Why Connect
 
-### Backend changes
+Onboarding a tenant pre-Connect:
+1. Generate `sk_live_***` from their Stripe dashboard
+2. Register a webhook endpoint on Stripe's side
+3. Copy the `whsec_***` signing secret
+4. Paste both into our dashboard
 
-1. **New columns on the per-tenant Settings (or a new `StripeAccount` table):**
-   - `stripe_account_id` — Connect account id (`acct_...`)
-   - `stripe_access_token` — OAuth refresh token (encrypted via existing crypto layer)
-   - `stripe_connected_at` — when the OAuth flow completed
-   - `stripe_user_email` — the email Stripe associates with the account
+~15 minutes per tenant, plus we end up custodian of their secret API keys.
 
-2. **OAuth callback endpoint:**
-   ```python
-   @router.get("/oauth/stripe/callback")
-   def stripe_oauth_callback(code: str, state: str): ...
-   ```
-   `state` carries the `org_slug` (HMAC-signed to prevent tampering).
-   Exchange `code` → `access_token` → store on tenant.
+Onboarding a tenant post-Connect:
+1. Click **"Connect with Stripe"**
+2. Authorize on Stripe's consent screen
+3. Done
 
-3. **Modify `stripe_client.create_payment_link`:**
-   - Today: uses tenant's `sk_live` directly via Basic Auth
-   - Connect: uses Strategos platform key + `Stripe-Account: acct_...`
-     header (the on-behalf-of pattern)
-
-4. **Webhook auto-registration:**
-   - When tenant connects, immediately call `POST /v1/webhook_endpoints`
-     scoped to their account, set our URL, store the returned `whsec_`.
-     Auto-subscribe to `checkout.session.completed`,
-     `payment_intent.succeeded`, `payment_intent.payment_failed`,
-     `charge.refunded`.
-
-### Dashboard changes
-
-1. **StripeTab.tsx:**
-   - Replace the "paste secret key + paste whsec" flow with a single
-     `<Button>Connect with Stripe</Button>` that opens the OAuth URL
-     in a popup
-   - On success: refresh the tab, show "Connected to acct_xxx (email)"
-     with a "Disconnect" button
-   - The `Test connection` button stays — same as today but uses the
-     Connect tokens
-
-2. **Pricing for the platform fee:**
-   - Stripe Connect "Standard" type → no platform fee (money flows
-     directly to tenant). Use this. We don't take a cut.
-   - "Express" / "Custom" charge platform fees — out of scope.
-
-### Migration for Just Print (one-off)
-
-1. Create the platform account on Stripe (Roi)
-2. Deploy the Connect endpoints to staging
-3. Justin clicks "Connect with Stripe" once → his existing account links
-4. We delete his stored `sk_live` and `whsec` from the Settings table
-5. Verify a test payment round-trips with the new flow
+~30 seconds. We never see, store, or transmit their secret key — Stripe
+issues us scoped tokens. Same UX pattern as Shopify, Substack, Lemon
+Squeezy.
 
 ---
 
-## When to do this
+## One-time platform setup (Roi)
 
-**Trigger conditions** (any one):
-- We're onboarding our 2nd client
-- A security audit specifically flags "we store tenant secret keys"
-- Stripe sends us a deprecation notice on the API key in URL header
-  pattern (unlikely, but)
+These six steps are blocked by Stripe's KYC review for any new platform.
+Allow ~1 day for approval.
 
-**Until then**: manual paste-and-save flow is fine. The encryption-at-rest
-layer added in `secrets_crypto.py` mitigates the immediate risk.
+### 1. Apply for Connect on the Strategos AI Stripe account
+
+[Dashboard → Settings → Connect](https://dashboard.stripe.com/settings/connect/onboarding-options).
+Choose **Standard** account type. Standard means:
+- Each tenant has their own Stripe account
+- Money flows directly to the tenant's bank
+- No platform fee unless we explicitly add one (we don't)
+- Tenants manage their own payouts, refunds, disputes in their dashboard
+
+### 2. Get the OAuth client id
+
+Once approved, in Connect → Settings → Integration, find
+**OAuth settings**. The `client_id` looks like `ca_*****************`.
+Copy it.
+
+### 3. Generate platform secret keys
+
+Two of them:
+- **Test:** `sk_test_strategos_***` — for staging + local dev
+- **Live:** `sk_live_strategos_***` — for prod
+
+These are the platform's "I am Strategos" keys. They authenticate every
+API call we make to Stripe. We then add a `Stripe-Account: acct_xxx`
+header on each call to act on behalf of a connected tenant.
+
+### 4. Configure OAuth redirect URI
+
+In Connect → Settings → Integration → Redirects, add the exact URL of
+our backend callback:
+
+```
+https://craig-pricing-277215252762.europe-west1.run.app/admin/api/oauth/stripe/callback
+```
+
+If we ever change Cloud Run URLs, this must be updated in lockstep or
+Stripe will reject the OAuth flow with `redirect_uri_mismatch`.
+
+### 5. Configure platform-level webhook endpoint
+
+In Webhooks → **Add endpoint**:
+- URL: `https://craig-pricing-277215252762.europe-west1.run.app/admin/api/webhooks/stripe-connect`
+- **Mode: "Connected accounts"** ← critical, NOT "Your account"
+- Events to subscribe to:
+  - `checkout.session.completed`
+  - `payment_intent.succeeded`
+  - `payment_intent.payment_failed`
+  - `charge.refunded`
+
+Copy the resulting signing secret (`whsec_***`).
+
+This single endpoint receives events from EVERY connected tenant. Each
+event has an `account: 'acct_xxx'` field at the top level — our handler
+looks up which tenant owns that account_id and routes the event to
+their Quote table.
+
+### 6. Provision the 3 secrets in Google Secret Manager
+
+```bash
+gcloud secrets create strategos-stripe-platform-key \
+    --replication-policy=automatic
+echo -n "sk_live_strategos_***REPLACE***" \
+    | gcloud secrets versions add strategos-stripe-platform-key --data-file=-
+
+gcloud secrets create strategos-stripe-connect-client-id \
+    --replication-policy=automatic
+echo -n "ca_***REPLACE***" \
+    | gcloud secrets versions add strategos-stripe-connect-client-id --data-file=-
+
+gcloud secrets create strategos-stripe-connect-webhook-secret \
+    --replication-policy=automatic
+echo -n "whsec_***REPLACE***" \
+    | gcloud secrets versions add strategos-stripe-connect-webhook-secret --data-file=-
+```
+
+Grant the Cloud Run service account access:
+
+```bash
+SA=277215252762-compute@developer.gserviceaccount.com
+for SECRET in strategos-stripe-platform-key \
+              strategos-stripe-connect-client-id \
+              strategos-stripe-connect-webhook-secret; do
+    gcloud secrets add-iam-policy-binding $SECRET \
+        --member=serviceAccount:$SA \
+        --role=roles/secretmanager.secretAccessor
+done
+```
+
+Mount them as env vars on the Cloud Run service:
+
+```bash
+gcloud run services update craig-pricing --region=europe-west1 \
+    --update-secrets=\
+STRATEGOS_STRIPE_PLATFORM_KEY=strategos-stripe-platform-key:latest,\
+STRATEGOS_STRIPE_CONNECT_CLIENT_ID=strategos-stripe-connect-client-id:latest,\
+STRATEGOS_STRIPE_CONNECT_WEBHOOK_SECRET=strategos-stripe-connect-webhook-secret:latest
+```
+
+Cloud Run redeploys automatically. Within 30 seconds, the new revision
+is live and the dashboard's StripeTab "Connect with Stripe" button
+becomes functional.
 
 ---
 
-## Reference
+## Per-tenant onboarding (the user)
 
-- Stripe Connect docs: https://stripe.com/docs/connect
-- OAuth flow: https://stripe.com/docs/connect/oauth-reference
-- Direct charges with Connect:
-  https://stripe.com/docs/connect/direct-charges#using-the-stripe-account-header
-- Migration guide for moving existing accounts:
-  https://stripe.com/docs/connect/standard-accounts#migrating
+When a new client (e.g. Just Print) wants to enable Stripe payments:
+
+1. Sign in to https://agents.strategos-ai.com → their workspace
+2. Navigate to **Craig → Connections → Stripe**
+3. Click **"Connect with Stripe"**
+4. Stripe takes over: choose existing account or create new one (~2 min if new)
+5. Approve the consent screen
+6. Land back on the dashboard with a green "Connected to Stripe" toast
+
+After this, every confirmed quote auto-generates a Payment Link. Money
+goes directly to the tenant's bank — Strategos doesn't custody funds.
+
+---
+
+## Disconnect / re-connect
+
+The tenant can click **Disconnect** anytime in the StripeTab. That:
+1. Calls Stripe's `/oauth/deauthorize` to revoke our access
+2. Clears the local `stripe_account_id`, `stripe_access_token`,
+   `stripe_publishable_key`, `stripe_connected_at`, `stripe_user_email`
+
+Existing Payment Links stay valid until the tenant cancels them in
+Stripe directly. Already-paid quotes are unaffected.
+
+To reconnect: click **Connect with Stripe** again. The tenant goes
+through OAuth a second time. Each fresh connection mints new tokens.
+
+---
+
+## Code map
+
+| File | Role |
+|---|---|
+| `stripe_connect.py` | OAuth helpers — state signing/verify, code exchange, deauthorize. Reads platform creds from env vars at module load |
+| `stripe_client.py` | HTTP client for Stripe REST API. `account_id` param gates the Stripe-Account header injection |
+| `stripe_push.py` | Orchestrator — reads `stripe_account_id` (not `stripe_secret_key`), passes it through `create_payment_link` |
+| `admin_api.py` | Endpoints: `POST /orgs/:slug/oauth/stripe/authorize-url`, `GET /oauth/stripe/callback`, `POST /orgs/:slug/oauth/stripe/disconnect`, `POST /webhooks/stripe-connect`, `GET /orgs/:slug/integrations/stripe/connect-status` |
+| `scripts/v16_stripe_settings_seed.py` | Seeds the 5 new Connect-era setting keys with empty placeholders |
+| `scripts/v18_stripe_connect_migration.py` | Deletes legacy `stripe_secret_key` + `stripe_webhook_secret` rows |
+| `settings_security.py` | `SECRET_KEYS` includes `stripe_access_token` (the only Stripe secret we still custody, encrypted via Fernet) |
+
+Tests: `test_stripe.py` (auth-path updates) + `test_stripe_connect.py`
+(state signing, code exchange, webhook routing). Default suite: 158
+tests, all green.
+
+---
+
+## Rollback
+
+If something is misbehaving badly, `stripe_enabled=false` per tenant
+disables link creation without disconnecting. Setting takes effect on
+the next quote confirmation (no deploy required).
+
+If the platform-level whsec leaks: rotate it in Stripe Connect →
+Webhooks → endpoint → Signing secret → "Roll secret". Update Secret
+Manager:
+
+```bash
+echo -n "whsec_NEW_***" \
+    | gcloud secrets versions add strategos-stripe-connect-webhook-secret --data-file=-
+gcloud run services update craig-pricing --region=europe-west1
+```
+
+Cloud Run picks up the new secret on next deploy. The old whsec keeps
+working for ~24h per Stripe's grace period.
+
+If the platform OAuth client_id is compromised: revoke it in Connect
+settings, generate a new one. ALL tenants will need to re-connect (the
+old `stripe_user_id` values become invalid). This is a nuclear option.
+
+---
+
+## Out of scope
+
+- Stripe Connect Express / Custom (we only support Standard)
+- Embedded Stripe.js / Elements (Payment Links work; Elements is future)
+- Payouts / disputes UI (handled in tenant's own Stripe dashboard)
+- Reacting to `account.application.deauthorized` (when a tenant revokes
+  from Stripe's side without telling us — they re-connect to recover)

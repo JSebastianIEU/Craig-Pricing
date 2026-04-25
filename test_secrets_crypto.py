@@ -37,27 +37,37 @@ from settings_security import SECRET_KEYS, SECRET_MASK, is_secret, is_mask, mask
 
 
 def test_secret_key_allowlist_matches_known_keys():
-    """The allowlist should contain exactly the 5 secret keys we recognize.
-    Adding a new tenant secret key must update SECRET_KEYS in the same PR."""
-    assert "stripe_secret_key" in SECRET_KEYS
-    assert "stripe_webhook_secret" in SECRET_KEYS
+    """The allowlist should contain exactly the secret keys we recognize.
+    Adding a new tenant secret key must update SECRET_KEYS in the same PR.
+
+    Post Stripe-Connect migration:
+      - stripe_secret_key + stripe_webhook_secret are GONE (replaced by
+        platform-level env vars + per-tenant OAuth tokens)
+      - stripe_access_token is the only Stripe secret we still custody
+    """
+    assert "stripe_access_token" in SECRET_KEYS
     assert "printlogic_api_key" in SECRET_KEYS
     assert "missive_api_token" in SECRET_KEYS
     assert "missive_webhook_secret" in SECRET_KEYS
+    # Post-migration these must NOT be in the allowlist
+    assert "stripe_secret_key" not in SECRET_KEYS
+    assert "stripe_webhook_secret" not in SECRET_KEYS
 
 
 def test_is_secret_handles_known_and_unknown():
-    assert is_secret("stripe_secret_key")
+    assert is_secret("stripe_access_token")
+    assert is_secret("printlogic_api_key")
+    assert not is_secret("stripe_account_id")  # account ids are not secrets
     assert not is_secret("system_prompt")
     assert not is_secret("vat_rate")
     assert not is_secret("")
 
 
 def test_mask_value_masks_secret_only_when_value_present():
-    assert mask_value("stripe_secret_key", "sk_live_abc") == SECRET_MASK
+    assert mask_value("stripe_access_token", "sk_acct_abc") == SECRET_MASK
     # Empty secret stays empty so frontend can show "not yet configured"
-    assert mask_value("stripe_secret_key", "") == ""
-    assert mask_value("stripe_secret_key", None) is None
+    assert mask_value("stripe_access_token", "") == ""
+    assert mask_value("stripe_access_token", None) is None
     # Non-secret keys pass through
     assert mask_value("system_prompt", "you are craig") == "you are craig"
 
@@ -164,11 +174,12 @@ def _auth() -> dict[str, str]:
 def test_get_settings_masks_secret_values():
     """GET /settings should return ******** for secret keys with a value
     set, and the raw value for non-secret keys."""
-    # Set a real secret first
+    # Use printlogic_api_key as the canonical secret-key example since
+    # stripe_* secret keys were retired in the Connect migration.
     r = _client.patch(
-        "/admin/api/orgs/just-print/settings/stripe_secret_key",
+        "/admin/api/orgs/just-print/settings/printlogic_api_key",
         headers=_auth(),
-        json={"value": "sk_test_real_secret_value_123", "value_type": "string"},
+        json={"value": "GA5_real_test_value_123", "value_type": "string"},
     )
     assert r.status_code == 200
 
@@ -176,29 +187,32 @@ def test_get_settings_masks_secret_values():
     r = _client.get("/admin/api/orgs/just-print/settings", headers=_auth())
     assert r.status_code == 200
     settings = {s["key"]: s["value"] for s in r.json()["settings"]}
-    assert settings.get("stripe_secret_key") == SECRET_MASK, (
-        "stripe_secret_key should be masked in GET responses"
+    assert settings.get("printlogic_api_key") == SECRET_MASK, (
+        "printlogic_api_key should be masked in GET responses"
     )
 
     # Non-secret keys should pass through
     if "vat_rate" in settings:
         assert settings["vat_rate"] != SECRET_MASK
+    # account_id is NOT a secret post-migration (Stripe shows it on receipts)
+    if "stripe_account_id" in settings:
+        assert settings["stripe_account_id"] != SECRET_MASK
 
 
 def test_patch_with_mask_string_does_not_clobber_real_secret():
     """If the dashboard saves the form without retyping, body.value is
     the literal '********'. We must NOT overwrite the real secret."""
-    # Plant a known-good real secret
+    # Plant a known-good real secret using a current secret-key
     r = _client.patch(
-        "/admin/api/orgs/just-print/settings/stripe_webhook_secret",
+        "/admin/api/orgs/just-print/settings/missive_webhook_secret",
         headers=_auth(),
-        json={"value": "whsec_real_value_keep_me", "value_type": "string"},
+        json={"value": "whsec_real_missive_keep_me", "value_type": "string"},
     )
     assert r.status_code == 200
 
     # Try to "save" with the mask
     r = _client.patch(
-        "/admin/api/orgs/just-print/settings/stripe_webhook_secret",
+        "/admin/api/orgs/just-print/settings/missive_webhook_secret",
         headers=_auth(),
         json={"value": SECRET_MASK, "value_type": "string"},
     )
@@ -209,8 +223,8 @@ def test_patch_with_mask_string_does_not_clobber_real_secret():
     from db import db_session
     from pricing_engine import _get_setting
     with db_session() as s:
-        actual = _get_setting(s, "stripe_webhook_secret", default="", organization_slug="just-print")
-    assert actual == "whsec_real_value_keep_me", (
+        actual = _get_setting(s, "missive_webhook_secret", default="", organization_slug="just-print")
+    assert actual == "whsec_real_missive_keep_me", (
         "saving '********' must not overwrite the real secret"
     )
 

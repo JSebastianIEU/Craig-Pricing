@@ -149,10 +149,13 @@ def _printlogic_status(db: Session, organization_slug: str) -> dict:
 
 
 def _stripe_status(db: Session, organization_slug: str) -> dict:
-    api_key = _setting(db, organization_slug, "stripe_secret_key") or ""
-    webhook_secret = _setting(db, organization_slug, "stripe_webhook_secret") or ""
+    # Connect-era: configured = the tenant has completed the OAuth flow
+    # (stripe_account_id is non-empty) AND the platform creds are present
+    # server-side. The platform creds are env vars, not per-tenant.
+    import stripe_connect
+    account_id = _setting(db, organization_slug, "stripe_account_id") or ""
     enabled = _truthy(_setting(db, organization_slug, "stripe_enabled"))
-    configured = bool(api_key) and bool(webhook_secret)
+    configured = bool(account_id) and stripe_connect.is_configured()
 
     cutoff = _now() - _dt.timedelta(days=ACTIVITY_WINDOW_DAYS)
     base = db.query(Quote).filter(
@@ -190,10 +193,13 @@ def _stripe_status(db: Session, organization_slug: str) -> dict:
     notes = None
     if not enabled:
         health = "unknown"
-        notes = "Disabled. Paste sk_*** + whsec_*** and flip stripe_enabled."
+        notes = "Disabled. Click 'Connect with Stripe' in Connections → Stripe to begin."
     elif not configured:
         health = "red"
-        notes = "stripe_enabled=true but secret key or webhook secret missing."
+        if not stripe_connect.is_configured():
+            notes = "stripe_enabled=true but Stripe Connect platform creds missing on the server (env vars)."
+        else:
+            notes = "stripe_enabled=true but tenant has not completed OAuth (no stripe_account_id)."
     else:
         recent_cutoff = _now() - _dt.timedelta(days=RECENT_SUCCESS_DAYS)
         had_recent_paid = last_paid_at and last_paid_at >= recent_cutoff

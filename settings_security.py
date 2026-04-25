@@ -22,8 +22,11 @@ from __future__ import annotations
 #      (prevents the dashboard's round-trip from overwriting a real
 #      secret with "********" if the user clicks Save without retyping)
 SECRET_KEYS: frozenset[str] = frozenset({
-    "stripe_secret_key",
-    "stripe_webhook_secret",
+    # Stripe Connect: the only Stripe secret we still custody. The platform
+    # key + webhook secret moved to env vars (see stripe_connect.py).
+    # Legacy `stripe_secret_key` and `stripe_webhook_secret` keys were
+    # removed when we migrated to OAuth — see scripts/v18_*.
+    "stripe_access_token",
     "printlogic_api_key",
     "missive_api_token",
     "missive_webhook_secret",

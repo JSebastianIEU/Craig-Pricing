@@ -1200,36 +1200,42 @@ def test_stripe_connection(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """
-    Validate the stored Stripe secret key by calling the lightest possible
-    Stripe endpoint (`GET /v1/account`). 200 = key works. 401 = wrong key.
+    Validate the Connect linkage by calling the lightest Stripe endpoint
+    (`GET /v1/account`) on behalf of the connected tenant.
 
-    Does NOT validate the webhook secret — that only proves itself when
-    Stripe actually delivers a signed event. We can only check it's
-    non-empty.
+    200 = the OAuth token still works AND the platform key is healthy.
+    401 = Stripe revoked us OR the platform key was rotated / invalidated.
+
+    Does NOT validate the platform-level webhook secret — that only
+    proves itself when Stripe actually delivers a signed event. The
+    Connect status endpoint reports whether it's set in env.
     """
+    import stripe_connect
     access_guard(org_slug, claims)
     require_role(claims, "client_owner")
 
     from pricing_engine import _get_setting
-    api_key = _get_setting(db, "stripe_secret_key", default="", organization_slug=org_slug)
-    whsec = _get_setting(db, "stripe_webhook_secret", default="", organization_slug=org_slug)
+    account_id = _get_setting(db, "stripe_account_id", default="", organization_slug=org_slug)
 
-    if not api_key:
-        return {"ok": False, "message": "no stripe_secret_key set"}
+    if not account_id:
+        return {"ok": False, "message": "Not connected. Click 'Connect with Stripe' to start the OAuth flow."}
+    if not stripe_connect.is_configured():
+        return {"ok": False, "message": "Server-side Stripe Connect platform credentials are missing."}
 
-    # Lightweight whoami call. Don't pull the stripe SDK in — direct httpx.
+    # Lightweight whoami call against the connected account.
     import httpx
     try:
         r = httpx.get(
             "https://api.stripe.com/v1/account",
-            auth=(api_key, ""),
+            auth=(stripe_connect.PLATFORM_KEY, ""),
+            headers={"Stripe-Account": account_id},
             timeout=httpx.Timeout(10.0, connect=5.0),
         )
     except httpx.HTTPError as e:
         return {"ok": False, "message": f"network: {type(e).__name__}"}
 
     if r.status_code == 401:
-        return {"ok": False, "message": "Stripe rejected the key (401 unauthorized)"}
+        return {"ok": False, "message": "Stripe rejected the connection (401). The user may have revoked access — try Disconnect + Connect again."}
     if r.status_code >= 400:
         try:
             err = r.json().get("error", {}).get("message", "unknown")
@@ -1239,15 +1245,14 @@ def test_stripe_connection(
 
     try:
         info = r.json()
-        account_id = info.get("id")
         country = info.get("country")
-        livemode = bool(info.get("charges_enabled")) and not info.get("details_submitted") is False
     except Exception:
         return {"ok": False, "message": "malformed response"}
 
-    msg = f"Connected to Stripe account {account_id} ({country})"
+    msg = f"Connected to {account_id} ({country})"
+    whsec = stripe_connect.PLATFORM_WEBHOOK_SECRET
     if not whsec:
-        msg += " — webhook secret not yet set"
+        msg += " — platform webhook secret not yet configured (server-side env var)"
     return {"ok": True, "message": msg, "account_id": account_id, "webhook_secret_set": bool(whsec)}
 
 
@@ -1341,9 +1346,16 @@ def cancel_stripe_payment_link(
 
     import asyncio
     import stripe_client
+    import stripe_connect
     from pricing_engine import _get_setting
-    api_key = _get_setting(db, "stripe_secret_key", default="", organization_slug=org_slug)
-    result = asyncio.run(stripe_client.deactivate_payment_link(api_key, q.stripe_payment_link_id))
+
+    # Connect mode: deactivate via platform key + Stripe-Account header.
+    # Falls back gracefully when not configured (returns no_api_key error).
+    account_id = _get_setting(db, "stripe_account_id", default="", organization_slug=org_slug)
+    api_key = stripe_connect.PLATFORM_KEY
+    result = asyncio.run(stripe_client.deactivate_payment_link(
+        api_key, q.stripe_payment_link_id, account_id=account_id or None,
+    ))
     if result.get("ok"):
         q.stripe_payment_link_id = None
         q.stripe_payment_link_url = None
@@ -1356,52 +1368,293 @@ def cancel_stripe_payment_link(
 
 
 # ============================================================================
-# Stripe webhook — receives payment.succeeded / checkout.session.completed etc.
+# Stripe Connect — OAuth flow + platform-level webhook
 # ============================================================================
 
 
+@router.post("/orgs/{org_slug}/oauth/stripe/authorize-url")
+def oauth_stripe_authorize_url(
+    org_slug: str,
+    request: Request,
+    claims: StrategosClaims = Depends(require_claims),
+) -> dict[str, Any]:
+    """
+    Returns a one-shot Stripe OAuth authorize URL the dashboard navigates
+    the user to. The URL embeds a signed `state` (HMAC-SHA256 over
+    `{org, exp:now+5min, nonce}`) so the callback can verify we initiated.
+
+    POST + JWT-protected because the URL is single-use-ish: each call
+    mints a fresh state with a 5-min TTL. The dashboard fetches this
+    URL and does `window.location = response.url` so the browser
+    naturally lands on Stripe's consent screen.
+
+    Why not 302-redirect from a GET endpoint? Because cross-origin
+    redirects from the dashboard wouldn't carry our Authorization
+    header, so the backend couldn't verify the user is allowed to start
+    a flow for this tenant.
+    """
+    import stripe_connect
+
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    if not stripe_connect.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="stripe_connect_not_configured: platform creds missing on the server",
+        )
+
+    redirect_uri = str(request.url_for("oauth_stripe_callback"))
+
+    try:
+        url = stripe_connect.build_authorize_url(org_slug, redirect_uri)
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    return {"url": url, "expires_in_seconds": stripe_connect.STATE_TTL_SECONDS}
+
+
+@router.get("/oauth/stripe/callback", name="oauth_stripe_callback")
+async def oauth_stripe_callback(
+    request: Request,
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_description: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+) -> Any:
+    """
+    Stripe redirects the user here after they authorize on the consent
+    screen (or cancel). We:
+
+      1. Verify `state` (HMAC + expiry) — if tampered, 400 immediately
+      2. Exchange `code` for tokens via Stripe OAuth API
+      3. Persist 5 setting rows for the tenant (account_id, access_token
+         encrypted, publishable_key, connected_at, user_email)
+      4. Redirect back to the dashboard with a success/error query param
+         the dashboard can react to
+
+    No JWT — this is a public callback Stripe hits. The state signature
+    is the security boundary: only WE could have signed a state with
+    our JWT_SECRET, so a state that verifies came from a flow WE started.
+    """
+    from fastapi.responses import RedirectResponse
+    import datetime as _dt
+    import stripe_connect
+
+    # User-facing redirect destination after we finish processing.
+    # The dashboard origin comes from env (so prod uses agents.strategos-ai.com,
+    # dev uses localhost). Fallback to the canonical prod URL.
+    dashboard_base = os.environ.get(
+        "STRATEGOS_DASHBOARD_URL", "https://agents.strategos-ai.com"
+    ).rstrip("/")
+
+    def _redirect(org_slug: str, params: dict[str, str]) -> RedirectResponse:
+        from urllib.parse import urlencode
+        target = f"{dashboard_base}/c/{org_slug}/a/craig/settings?{urlencode(params)}"
+        return RedirectResponse(target, status_code=302)
+
+    # User cancelled on Stripe's consent screen
+    if error:
+        # We don't know org_slug yet (state verification failed or wasn't tried).
+        # Best-effort: try to recover org from state for a nicer redirect.
+        org_slug = "unknown"
+        if state:
+            try:
+                org_slug = stripe_connect.verify_state(state).get("org", "unknown")
+            except stripe_connect.InvalidState:
+                pass
+        return _redirect(org_slug, {
+            "stripe": "error",
+            "msg": (error_description or error)[:200],
+        })
+
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="missing_code_or_state")
+
+    # Verify state (raises InvalidState on tamper/expiry)
+    try:
+        parsed = stripe_connect.verify_state(state)
+    except stripe_connect.InvalidState as e:
+        raise HTTPException(status_code=400, detail=f"invalid_state:{e.reason}")
+
+    org_slug = parsed["org"]
+
+    # Exchange code for tokens
+    result = await stripe_connect.exchange_code(code)
+    if not result.get("ok"):
+        return _redirect(org_slug, {
+            "stripe": "error",
+            "msg": str(result.get("error", "exchange_failed"))[:200],
+        })
+
+    # Persist — 5 Setting rows. Use _set_setting helper that respects encryption.
+    from settings_security import is_secret
+    from secrets_crypto import encrypt as _encrypt_secret
+
+    def _upsert(key: str, value: str) -> None:
+        row = (
+            db.query(Setting)
+            .filter_by(organization_slug=org_slug, key=key)
+            .first()
+        )
+        # Encrypt only secret-keyed values (stripe_access_token is in SECRET_KEYS)
+        stored_value = _encrypt_secret(value) if is_secret(key) and value else value
+        if row:
+            row.value = stored_value
+        else:
+            db.add(Setting(
+                organization_slug=org_slug,
+                key=key,
+                value=stored_value,
+                value_type="string",
+            ))
+
+    _upsert("stripe_account_id", result["account_id"])
+    _upsert("stripe_access_token", result["access_token"])
+    _upsert("stripe_publishable_key", result.get("publishable_key", ""))
+    _upsert("stripe_connected_at", _dt.datetime.utcnow().isoformat(timespec="seconds"))
+    # We don't get the email from the basic OAuth response — fetch it
+    # right now via a /v1/account call (best-effort; failure non-fatal).
+    user_email = ""
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=_httpx.Timeout(10.0, connect=5.0)) as c:
+            r = await c.get(
+                "https://api.stripe.com/v1/account",
+                headers={"Stripe-Account": result["account_id"]},
+                auth=(stripe_connect.PLATFORM_KEY, ""),
+            )
+            if r.status_code == 200:
+                acct = r.json()
+                user_email = (acct.get("email") or "")[:200]
+    except Exception:
+        pass
+    _upsert("stripe_user_email", user_email)
+
+    db.commit()
+
+    return _redirect(org_slug, {"stripe": "connected"})
+
+
+@router.post("/orgs/{org_slug}/oauth/stripe/disconnect")
+async def oauth_stripe_disconnect(
+    org_slug: str,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Revoke our access to the connected Stripe account + clear the local
+    setting rows. Does NOT cancel pending Payment Links (those stay
+    valid; the tenant can manage them in Stripe directly). Does NOT
+    affect already-paid quotes.
+
+    Auth: client_owner. Returns the disconnect result + the cleared
+    quote/setting state.
+    """
+    import stripe_connect
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    from pricing_engine import _get_setting
+    account_id = _get_setting(db, "stripe_account_id", default="", organization_slug=org_slug)
+
+    if account_id:
+        # Revoke Stripe-side. We tolerate "already disconnected" as success.
+        revoke = await stripe_connect.deauthorize(account_id)
+    else:
+        revoke = {"ok": True, "note": "nothing_to_revoke"}
+
+    # Clear local rows regardless of Stripe-side success — keeping stale
+    # state would be worse than orphaned tokens (which expire anyway).
+    cleared_keys = (
+        "stripe_account_id", "stripe_access_token", "stripe_publishable_key",
+        "stripe_connected_at", "stripe_user_email",
+    )
+    for key in cleared_keys:
+        row = (
+            db.query(Setting)
+            .filter_by(organization_slug=org_slug, key=key)
+            .first()
+        )
+        if row:
+            row.value = ""
+    db.commit()
+
+    return {"ok": True, "revoke": revoke}
+
+
+@router.get("/orgs/{org_slug}/integrations/stripe/connect-status")
+def stripe_connect_status(
+    org_slug: str,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Lightweight read of the tenant's Connect linkage. Returns a small dict
+    the dashboard StripeTab uses to decide which view to render
+    (connect-CTA vs connected-info).
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_member")
+
+    from pricing_engine import _get_setting
+    account_id = _get_setting(db, "stripe_account_id", default="", organization_slug=org_slug)
+
+    return {
+        "connected": bool(account_id),
+        "account_id": account_id or None,
+        "user_email": _get_setting(db, "stripe_user_email", default="", organization_slug=org_slug) or None,
+        "connected_at": _get_setting(db, "stripe_connected_at", default="", organization_slug=org_slug) or None,
+        "publishable_key": _get_setting(db, "stripe_publishable_key", default="", organization_slug=org_slug) or None,
+        "enabled": _get_setting(db, "stripe_enabled", default="false", organization_slug=org_slug) == "true",
+    }
+
+
 @router.post(
-    "/webhooks/stripe/{org_slug}",
+    "/webhooks/stripe-connect",
     dependencies=[Depends(rate_limit("stripe_webhook", 120))],
 )
-async def stripe_webhook(
-    org_slug: str,
+async def stripe_connect_webhook(
     request: Request,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """
-    Public endpoint — Stripe POSTs events here. NOT behind JWT: auth is by
-    HMAC on the Stripe-Signature header using the tenant's stored
-    `stripe_webhook_secret`. Rejects anything whose signature doesn't match.
+    Platform-level webhook endpoint. Stripe POSTs every event from every
+    connected tenant here. We:
 
-    Endpoint URL per tenant:
-        POST /admin/api/webhooks/stripe/<org_slug>
+      1. Verify HMAC against the platform whsec (env var, set by Roi)
+      2. Read `event.account` to know which tenant this concerns
+      3. DB lookup: which org has stripe_account_id == event.account?
+      4. Hand to apply_webhook_event with the resolved org_slug
 
-    Configure this URL in the tenant's Stripe dashboard → Developers →
-    Webhooks. Subscribe at minimum to:
-        - checkout.session.completed
-        - payment_intent.succeeded
-        - payment_intent.payment_failed
-        - charge.refunded
+    Endpoint URL (one for the whole platform — register this once in
+    Stripe Connect → Webhooks, mode "Connected accounts"):
+        POST /admin/api/webhooks/stripe-connect
+
+    Subscribe to:
+      - checkout.session.completed
+      - payment_intent.succeeded
+      - payment_intent.payment_failed
+      - charge.refunded
     """
     import stripe_client
+    import stripe_connect
     from stripe_push import apply_webhook_event
-    from pricing_engine import _get_setting
 
-    secret = _get_setting(db, "stripe_webhook_secret", default="", organization_slug=org_slug)
-    if not secret:
-        # Webhook configured before secret stored — refuse rather than
-        # silently accepting unsigned events.
-        raise HTTPException(status_code=503, detail="webhook_secret_not_configured")
+    if not stripe_connect.PLATFORM_WEBHOOK_SECRET:
+        # Webhook hit before platform whsec was provisioned. Fail loud
+        # rather than silently accept — Stripe surfaces 503s in the UI.
+        raise HTTPException(status_code=503, detail="platform_webhook_secret_not_configured")
 
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
     try:
-        stripe_client.verify_webhook_signature(payload, sig_header, secret)
+        stripe_client.verify_webhook_signature(
+            payload, sig_header, stripe_connect.PLATFORM_WEBHOOK_SECRET,
+        )
     except stripe_client.InvalidSignature as e:
-        # Non-leaky 400. Stripe will retry with backoff — that's fine,
-        # a genuine misconfiguration will surface quickly in their UI.
         raise HTTPException(status_code=400, detail=f"invalid_signature:{e}")
 
     try:
@@ -1410,7 +1663,25 @@ async def stripe_webhook(
     except Exception:
         raise HTTPException(status_code=400, detail="malformed_json")
 
-    result = apply_webhook_event(db, event, org_slug)
+    # Connect events have `account` at the top level (not in data.object).
+    # That tells us which tenant's account the event came from.
+    account_id = event.get("account")
+    if not account_id:
+        # Could be a platform-level event (e.g. account.application.deauthorized).
+        # Out of scope for v1 — just acknowledge so Stripe stops retrying.
+        return {"received": True, "note": "platform_level_event_ignored", "type": event.get("type")}
+
+    setting_row = (
+        db.query(Setting)
+        .filter(Setting.key == "stripe_account_id", Setting.value == account_id)
+        .first()
+    )
+    if not setting_row:
+        # Unknown account — could be a stale connection we lost track of.
+        # Return 200 so Stripe doesn't retry forever.
+        return {"received": True, "note": "unknown_account", "account_id": account_id}
+
+    result = apply_webhook_event(db, event, setting_row.organization_slug)
     db.commit()
     return {"received": True, "result": result}
 

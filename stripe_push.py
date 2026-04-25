@@ -98,7 +98,7 @@ def create_link_for_quote(db, quote: Quote, organization_slug: str) -> dict:
       disabled: bool        — True when stripe_enabled != 'true'
       error: str|None
     """
-    # ── 1. Read tenant settings ─────────────────────────────────────────
+    # ── 1. Read tenant settings + platform creds ────────────────────────
     enabled = _get_setting(db, "stripe_enabled", default="false", organization_slug=organization_slug)
     if not _truthy(enabled):
         return {
@@ -107,16 +107,29 @@ def create_link_for_quote(db, quote: Quote, organization_slug: str) -> dict:
             "error": "disabled",
         }
 
-    api_key = _get_setting(db, "stripe_secret_key", default="", organization_slug=organization_slug)
+    # Connect mode: read the tenant's account_id (set by the OAuth callback)
+    # and use the platform-level secret key as Basic auth + Stripe-Account
+    # header for tenant scoping. We never store the tenant's sk_live_***
+    # key with this flow — Stripe issues us a scoped access token at
+    # connect time, which we keep as a fallback (stripe_access_token).
+    import stripe_connect  # late import — avoid circular dep at module load
+    account_id = _get_setting(db, "stripe_account_id", default="", organization_slug=organization_slug)
     currency = _get_setting(db, "stripe_currency", default="eur", organization_slug=organization_slug) or "eur"
     success_url = _get_setting(db, "stripe_success_url", default="", organization_slug=organization_slug) or None
 
-    if not api_key:
+    if not account_id:
         return {
             "ok": False, "url": None, "link_id": None,
             "already_exists": False, "disabled": False,
-            "error": "no_api_key",
+            "error": "not_connected",  # tenant hasn't completed OAuth
         }
+    if not stripe_connect.is_configured():
+        return {
+            "ok": False, "url": None, "link_id": None,
+            "already_exists": False, "disabled": False,
+            "error": "platform_not_configured",
+        }
+    api_key = stripe_connect.PLATFORM_KEY
 
     # ── 2. Idempotency guard ────────────────────────────────────────────
     if quote.stripe_payment_link_id and quote.stripe_payment_link_url:
@@ -141,10 +154,11 @@ def create_link_for_quote(db, quote: Quote, organization_slug: str) -> dict:
     customer_email = _customer_email_for(db, quote)
     description = _build_description(quote)
 
-    # ── 4. Call Stripe ──────────────────────────────────────────────────
+    # ── 4. Call Stripe (Connect mode — platform key + Stripe-Account header)
     try:
         result = asyncio.run(stripe_client.create_payment_link(
             api_key=api_key,
+            account_id=account_id,
             quote_id=quote.id,
             amount_eur=amount,
             product_description=description,

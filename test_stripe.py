@@ -85,11 +85,24 @@ def _make_quote(total: float = 234.56, **overrides) -> Quote:
 @pytest.fixture(autouse=True)
 def _reset_stripe_settings():
     """Every test starts from a known-clean state: disabled, no keys."""
-    for k in ("stripe_enabled", "stripe_secret_key", "stripe_webhook_secret",
+    for k in ("stripe_enabled", "stripe_account_id", "stripe_access_token",
+              "stripe_publishable_key", "stripe_connected_at", "stripe_user_email",
               "stripe_currency", "stripe_success_url"):
         _clear_setting(k)
+    # Ensure stripe_connect has dummy platform creds for the duration of
+    # the test (tests that need "not configured" override this themselves)
+    import stripe_connect
+    stripe_connect._reset_for_tests(
+        platform_key="sk_test_platform_dummy",
+        client_id="ca_test_client_id_dummy",
+        webhook_secret="whsec_test_platform_dummy",
+        jwt_secret=os.environ.get("STRATEGOS_JWT_SECRET", "test-jwt-secret"),
+    )
     yield
-    for k in ("stripe_enabled", "stripe_secret_key", "stripe_webhook_secret",
+    # Teardown: clear settings (don't reset stripe_connect — let it stay
+    # in dummy-configured state for any subsequent test fixture init)
+    for k in ("stripe_enabled", "stripe_account_id", "stripe_access_token",
+              "stripe_publishable_key", "stripe_connected_at", "stripe_user_email",
               "stripe_currency", "stripe_success_url"):
         _clear_setting(k)
 
@@ -256,22 +269,25 @@ def test_push_disabled_by_default_zero_network():
 
 
 @respx.mock(assert_all_called=False)
-def test_push_enabled_but_no_api_key_zero_network():
+def test_push_enabled_but_not_connected_zero_network():
+    """Connect-mode: tenant enabled Stripe but hasn't completed OAuth →
+    skip with `not_connected`, don't hit Stripe."""
     _set_setting("stripe_enabled", "true")
+    # Note: NO stripe_account_id set
     route = respx.post(STRIPE_URL_CREATE)
     with db_session() as db:
         q = _make_quote()
         result = stripe_push.create_link_for_quote(db, q, ORG)
     assert result["ok"] is False
     assert result["disabled"] is False
-    assert result["error"] == "no_api_key"
+    assert result["error"] == "not_connected"
     assert route.call_count == 0
 
 
 @respx.mock
 def test_push_happy_path_persists_link_on_quote():
     _set_setting("stripe_enabled", "true")
-    _set_setting("stripe_secret_key", "sk_test_x")
+    _set_setting("stripe_account_id", "acct_test_x")
     respx.post(STRIPE_URL_CREATE).mock(
         return_value=httpx.Response(200, json={
             "id": "plink_real", "url": "https://buy.stripe.com/real",
@@ -292,7 +308,7 @@ def test_push_happy_path_persists_link_on_quote():
 def test_push_idempotent_when_link_already_exists():
     """Second call must NOT hit Stripe — return the cached link id."""
     _set_setting("stripe_enabled", "true")
-    _set_setting("stripe_secret_key", "sk_test_x")
+    _set_setting("stripe_account_id", "acct_test_x")
     route = respx.post(STRIPE_URL_CREATE)
     with db_session() as db:
         q = _make_quote()
@@ -308,7 +324,7 @@ def test_push_idempotent_when_link_already_exists():
 @respx.mock
 def test_push_persists_error_on_failure():
     _set_setting("stripe_enabled", "true")
-    _set_setting("stripe_secret_key", "sk_test_x")
+    _set_setting("stripe_account_id", "acct_test_x")
     respx.post(STRIPE_URL_CREATE).mock(
         return_value=httpx.Response(402, json={"error": {"message": "Your card was declined."}})
     )
@@ -323,7 +339,7 @@ def test_push_persists_error_on_failure():
 @respx.mock(assert_all_called=False)
 def test_push_zero_amount_quote_short_circuits():
     _set_setting("stripe_enabled", "true")
-    _set_setting("stripe_secret_key", "sk_test_x")
+    _set_setting("stripe_account_id", "acct_test_x")
     route = respx.post(STRIPE_URL_CREATE)
     with db_session() as db:
         q = _make_quote(total=0.0, final_price_inc_vat=0.0)

@@ -108,9 +108,23 @@ async def create_payment_link(
     organization_slug: str = "",
     customer_email: str | None = None,
     success_url: str | None = None,
+    account_id: str | None = None,
 ) -> dict:
     """
     Create a Stripe Payment Link for a confirmed quote.
+
+    Two auth modes, both pass through this single function:
+
+      1. **Connect (default for Connect tenants):** caller passes
+         `account_id="acct_xxx"` and `api_key=<platform_key>`. We add a
+         `Stripe-Account: acct_xxx` header so Stripe routes the call
+         on-behalf-of the connected tenant. Money flows directly to the
+         tenant's bank.
+
+      2. **Direct (legacy / test):** `account_id=None`. We use `api_key`
+         (the tenant's own `sk_***`) as plain Basic auth. Money flows to
+         whoever owns that key. Kept for backwards compat + simple test
+         setups, but production is Mode 1.
 
     Uses the "inline price" form of Payment Links — we pass `price_data`
     directly instead of pre-creating a Price object, because each quote is
@@ -170,11 +184,18 @@ async def create_payment_link(
 
     body = _encode_form(params)
 
+    headers = _headers()
+    if account_id:
+        # Connect mode: act on-behalf-of the tenant. Stripe routes the
+        # resulting Payment Link to live in their account, money flows
+        # to their bank.
+        headers["Stripe-Account"] = account_id
+
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             resp = await client.post(
                 f"{STRIPE_BASE}/payment_links",
-                headers=_headers(),
+                headers=headers,
                 auth=_auth(api_key),
                 content=body,
             )
@@ -214,11 +235,20 @@ async def create_payment_link(
     return {"ok": True, "link_id": link_id, "url": url, "error": None, "raw": data}
 
 
-async def deactivate_payment_link(api_key: str, link_id: str) -> dict:
+async def deactivate_payment_link(
+    api_key: str,
+    link_id: str,
+    *,
+    account_id: str | None = None,
+) -> dict:
     """
     Make a Payment Link no longer accept payments. Stripe's API doesn't
     let you delete Payment Links — you POST `active=false` instead. Used
     for the dashboard "Cancel" action.
+
+    `account_id` follows the same rules as create_payment_link: when set,
+    we use the platform key + Stripe-Account header (Connect mode).
+    Otherwise plain Basic auth with `api_key` (legacy/test mode).
     """
     if not api_key:
         return {"ok": False, "error": "no_api_key"}
@@ -226,11 +256,15 @@ async def deactivate_payment_link(api_key: str, link_id: str) -> dict:
         return {"ok": False, "error": "no_link_id"}
 
     body = _encode_form({"active": False})
+    headers = _headers()
+    if account_id:
+        headers["Stripe-Account"] = account_id
+
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             resp = await client.post(
                 f"{STRIPE_BASE}/payment_links/{link_id}",
-                headers=_headers(),
+                headers=headers,
                 auth=_auth(api_key),
                 content=body,
             )

@@ -44,21 +44,47 @@ SEED_ROWS: list[tuple[str, str, str, str]] = [
         "on confirm_order; 'false' skips the integration entirely. Default false "
         "so the code is dormant until keys are pasted and a dry run is done.",
     ),
+    # Connect (OAuth) credentials — populated by /admin/api/oauth/stripe/callback
+    # when the tenant clicks "Connect with Stripe". Empty placeholders here
+    # so the integration_status endpoint can recognise "not yet connected"
+    # without a missing-row error.
     (
-        "stripe_secret_key",
+        "stripe_account_id",
         "",
         "string",
-        "Tenant's Stripe secret key (sk_live_... in prod, sk_test_... for testing). "
-        "Comes from the tenant's OWN Stripe dashboard — we never share keys "
-        "across tenants. Never commit.",
+        "Stripe Connect account id (acct_...) of the connected tenant. "
+        "Populated by the OAuth callback. Plaintext — this is a public-facing "
+        "identifier (Stripe shows it on receipts), not a secret.",
     ),
     (
-        "stripe_webhook_secret",
+        "stripe_access_token",
         "",
         "string",
-        "Signing secret (whsec_...) for the webhook endpoint the tenant "
-        "configures at https://dashboard.stripe.com/webhooks. Required — we "
-        "reject any webhook whose HMAC doesn't match.",
+        "OAuth access token issued by Stripe at connect time (sk_acct_...). "
+        "Encrypted at rest via secrets_crypto. Primary auth path uses the "
+        "platform key + Stripe-Account header instead, but this is kept as a "
+        "fallback and audit trail.",
+    ),
+    (
+        "stripe_publishable_key",
+        "",
+        "string",
+        "Public key (pk_...) for Stripe.js / Elements if we ever embed payment "
+        "forms. Returned by Stripe at connect time. Not secret.",
+    ),
+    (
+        "stripe_connected_at",
+        "",
+        "string",
+        "ISO 8601 timestamp of when the tenant connected via OAuth. Empty "
+        "until first connection. Set by the callback; cleared on disconnect.",
+    ),
+    (
+        "stripe_user_email",
+        "",
+        "string",
+        "Email Stripe associates with the connected account. Display-only; "
+        "shown as 'Connected to {email}' in the dashboard.",
     ),
     (
         "stripe_currency",

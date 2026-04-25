@@ -128,98 +128,71 @@ generating immediately. No emails sent.
 
 ---
 
-## Step 3 — Connect Stripe in TEST MODE
+## Step 3 — Connect Stripe via OAuth ("Connect with Stripe" button)
 
-Time: ~20 min. Risk: zero (test mode means no real charges). Side
-effects: test payment links can be shared but only Stripe-test cards
-work.
+Time: ~5 min for Justin once the platform setup is done. Risk: zero
+(money goes directly to his account; Strategos never custodies it).
 
-### 3a. Get test API keys
+> **Prerequisite:** the platform-side setup in
+> [`docs/stripe-connect-migration.md`](./stripe-connect-migration.md)
+> must be complete first. That's a one-time Roi task. Once done, every
+> future client onboarding is just step 3a below.
 
-1. Stripe dashboard → top-right toggle to **Test mode**.
-2. **Developers → API keys**. Copy the **Secret key** (`sk_test_...`).
+### 3a. Justin clicks Connect
 
-### 3b. Register the webhook endpoint
+1. Justin signs in to `https://agents.strategos-ai.com` → his workspace
+2. Navigates to **Craig → Connections → Stripe**
+3. Clicks **"Connect with Stripe"**
+4. Stripe takes over: he picks an existing Stripe account or creates a
+   new one (~2 min if new — Stripe walks him through bank details, ID
+   verification, etc.)
+5. Approves the OAuth consent
+6. Lands back on the dashboard with a green "Connected to Stripe" toast
 
-1. **Developers → Webhooks → Add endpoint**.
-2. URL:
-   ```
-   https://<cloud-run-url>/admin/api/webhooks/stripe/just-print
-   ```
-   The dashboard's **Connections → Stripe** tab shows this URL with a
-   Copy button — use that to avoid typos.
-3. Events to send (minimum):
-   - `checkout.session.completed`
-   - `payment_intent.succeeded`
-   - `payment_intent.payment_failed`
-   - `charge.refunded`
-4. Click **Add endpoint**. Stripe will show the **Signing secret**
-   (`whsec_test_...`). Copy it.
+The tab now shows "Connected to {his_email} · acct_xxx" with Test +
+Disconnect buttons.
 
-### 3c. Configure Craig
+### 3b. Smoke test (test card)
 
-In the dashboard `Craig → Connections → Stripe`:
+While Justin is still on the call:
 
-1. Paste **Stripe secret key** (the `sk_test_...` from 3a). Save.
-2. Paste **Webhook signing secret** (the `whsec_test_...` from 3b). Save.
-3. Verify **Currency** is `eur`.
-4. **Leave `stripe_enabled` OFF** for now — we'll flip it after the
-   smoke test passes.
-
-### 3d. Smoke test
-
-Manually create a tiny test quote in the dashboard, then in
-**Connections → Stripe**, flip **enabled = true**. Now in **Quotes**,
-find your test quote and click **Create link**. Copy the URL it
-produces and open in incognito.
-
-Pay with Stripe's canonical test card: `4242 4242 4242 4242`, any
-future date, any CVC.
-
-Within 30s the dashboard should refresh the quote's Payment column to
-**Paid €X**. The Cloud Logging stream will show the audit JSON line
-from `stripe_push.apply_webhook_event`.
+1. In the dashboard **Quotes**, find a small recent quote
+2. Click **Create link** in the Payment column
+3. Copy the URL → open in incognito
+4. Pay with `4242 4242 4242 4242`, any future date, any CVC
+5. Within 30s the Payment column flips to **Paid €X**
 
 If nothing happens after 60s:
-- Check Stripe's webhook tab → click your endpoint → see the **Event
-  log**. Each delivery shows the response code we returned. 400 means
-  HMAC failed → double-check the signing secret matches what's in our
-  Settings table. 503 means our endpoint thinks no secret is
-  configured → save the secret in the dashboard again.
-- 200 + `received: true` but no Quote update → check that
-  `metadata.craig_quote_id` is in the event payload (it should be —
-  Craig stamps it when creating the link). If missing, the link was
-  created via a different path (or by hand in Stripe's UI) and won't
-  correlate.
+- Check Stripe → Developers → Webhooks → our platform endpoint → see the
+  **Event log**. Each delivery shows the response code. 400 = HMAC
+  failed (platform whsec env var drift). 503 = platform whsec env var
+  missing entirely.
+- 200 + no Quote update → confirm `metadata.craig_quote_id` is in the
+  event payload (it should be — Craig stamps it when creating the link).
+  If missing, the link was created via a different path (manual in
+  Stripe's UI) and won't correlate.
 
-**Rollback (3a-3c):** flip `stripe_enabled=false` in the dashboard. No
-new links can be created. Existing links remain valid until manually
-deactivated via the **Cancel** button in the Quotes table.
+**Rollback:** flip `stripe_enabled=false` in the dashboard. No new
+links can be created. Existing links remain valid until cancelled via
+the **Cancel** button in Quotes. To fully cut the cord: click
+**Disconnect** in the Stripe tab (revokes Stripe-side too).
 
 ---
 
-## Step 4 — Promote Stripe to LIVE mode
+## Step 4 — (no-op with Connect)
 
-Time: ~5 min. Risk: real money flows from this point forward. Side
-effects: customers can pay real €€ to Just Print's Stripe account.
+The legacy "promote to live mode" step doesn't exist with Connect. The
+tenant's account IS their live account from step 3a — no test/live
+swap. The platform's secret key (set in env vars by Roi) determines
+whether the connection is a test-mode or live-mode link, and that
+matches what Roi configured in step 6 of the platform setup.
 
-**Do not skip step 3.** Live mode is for after the test-mode round-trip
-worked end-to-end.
-
-1. Stripe dashboard → toggle to **Live mode**.
-2. Repeat steps 3a + 3b in live mode to get fresh `sk_live_...` and
-   `whsec_live_...` values.
-3. Open `Craig → Connections → Stripe` and **replace** both the secret
-   key and the webhook signing secret with the live values. Save each.
-4. Pick a sentinel quote (small amount — €1, an internal test ID) and
-   click **Create link** → pay it with a real card → confirm the money
-   landed in Justin's Stripe.
-5. Refund that sentinel from Stripe's UI. Confirm the Quote's Payment
-   column flips to **Refunded** within 30s (webhook
-   `charge.refunded`).
-
-**Rollback:** as in step 3 — flip `stripe_enabled=false`. No new
-charges. Already-paid quotes stay paid.
+If you need to validate live payments end-to-end before Justin tells
+his customers about it:
+1. Make sure platform creds are `sk_live_***` (not `sk_test_***`)
+2. Connect Justin via OAuth (he'll get prompted for live-mode account)
+3. €1 sentinel charge with a real card → confirm webhook lands → refund
+4. From this point on, every confirmed quote can charge real money
 
 ---
 
