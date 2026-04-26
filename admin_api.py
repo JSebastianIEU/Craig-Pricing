@@ -1404,7 +1404,19 @@ def oauth_stripe_authorize_url(
             detail="stripe_connect_not_configured: platform creds missing on the server",
         )
 
+    # Cloud Run terminates TLS at the load balancer — internally the
+    # request reports `http://` even though the public URL is https.
+    # Stripe Connect rejects http:// redirect_uri values, so we honor the
+    # X-Forwarded-Proto header that the load balancer passes through, and
+    # in production also force https as a belt-and-suspenders.
     redirect_uri = str(request.url_for("oauth_stripe_callback"))
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").lower()
+    if forwarded_proto == "https" and redirect_uri.startswith("http://"):
+        redirect_uri = "https://" + redirect_uri[len("http://"):]
+    # Hard guard for production hostnames — never let an http:// slip
+    # through to Stripe even if the proxy header is missing.
+    if redirect_uri.startswith("http://") and ".run.app" in redirect_uri:
+        redirect_uri = "https://" + redirect_uri[len("http://"):]
 
     try:
         url = stripe_connect.build_authorize_url(org_slug, redirect_uri)
