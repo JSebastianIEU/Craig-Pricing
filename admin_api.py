@@ -1306,7 +1306,7 @@ class SentinelQuoteRequest(BaseModel):
                       description="Visible note so anyone can spot test quotes vs real ones")
 
 
-@router.post("/orgs/{org_slug}/quotes/sentinel")
+@router.post("/orgs/{org_slug}/sentinel-quote")
 def create_sentinel_quote(
     org_slug: str,
     body: SentinelQuoteRequest,
