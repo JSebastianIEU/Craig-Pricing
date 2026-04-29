@@ -1294,6 +1294,78 @@ def test_missive_connection(
 
 
 # ============================================================================
+# Sentinel / smoke-test quote creation
+# ============================================================================
+
+
+class SentinelQuoteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    amount_inc_vat: float = Field(..., gt=0, le=100,
+                                  description="Total inc VAT — small (1-100€) for safe testing")
+    note: str = Field("[SENTINEL-TEST]",
+                      description="Visible note so anyone can spot test quotes vs real ones")
+
+
+@router.post("/orgs/{org_slug}/quotes/sentinel")
+def create_sentinel_quote(
+    org_slug: str,
+    body: SentinelQuoteRequest,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Create a Quote with an arbitrary small amount, bypassing Craig's
+    pricing engine. Strictly for smoke testing the Stripe Payment Link
+    pipeline (or future end-to-end pipelines) when the real catalog
+    minimums would force a higher amount.
+
+    Auth: strategos_admin only — this endpoint sidesteps the pricing
+    engine, so we don't want client_owners using it accidentally.
+
+    Limits:
+      - amount_inc_vat must be > 0 and ≤ €100 (safety cap)
+      - Status starts as 'approved' so it's immediately Payment Link-able
+      - Note prefix '[SENTINEL-TEST]' goes into both quote.notes AND the
+        product description on Stripe — the customer sees that this is a
+        test charge before paying.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "strategos_admin")
+
+    # Compute price split (assume 23% VAT for safety — services/large format
+    # rate; printed-matter is 13.5% but we don't know the product). Inc-VAT
+    # is what the user asked for, so we work backwards.
+    inc = float(body.amount_inc_vat)
+    vat_rate = 0.23
+    ex = round(inc / (1 + vat_rate), 2)
+    vat = round(inc - ex, 2)
+
+    q = Quote(
+        organization_slug=org_slug,
+        product_key="sentinel_test",
+        specs={
+            "sentinel": True,
+            "note": body.note,
+            "created_via": "POST /quotes/sentinel",
+        },
+        base_price=ex,
+        surcharges=[],
+        final_price_ex_vat=ex,
+        vat_amount=vat,
+        final_price_inc_vat=inc,
+        artwork_cost=0.0,
+        total=inc,
+        status="approved",
+        approved_by=claims.email,
+        notes=body.note,
+    )
+    db.add(q)
+    db.commit()
+    db.refresh(q)
+    return {"quote": _quote_to_dict(q)}
+
+
+# ============================================================================
 # Stripe payment links
 # ============================================================================
 
