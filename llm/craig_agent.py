@@ -1407,6 +1407,13 @@ def chat_with_craig(
         (conversation.customer_email or "").strip()
         or (conversation.customer_phone or "").strip()
     )
+    # Phase E — also require the funnel to be complete. We treat
+    # `delivery_method` as the canonical "funnel done" signal because it's
+    # the LAST question Craig asks; if it's set, all earlier questions were
+    # walked through. (is_company / is_returning_customer are useful signals
+    # but optional — some customers won't know or won't say.)
+    _funnel_complete = bool((conversation.delivery_method or "").strip())
+
     if _channel_needs_gate and "[QUOTE_READY]" in final_reply and not _has_contact:
         # Replace the ENTIRE reply with the contact ask. Keeping the LLM's
         # "Here's your quote! 📋" pre-text in front of the ask confused
@@ -1415,6 +1422,41 @@ def chat_with_craig(
             "Before I send the full quote \u2014 what's your name and email "
             "(or WhatsApp number)? Justin will need that to follow up \U0001f44d"
         )
+    elif _channel_needs_gate and "[QUOTE_READY]" in final_reply and _has_contact and not _funnel_complete:
+        # Phase E gate — contact present, but the funnel still has open
+        # questions (company/individual? returning? delivery vs collect?).
+        # Strip the marker so the PDF doesn't render, and append a
+        # follow-up that asks ONLY the missing questions (capped at 2 per
+        # turn so it doesn't feel like an interrogation).
+        print(
+            f"[craig] FUNNEL GATE: stripping [QUOTE_READY] — "
+            f"delivery_method not set on conv {conversation.id}. "
+            f"channel={channel!r}",
+            flush=True,
+        )
+        final_reply = final_reply.replace("[QUOTE_READY]", "").rstrip()
+        missing: list[str] = []
+        if conversation.is_company is None:
+            missing.append(
+                "Are you ordering for a company or as an individual? "
+                "(helps with invoicing)"
+            )
+        if conversation.is_returning_customer is None:
+            missing.append(
+                "Have you ordered with us before? If yes, what email did "
+                "you use last time?"
+            )
+        if not (conversation.delivery_method or "").strip():
+            missing.append(
+                "Delivery to an address, or would you collect from our shop?"
+            )
+        ask = "\n\n".join(missing[:2])
+        prefix = (final_reply + "\n\n") if final_reply else ""
+        final_reply = (
+            prefix
+            + "Almost there — a couple of quick things before I send "
+            "the full quote:\n\n" + ask
+        ).strip()
     elif _channel_needs_gate and "[QUOTE_READY]" in final_reply and _has_contact:
         # The PDF is going out. Append a confirmation tail so the customer
         # knows Justin will follow up — unless the LLM already said it.
@@ -1450,6 +1492,7 @@ def chat_with_craig(
         and not order_confirmed                  # don't fire on confirm_order paths
         and _save_contact_called                 # contact was JUST collected
         and _has_contact                         # …and persisted
+        and _funnel_complete                     # …Phase E: ALL funnel fields collected too
         and _had_prior_quote                     # …and a Quote already exists on this thread
         and not _already_has_marker              # LLM didn't include the marker
         and not _pdf_already_released_earlier    # the PDF wasn't already sent in a prior turn

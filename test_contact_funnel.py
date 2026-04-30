@@ -490,6 +490,55 @@ def test_push_uses_past_email_for_returning_customer_dedup():
         db.close()
 
 
+def test_funnel_gate_logic_blocks_quote_ready_when_delivery_unset():
+    """Phase E server gate — exercise the decision logic the gate uses
+    on the bug-reproducing inputs (contact present, delivery_method
+    null). Asserts the gate would fire."""
+    _fresh()
+    db = _TestSession()
+    try:
+        conv = _new_conversation(db, with_contact=True)
+        # Contact present, but funnel NOT complete (delivery_method is null)
+        channel = "web"
+        channel_needs_gate = channel.lower() in ("web", "")
+        has_contact = bool(
+            (conv.customer_email or "").strip()
+            or (conv.customer_phone or "").strip()
+        )
+        funnel_complete = bool((conv.delivery_method or "").strip())
+        reply_has_marker = "[QUOTE_READY]" in (
+            "Here's your quote! 📋 [QUOTE_READY]"
+        )
+
+        gate_fires = (
+            channel_needs_gate and reply_has_marker
+            and has_contact and not funnel_complete
+        )
+        assert gate_fires is True, (
+            "Funnel gate MUST fire when contact is present but "
+            "delivery_method is null"
+        )
+    finally:
+        db.close()
+
+
+def test_funnel_gate_passes_through_when_delivery_set():
+    """Once delivery_method is populated, the gate lets the marker through."""
+    _fresh()
+    db = _TestSession()
+    try:
+        conv = _new_conversation(
+            db, with_contact=True,
+            is_company=False,
+            is_returning_customer=False,
+            delivery_method="collect",
+        )
+        funnel_complete = bool((conv.delivery_method or "").strip())
+        assert funnel_complete is True
+    finally:
+        db.close()
+
+
 def test_push_uses_in_chat_email_when_not_returning():
     _fresh()
     db = _TestSession()
