@@ -1302,9 +1302,9 @@ def create_printlogic_test_order(
     require_role(claims, "client_owner")
 
     import asyncio
-    import json as _json
     import time
     import printlogic
+    import printlogic_payload
     from pricing_engine import _get_setting
 
     api_key = _get_setting(db, "printlogic_api_key", default="", organization_slug=org_slug)
@@ -1316,37 +1316,17 @@ def create_printlogic_test_order(
     dry_run_setting = _get_setting(db, "printlogic_dry_run", default="true", organization_slug=org_slug)
     dry_run = dry_run_setting != "false"
 
-    ts = int(time.time())
-    marker = f"[CRAIG-PROBE-DELETE-ME-{ts}]"
-
-    payload = {
-        "customer_uid": "",
-        "customer_name": f"CRAIG-PROBE-DO-NOT-PROCESS-{ts}",
-        "customer_email": "probe@strategos-ai.com",
-        "customer_phone": "",
-        "customer_address1": "",
-        "customer_address2": "",
-        "customer_address3": "",
-        "customer_address4": "",
-        "customer_postcode": "",
-        "order_description": f"{marker} dashboard test order — DO NOT PRODUCE",
-        "contact_name": "",
-        "order_po": "",
-        "delivery_address1": "",
-        "delivery_address2": "",
-        "delivery_address3": "",
-        "delivery_address4": "",
-        "order_items": [{
-            "item_quantity": "1",
-            "item_desc": "[PROBE] sentinel item — DO NOT PRODUCE",
-            "item_price": "0.01",
-            "item_vat": "23",
-            "item_custom_data": _json.dumps({"craig_probe": True, "ts": ts, "source": "dashboard"}),
-            "item_detail": f"{marker} Dashboard test only",
-            "item_code": "PROBE",
-            "item_part_number": "",
-        }],
-    }
+    # Build a RICH demo payload (250 BCs, soft-touch, 85x55mm, 400gsm silk
+    # etc.) so the test order in PrintLogic looks like a real Craig push,
+    # not a `[PROBE] sentinel item` placeholder. The marker stays so it's
+    # still trivially identifiable for cancel.
+    ts_now = int(time.time())
+    payload = printlogic_payload.build_demo_payload(
+        quote_id_marker=f"dash-test-{ts_now}",
+    )
+    # Pop the side-channel meta keys before sending to PrintLogic
+    marker = payload.pop("_marker")
+    ts = payload.pop("_ts")
 
     try:
         result = asyncio.run(printlogic.create_order(

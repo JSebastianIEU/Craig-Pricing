@@ -30,6 +30,7 @@ import json
 from typing import Any
 
 import printlogic
+import printlogic_payload
 from db.models import Conversation, Quote
 from pricing_engine import _get_setting
 
@@ -40,105 +41,22 @@ def _truthy(val: str | None) -> bool:
     return val.strip().lower() in ("true", "1", "yes", "on")
 
 
-def _build_item_desc(quote: Quote) -> str:
-    """Best-effort description of what's being ordered — ends up in
-    PrintLogic's `item_desc` field. Short and human-friendly."""
-    specs = quote.specs or {}
-    parts: list[str] = []
-    qty = specs.get("quantity")
-    if qty:
-        parts.append(str(qty))
-    if quote.product_key:
-        parts.append(quote.product_key.replace("_", " "))
-    if specs.get("finish"):
-        parts.append(specs["finish"])
-    if specs.get("double_sided"):
-        parts.append("DS")
-    else:
-        parts.append("SS")
-    return " ".join(parts) if parts else "Craig quote"
-
-
-def _build_item_detail(quote: Quote) -> str:
-    """Longer detail line — paper weight, format, pages, cover, etc."""
-    specs = quote.specs or {}
-    bits: list[str] = []
-    if quote.product_key and quote.product_key.startswith("flyers_"):
-        bits.append("170gsm")
-    if quote.product_key == "business_cards":
-        bits.append("400gsm silk")
-    if specs.get("finish"):
-        bits.append(f"{specs['finish']} finish")
-    if specs.get("double_sided") is not None:
-        bits.append("double-sided" if specs["double_sided"] else "single-sided")
-    if specs.get("pages"):
-        bits.append(f"{specs['pages']}pp")
-    if specs.get("cover_type"):
-        bits.append(str(specs["cover_type"]).replace("_", " "))
-    if specs.get("binding"):
-        bits.append(str(specs["binding"]).replace("_", " "))
-    return ", ".join(bits)
+# Backwards-compat shim — these helpers used to live here. Tests + any
+# external imports should now use `printlogic_payload` directly. We keep
+# `_build_payload` as a thin alias so existing call sites keep working.
 
 
 def _build_payload(quote: Quote, conv: Conversation | None) -> dict[str, Any]:
     """
     Construct a PrintLogic create_order body from the Quote + Conversation.
-    The CRAIG-PUSH marker in `order_description` is deliberate — it lets
-    Justin spot Craig-originated orders in his PrintLogic UI and filter
-    or clean them up if anything ever goes wrong.
+
+    Delegates to `printlogic_payload.build_payload_from_quote` which sets
+    the rich per-item fields PrintLogic supports (width_mm/height_mm,
+    finished_size_text, pages, colors, paper_description,
+    finishing_description) plus the order-level `contact_*` fields and
+    `order_date_due` that we used to leave blank.
     """
-    specs = quote.specs or {}
-    qty = int(specs.get("quantity", 1)) if specs.get("quantity") else 1
-
-    cust_name = (getattr(conv, "customer_name", None) or "").strip()
-    cust_email = (getattr(conv, "customer_email", None) or "").strip()
-    cust_phone = (getattr(conv, "customer_phone", None) or "").strip()
-
-    short = _build_item_desc(quote)
-    detail = _build_item_detail(quote)
-
-    # Per PrintLogic spec: item_vat can be "23" / "13.5" etc. (percentage as string)
-    # Use the effective rate from the stored quote.
-    # We compute it from vat_amount / final_price_ex_vat to avoid a lookup.
-    try:
-        vat_rate_pct = round(
-            (float(quote.vat_amount) / float(quote.final_price_ex_vat or 1)) * 100, 1
-        )
-    except (TypeError, ZeroDivisionError):
-        vat_rate_pct = 23.0
-
-    return {
-        "customer_name": cust_name or "Craig customer",
-        "customer_email": cust_email,
-        "customer_phone": cust_phone,
-        "customer_address1": "",
-        "customer_address2": "",
-        "customer_address3": "",
-        "customer_address4": "",
-        "customer_postcode": "",
-        "order_description": f"[CRAIG-PUSH qid={quote.id}] {short}",
-        "contact_name": cust_name,
-        "order_po": "",
-        "delivery_address1": "",
-        "delivery_address2": "",
-        "delivery_address3": "",
-        "delivery_address4": "",
-        "order_items": [
-            {
-                "item_quantity": str(qty),
-                "item_desc": short,
-                "item_price": f"{float(quote.final_price_ex_vat or 0):.2f}",
-                "item_vat": f"{vat_rate_pct}",
-                "item_custom_data": json.dumps({
-                    "craig_quote_id": quote.id,
-                    "craig_specs": specs,
-                }),
-                "item_detail": detail,
-                "item_code": (quote.product_key or "")[:80],
-                "item_part_number": "",
-            },
-        ],
-    }
+    return printlogic_payload.build_payload_from_quote(quote, conv)
 
 
 def push_quote(db, quote: Quote, organization_slug: str) -> dict[str, Any]:
@@ -203,9 +121,10 @@ def push_quote(db, quote: Quote, organization_slug: str) -> dict[str, Any]:
             print(f"[printlogic_push] find_customer failed (non-fatal): {e}", flush=True)
 
     # ── 5. Build payload ─────────────────────────────────────────────
-    payload = _build_payload(quote, conv)
-    if existing_customer_uid:
-        payload["customer_uid"] = existing_customer_uid
+    payload = printlogic_payload.build_payload_from_quote(
+        quote, conv,
+        customer_uid=existing_customer_uid or "",
+    )
 
     # ── 6. Fire create_order (or simulate) ───────────────────────────
     result = asyncio.run(printlogic.create_order(
