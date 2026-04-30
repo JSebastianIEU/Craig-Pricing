@@ -285,16 +285,29 @@ class Quote(Base):
     stripe_paid_at = Column(DateTime, nullable=True)
     stripe_last_error = Column(Text, nullable=True)
 
-    # Missive outbound draft (Phase C). When confirm_order fires on a web-
-    # widget conversation and the tenant has Missive enabled, we create
-    # a brand-new Missive thread (not a reply — the customer never emailed
-    # in) with the quote PDF + payment link. `missive_draft_id` is the
-    # idempotency guard — non-null means we already drafted, don't double-
-    # send. `missive_drafted_at` records when. `missive_last_error` keeps
-    # the failure mode if the draft creation 4xx'd / network'd.
+    # Missive outbound draft (Phase C). When the dashboard "Approve" action
+    # fires on a web-widget conversation and the tenant has Missive enabled,
+    # we create a brand-new Missive thread (not a reply — the customer
+    # never emailed in) with the quote PDF + payment link. `missive_draft_id`
+    # is the idempotency guard — non-null means we already drafted, don't
+    # double-send. `missive_drafted_at` records when. `missive_last_error`
+    # keeps the failure mode if the draft creation 4xx'd / network'd.
     missive_draft_id = Column(String(128), nullable=True, index=True)
     missive_drafted_at = Column(DateTime, nullable=True)
     missive_last_error = Column(Text, nullable=True)
+
+    # Customer-side acceptance signal (Phase D). Set by the LLM's
+    # `confirm_order` tool when the customer explicitly says "yes / go
+    # ahead" in the chat. Distinct from `approved_by` (Justin's manual
+    # approval action in the dashboard). The pair lets the dashboard
+    # show queues split by:
+    #   - "Customer confirmed, awaiting your approval" (client_confirmed_at
+    #     set, approved_by null)
+    #   - "Approved, sent to customer for payment"     (approved_by set,
+    #     stripe_payment_status != 'paid')
+    #   - "Paid, ready for production"                 (stripe_payment_status
+    #     = 'paid', no PrintLogic order yet)
+    client_confirmed_at = Column(DateTime, nullable=True)
 
     conversation = relationship("Conversation", back_populates="quotes")
 

@@ -135,14 +135,28 @@ def _seed_quote(db, conversation_id: int, *, status: str = "pending_approval") -
     return q
 
 
-def test_confirm_order_flips_status():
-    """Calling confirm_order with a valid quote_id should mark both rows."""
+def test_confirm_order_is_passive_does_not_fire_integrations():
+    """
+    Phase D: confirm_order is the customer-side acceptance signal only.
+    It MUST NOT:
+      - flip Quote.status (only Justin's PATCH approve can do that)
+      - trigger Stripe payment link creation
+      - trigger Missive draft creation
+      - push to PrintLogic
+
+    It SHOULD:
+      - record `client_confirmed_at` on the Quote
+      - flip Conversation.status to 'order_placed' (queue signal)
+      - persist any LLM-supplied notes
+      - return a customer-facing message that doesn't promise a link
+    """
     _fresh_tables()
     db = _TestSession()
     try:
         conv = _new_conversation(db, with_contact=True)
         q = _seed_quote(db, conv.id)
         qid = q.id
+        original_status = q.status
 
         result = _exec_tool(
             db,
@@ -150,14 +164,34 @@ def test_confirm_order_flips_status():
             {"quote_id": qid, "notes": "Deliver to Dublin"},
             conversation_id=conv.id,
         )
-        assert result["confirmed"] is True, f"Expected confirmed=True, got: {result}"
+        assert result["confirmed"] is True
         assert result["ref"] == f"JP-{qid:04d}"
+        # All integrations explicitly deferred
+        assert result["printlogic_pushed"] is False
+        assert result["printlogic_error"] == "deferred_to_approve"
+        assert result["stripe_link_created"] is False
+        assert result["stripe_link_url"] is None
+        assert result["stripe_disabled"] is True
+        assert result["missive_draft_created"] is False
+        assert result["missive_draft_id"] is None
+        assert result["missive_skipped"] is True
+        assert result["missive_skip_reason"] == "deferred_to_approve"
 
-        db.refresh(q)
-        db.refresh(conv)
-        assert q.status == "confirmed"
+        db.refresh(q); db.refresh(conv)
+        # Quote status STAYS unchanged — only PATCH approve flips it
+        assert q.status == original_status, (
+            f"Quote.status should not change in confirm_order; "
+            f"was {original_status!r}, got {q.status!r}"
+        )
+        # Customer-side signal recorded
+        assert q.client_confirmed_at is not None
+        # Notes persisted
         assert q.notes == "Deliver to Dublin"
+        # Conversation flipped (so Justin's queue surfaces it)
         assert conv.status == "order_placed"
+        # No outbound integrations populated
+        assert q.stripe_payment_link_url is None
+        assert q.missive_draft_id is None
     finally:
         db.close()
 

@@ -987,6 +987,18 @@ def _quote_to_dict(q: Quote) -> dict[str, Any]:
             if getattr(q, "stripe_paid_at", None) else None
         ),
         "stripe_last_error": getattr(q, "stripe_last_error", None),
+        # Missive outbound draft state — populated when "Approve" fires
+        "missive_draft_id": getattr(q, "missive_draft_id", None),
+        "missive_drafted_at": (
+            q.missive_drafted_at.isoformat()
+            if getattr(q, "missive_drafted_at", None) else None
+        ),
+        "missive_last_error": getattr(q, "missive_last_error", None),
+        # Customer-side acceptance signal (set by confirm_order, not by Justin)
+        "client_confirmed_at": (
+            q.client_confirmed_at.isoformat()
+            if getattr(q, "client_confirmed_at", None) else None
+        ),
     }
 
 
@@ -1023,19 +1035,85 @@ def update_quote(
     claims: StrategosClaims = Depends(require_claims),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    """
+    Update a quote's status / notes. Critical side-effect: when status
+    transitions TO `"approved"` for the first time, this endpoint fires
+    the two outbound integrations Justin asked for:
+
+      1. Stripe Payment Link  (create_link_for_quote)
+      2. Missive outbound draft (send_quote_draft) with PDF + payment URL
+
+    Both are best-effort — failure does NOT roll back the status change.
+    A retry of approve (e.g. PATCH approved → rejected → approved) will
+    NOT re-fire if the integrations already populated their respective
+    idempotency columns (stripe_payment_link_id, missive_draft_id). To
+    force a re-trigger, use the dedicated /create-payment-link or a
+    future "resend missive" endpoint.
+
+    PrintLogic push remains a strictly manual action (separate button in
+    the dashboard) — Justin only fires it after the customer has paid.
+    """
     access_guard(org_slug, claims)
     require_role(claims, "client_member")
     q = _scope(db.query(Quote), Quote, claims, org_slug).filter(Quote.id == quote_id).first()
     if not q:
         raise HTTPException(status_code=404, detail="Quote not found")
+
+    prev_status = q.status
     q.status = body.status
     if body.status in ("approved", "rejected"):
         q.approved_by = claims.email
     if body.notes is not None:
         q.notes = body.notes
+
+    # Fire outbound integrations on the FIRST transition into "approved".
+    # Skip if we were already approved — re-PATCHing approved is allowed
+    # (e.g. correcting notes) and shouldn't double-charge / double-email.
+    integrations: dict[str, Any] = {}
+    if body.status == "approved" and prev_status != "approved":
+        # Stripe payment link first — Missive's email body embeds the URL
+        # so the link must be persisted on the row before we draft.
+        sp: dict[str, Any] = {"ok": False, "error": "not_attempted",
+                              "disabled": True, "url": None}
+        try:
+            from stripe_push import create_link_for_quote
+            sp = create_link_for_quote(db, q, org_slug)
+        except Exception as e:
+            sp = {"ok": False, "error": f"stripe_crashed:{type(e).__name__}",
+                  "disabled": False, "url": None}
+        integrations["stripe"] = {
+            "ok": bool(sp.get("ok")),
+            "url": sp.get("url"),
+            "disabled": bool(sp.get("disabled")),
+            "error": sp.get("error"),
+        }
+
+        # Missive outbound draft. Reads the just-persisted payment link
+        # off the quote row.
+        md: dict[str, Any] = {"ok": False, "skipped": True,
+                              "skip_reason": "not_attempted",
+                              "draft_id": None, "error": None}
+        try:
+            db.flush()
+            from missive_outbound import send_quote_draft
+            md = send_quote_draft(db, q, org_slug)
+        except Exception as e:
+            md = {"ok": False, "skipped": False, "skip_reason": None,
+                  "draft_id": None, "error": f"missive_crashed:{type(e).__name__}"}
+        integrations["missive"] = {
+            "ok": bool(md.get("ok") and not md.get("skipped")),
+            "draft_id": md.get("draft_id"),
+            "skipped": bool(md.get("skipped")),
+            "skip_reason": md.get("skip_reason"),
+            "error": md.get("error"),
+        }
+
     db.commit()
     db.refresh(q)
-    return {"quote": _quote_to_dict(q)}
+    response: dict[str, Any] = {"quote": _quote_to_dict(q)}
+    if integrations:
+        response["integrations"] = integrations
+    return response
 
 
 @router.post("/orgs/{org_slug}/quotes/{quote_id}/push-to-printlogic")

@@ -49,6 +49,7 @@ which is sufficient context for email replies without the chat-voice
 bleed-through. See `_CHANNEL_CONTEXT` below.
 """
 
+import datetime as _dt
 import json
 import os
 import re
@@ -806,9 +807,19 @@ def _exec_tool(
         if name == "confirm_order":
             # Lock in a previously-sent quote. Called when the customer
             # explicitly accepts ("yes", "go ahead", "confirmed") a quote
-            # that's already in the thread. Flips the Quote row to
-            # "confirmed" and the Conversation to "order_placed" so Justin
-            # sees it in the queue as an action item, not an open lead.
+            # that's already in the thread.
+            #
+            # IMPORTANT — this tool is now PASSIVE. It only:
+            #   - flips the Conversation status to "order_placed" (queue signal)
+            #   - records `client_confirmed_at` on the Quote
+            #   - leaves Quote.status at "pending_approval" so Justin sees it
+            #
+            # It does NOT create a Stripe payment link, NOT generate a Missive
+            # draft, NOT push to PrintLogic. Those are now triggered by the
+            # human-in-the-loop "Approve" action in the dashboard (PATCH
+            # /quotes/{id} status=approved). This is the demo-aligned flow
+            # Justin asked for: he reviews every quote before any commercial
+            # action fires.
             try:
                 qid = int(args["quote_id"])
             except (KeyError, ValueError, TypeError):
@@ -823,7 +834,10 @@ def _exec_tool(
                     "error": f"Quote JP-{qid:04d} not found on this conversation",
                     "confirmed": False,
                 }
-            q.status = "confirmed"
+            # Status stays at "pending_approval" — only Justin's PATCH approve
+            # flips it. We track the client signal via Conversation.status and
+            # client_confirmed_at on the Quote.
+            q.client_confirmed_at = _dt.datetime.utcnow()
             if (args.get("notes") or "").strip():
                 q.notes = args["notes"].strip()
             if conversation_id:
@@ -832,85 +846,32 @@ def _exec_tool(
                     conv.status = "order_placed"
             db.flush()
 
-            # Best-effort push to PrintLogic. Respects the tenant's
-            # `printlogic_dry_run` flag (default True → synthetic DRY-xxxx id,
-            # zero network). Never raises or blocks the customer-facing reply:
-            # if PrintLogic is down, the customer still gets their
-            # "Order confirmed" message and Justin can retry from the
-            # dashboard button.
-            #
-            # The LLM reply text does NOT mention PrintLogic — the extra
-            # fields below are for the API caller / logs, not the
-            # customer-facing draft.
-            pl: dict[str, object] = {"ok": False, "error": "not_attempted"}
-            try:
-                from printlogic_push import push_quote
-                pl = push_quote(db, q, organization_slug)
-            except Exception as e:
-                # Defense-in-depth: even if the push module itself blows up
-                # (import error, DB weirdness), we keep the customer path alive.
-                pl = {"ok": False, "error": f"push_crashed:{type(e).__name__}"}
-
-            # Best-effort Stripe payment link. Respects the tenant's
-            # `stripe_enabled` flag (default false → disabled=True, zero
-            # network). Like PrintLogic, any failure is swallowed so the
-            # customer still sees the confirmation message.
-            sp: dict[str, object] = {"ok": False, "error": "not_attempted", "disabled": True}
-            try:
-                from stripe_push import create_link_for_quote
-                sp = create_link_for_quote(db, q, organization_slug)
-            except Exception as e:
-                sp = {"ok": False, "error": f"stripe_crashed:{type(e).__name__}", "disabled": False}
-
-            # Best-effort outbound Missive draft. Sends an email to the
-            # customer with the PDF + payment link so they have a permanent
-            # copy outside the chat session. Strictly opt-in per tenant
-            # via missive_enabled + missive_auto_draft_enabled — defaults
-            # to "skip" if either flag is off. The draft sits in Justin's
-            # Missive inbox with send=False so he reviews before firing.
-            md: dict[str, object] = {"ok": False, "skipped": True,
-                                      "skip_reason": "not_attempted",
-                                      "draft_id": None, "error": None}
-            try:
-                # Re-read the quote so we pick up the stripe_payment_link_url
-                # that create_link_for_quote just persisted on this row.
-                db.flush()
-                from missive_outbound import send_quote_draft
-                md = send_quote_draft(db, q, organization_slug)
-            except Exception as e:
-                md = {"ok": False, "skipped": False, "skip_reason": None,
-                      "draft_id": None,
-                      "error": f"missive_crashed:{type(e).__name__}"}
-
-            # Customer-facing message becomes "here's your payment link"
-            # when we have one; otherwise falls back to the original.
-            pay_url = sp.get("url")
-            if pay_url:
-                customer_msg = (
-                    "Order confirmed. You can pay securely here: "
-                    f"{pay_url} — Justin will be in touch with next steps."
-                )
-            else:
-                customer_msg = "Order confirmed. Justin will be in touch with next steps."
+            customer_msg = (
+                "All set! Justin will review your quote and email you the "
+                "official confirmation with payment details shortly. \U0001f44d"
+            )
 
             return {
                 "confirmed": True,
                 "quote_id": qid,
                 "ref": f"JP-{qid:04d}",
                 "message": customer_msg,
-                "printlogic_pushed": bool(pl.get("ok")),
-                "printlogic_order_id": pl.get("order_id"),
-                "printlogic_dry_run": bool(pl.get("dry_run")),
-                "printlogic_error": pl.get("error"),
-                "stripe_link_created": bool(sp.get("ok")),
-                "stripe_link_url": sp.get("url"),
-                "stripe_disabled": bool(sp.get("disabled")),
-                "stripe_error": sp.get("error"),
-                "missive_draft_created": bool(md.get("ok") and not md.get("skipped")),
-                "missive_draft_id": md.get("draft_id"),
-                "missive_skipped": bool(md.get("skipped")),
-                "missive_skip_reason": md.get("skip_reason"),
-                "missive_error": md.get("error"),
+                # Status fields kept for backwards-compat with callers /
+                # tests that expected the old shape; integrations don't
+                # fire here any more.
+                "printlogic_pushed": False,
+                "printlogic_order_id": None,
+                "printlogic_dry_run": None,
+                "printlogic_error": "deferred_to_approve",
+                "stripe_link_created": False,
+                "stripe_link_url": None,
+                "stripe_disabled": True,
+                "stripe_error": "deferred_to_approve",
+                "missive_draft_created": False,
+                "missive_draft_id": None,
+                "missive_skipped": True,
+                "missive_skip_reason": "deferred_to_approve",
+                "missive_error": None,
             }
 
         return {"error": f"Unknown tool: {name}"}
