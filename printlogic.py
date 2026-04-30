@@ -259,7 +259,11 @@ async def update_order_status(order_number: str, status: str, api_key: str) -> d
     )
     if err:
         return {"ok": False, "raw": parsed, "error": err}
-    # PrintLogic returns `{"status":"ok"}` on success
-    if isinstance(parsed, dict) and parsed.get("status") == "ok":
+    # The PDF spec says `{"status":"ok"}` but the real API returns
+    # `{"result":"ok"}`. Accept either shape — verified against live
+    # probe `scripts/probe_printlogic_ops_cycle.py`.
+    if isinstance(parsed, dict) and (
+        parsed.get("status") == "ok" or parsed.get("result") == "ok"
+    ):
         return {"ok": True, "raw": parsed, "error": None}
     return {"ok": False, "raw": parsed, "error": "unexpected_response"}

@@ -1194,6 +1194,295 @@ def test_printlogic_connection(
     }
 
 
+# ----------------------------------------------------------------------------
+# PrintLogic test-order — create & cancel a sentinel order from the dashboard.
+#
+# Mirrors the lifecycle proven by `scripts/probe_printlogic_ops_cycle.py`:
+#   CREATE  -> sentinel order tagged [CRAIG-PROBE-DELETE-ME-{ts}]
+#   CANCEL  -> update_order_status="Cancelled" (PrintLogic has no DELETE)
+#
+# Honors the tenant `printlogic_dry_run` flag — when dry-run is on, this
+# returns a synthetic DRY-xxxx id without ever calling PrintLogic. Once
+# the ceremony flips dry_run=false, the same UI button creates a real
+# order that Justin can spot in his queue by the marker.
+#
+# We persist the most-recent test order in Settings so the Cancel button
+# survives a page refresh:
+#   - printlogic_last_test_order_id
+#   - printlogic_last_test_order_number
+#   - printlogic_last_test_customer_id
+#   - printlogic_last_test_marker
+#   - printlogic_last_test_created_at
+#   - printlogic_last_test_status   ('open' | 'cancelled')
+#   - printlogic_last_test_dry_run  ('true' | 'false')
+# ----------------------------------------------------------------------------
+
+
+_PL_TEST_KEYS = (
+    "printlogic_last_test_order_id",
+    "printlogic_last_test_order_number",
+    "printlogic_last_test_customer_id",
+    "printlogic_last_test_marker",
+    "printlogic_last_test_created_at",
+    "printlogic_last_test_status",
+    "printlogic_last_test_dry_run",
+)
+
+
+def _set_setting(db: Session, org_slug: str, key: str, value: str) -> None:
+    """Idempotent upsert of a Setting row scoped to org_slug."""
+    row = (
+        db.query(Setting)
+        .filter_by(organization_slug=org_slug, key=key)
+        .first()
+    )
+    if row:
+        row.value = value
+    else:
+        db.add(Setting(
+            organization_slug=org_slug,
+            key=key,
+            value=value,
+            value_type="string",
+        ))
+
+
+def _read_last_test(db: Session, org_slug: str) -> dict[str, Any]:
+    """Return the persisted last-test-order info as a flat dict."""
+    rows = {
+        r.key: r.value
+        for r in db.query(Setting)
+        .filter_by(organization_slug=org_slug)
+        .filter(Setting.key.in_(_PL_TEST_KEYS))
+        .all()
+    }
+    if not rows.get("printlogic_last_test_order_id"):
+        return {"present": False}
+    return {
+        "present": True,
+        "order_id": rows.get("printlogic_last_test_order_id"),
+        "order_number": rows.get("printlogic_last_test_order_number"),
+        "customer_id": rows.get("printlogic_last_test_customer_id"),
+        "marker": rows.get("printlogic_last_test_marker"),
+        "created_at": rows.get("printlogic_last_test_created_at"),
+        "status": rows.get("printlogic_last_test_status") or "open",
+        "dry_run": rows.get("printlogic_last_test_dry_run") == "true",
+    }
+
+
+@router.get("/orgs/{org_slug}/integrations/printlogic/test-order")
+def get_printlogic_test_order(
+    org_slug: str,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Return the most-recent dashboard-created sentinel order, if any."""
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+    return _read_last_test(db, org_slug)
+
+
+@router.post("/orgs/{org_slug}/integrations/printlogic/test-order")
+def create_printlogic_test_order(
+    org_slug: str,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Create a sentinel PrintLogic order tagged [CRAIG-PROBE-DELETE-ME-{ts}].
+
+    Honors the tenant `printlogic_dry_run` flag:
+      - dry_run=true  -> synthetic DRY-xxxx id, zero network traffic
+      - dry_run=false -> real create_order POST; the resulting order
+                         goes into Justin's queue tagged so he can find
+                         it (it should be cancelled immediately after
+                         the demo via the Cancel button).
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    import asyncio
+    import json as _json
+    import time
+    import printlogic
+    from pricing_engine import _get_setting
+
+    api_key = _get_setting(db, "printlogic_api_key", default="", organization_slug=org_slug)
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="PrintLogic api_key not configured. Save the api_key first.",
+        )
+    dry_run_setting = _get_setting(db, "printlogic_dry_run", default="true", organization_slug=org_slug)
+    dry_run = dry_run_setting != "false"
+
+    ts = int(time.time())
+    marker = f"[CRAIG-PROBE-DELETE-ME-{ts}]"
+
+    payload = {
+        "customer_uid": "",
+        "customer_name": f"CRAIG-PROBE-DO-NOT-PROCESS-{ts}",
+        "customer_email": "probe@strategos-ai.com",
+        "customer_phone": "",
+        "customer_address1": "",
+        "customer_address2": "",
+        "customer_address3": "",
+        "customer_address4": "",
+        "customer_postcode": "",
+        "order_description": f"{marker} dashboard test order — DO NOT PRODUCE",
+        "contact_name": "",
+        "order_po": "",
+        "delivery_address1": "",
+        "delivery_address2": "",
+        "delivery_address3": "",
+        "delivery_address4": "",
+        "order_items": [{
+            "item_quantity": "1",
+            "item_desc": "[PROBE] sentinel item — DO NOT PRODUCE",
+            "item_price": "0.01",
+            "item_vat": "23",
+            "item_custom_data": _json.dumps({"craig_probe": True, "ts": ts, "source": "dashboard"}),
+            "item_detail": f"{marker} Dashboard test only",
+            "item_code": "PROBE",
+            "item_part_number": "",
+        }],
+    }
+
+    try:
+        result = asyncio.run(printlogic.create_order(
+            payload, api_key, dry_run=dry_run, quote_id_for_dry=f"dash-test-{ts}",
+        ))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"create_order crashed: {type(e).__name__}: {e}")
+
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "dry_run": dry_run,
+            "error": result.get("error") or "unknown",
+            "raw": result.get("raw"),
+            "ambiguous": result.get("ambiguous", False),
+        }
+
+    order_id = str(result.get("order_id") or "")
+    customer_id = str(result.get("customer_id") or "")
+    raw = result.get("raw") or {}
+    order_number = str(raw.get("order_number") or order_id)
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    # Persist for the Cancel button to find later
+    _set_setting(db, org_slug, "printlogic_last_test_order_id", order_id)
+    _set_setting(db, org_slug, "printlogic_last_test_order_number", order_number)
+    _set_setting(db, org_slug, "printlogic_last_test_customer_id", customer_id)
+    _set_setting(db, org_slug, "printlogic_last_test_marker", marker)
+    _set_setting(db, org_slug, "printlogic_last_test_created_at", created_at)
+    _set_setting(db, org_slug, "printlogic_last_test_status", "open")
+    _set_setting(db, org_slug, "printlogic_last_test_dry_run", "true" if dry_run else "false")
+    db.commit()
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "order_id": order_id,
+        "order_number": order_number,
+        "customer_id": customer_id,
+        "marker": marker,
+        "created_at": created_at,
+        "status": "open",
+    }
+
+
+@router.post("/orgs/{org_slug}/integrations/printlogic/test-order/cancel")
+def cancel_printlogic_test_order(
+    org_slug: str,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Cancel the most-recent sentinel order (sets status=Cancelled in
+    PrintLogic). For dry-run orders, this is a no-op except for clearing
+    our local pointer so the dashboard returns to "no test order".
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    last = _read_last_test(db, org_slug)
+    if not last.get("present"):
+        raise HTTPException(status_code=404, detail="No test order on file")
+    if last.get("status") == "cancelled":
+        return {"ok": True, "already_cancelled": True, **last}
+
+    order_number = last.get("order_number") or ""
+    was_dry = bool(last.get("dry_run"))
+
+    if was_dry:
+        # No real order existed — just clear local state.
+        _set_setting(db, org_slug, "printlogic_last_test_status", "cancelled")
+        db.commit()
+        return {
+            "ok": True,
+            "dry_run": True,
+            "order_number": order_number,
+            "status": "cancelled",
+            "note": "Dry-run — no real cancel needed; local pointer cleared.",
+        }
+
+    import asyncio
+    import printlogic
+    from pricing_engine import _get_setting
+
+    api_key = _get_setting(db, "printlogic_api_key", default="", organization_slug=org_slug)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key disappeared")
+
+    try:
+        result = asyncio.run(
+            printlogic.update_order_status(order_number, "Cancelled", api_key)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"update_order_status crashed: {type(e).__name__}: {e}",
+        )
+
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "order_number": order_number,
+            "error": result.get("error"),
+            "raw": result.get("raw"),
+        }
+
+    _set_setting(db, org_slug, "printlogic_last_test_status", "cancelled")
+    db.commit()
+
+    return {
+        "ok": True,
+        "dry_run": False,
+        "order_number": order_number,
+        "status": "cancelled",
+    }
+
+
+@router.post("/orgs/{org_slug}/integrations/printlogic/test-order/clear")
+def clear_printlogic_test_order(
+    org_slug: str,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Clear the dashboard's local pointer to the last test order without
+    touching PrintLogic. Useful after a successful cancel to dismiss the
+    card so the demo can run fresh.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+    for k in _PL_TEST_KEYS:
+        _set_setting(db, org_slug, k, "")
+    db.commit()
+    return {"ok": True, "cleared": True}
+
+
 @router.post("/orgs/{org_slug}/integrations/stripe/test")
 def test_stripe_connection(
     org_slug: str,
