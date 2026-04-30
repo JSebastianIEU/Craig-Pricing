@@ -104,13 +104,26 @@ def push_quote(db, quote: Quote, organization_slug: str) -> dict[str, Any]:
         conv = db.query(Conversation).filter_by(id=quote.conversation_id).first()
 
     # ── 4. Customer dedup lookup (optional — silently skip on any error) ─
+    # Phase E priority: when the customer told us they've ordered before,
+    # use the past_customer_email they typed (their actual PrintLogic-side
+    # identity) rather than the email they used in this chat session.
+    # That maximises the chance of a successful match in PrintLogic's
+    # customer table and avoids creating a duplicate record.
     existing_customer_uid: str | None = None
-    if not dry_run and conv and (conv.customer_email or conv.customer_phone):
+    lookup_email = None
+    if conv:
+        if getattr(conv, "is_returning_customer", None) and (getattr(conv, "past_customer_email", None) or "").strip():
+            lookup_email = conv.past_customer_email.strip()
+        elif (conv.customer_email or "").strip():
+            lookup_email = conv.customer_email.strip()
+    lookup_phone = (conv.customer_phone if conv else None) or None
+
+    if not dry_run and conv and (lookup_email or lookup_phone):
         try:
             lookup = asyncio.run(printlogic.find_customer(
                 api_key,
-                email=(conv.customer_email or None),
-                phone=(conv.customer_phone or None),
+                email=lookup_email,
+                phone=lookup_phone,
             ))
             if lookup.get("ok") and lookup.get("customer"):
                 c = lookup["customer"]

@@ -235,6 +235,19 @@ class Conversation(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # Phase E — extended customer-funnel fields (v22 migration). Roi's
+    # post-meeting spec: Craig must collect company-vs-individual,
+    # returning-customer status, and delivery-vs-collect preference
+    # before generating a quote so the eventual PrintLogic order has
+    # everything Justin needs to invoice + ship.
+    is_company = Column(Boolean, nullable=True)
+    is_returning_customer = Column(Boolean, nullable=True)
+    past_customer_email = Column(String(200), nullable=True)
+    # 'delivery' | 'collect' — null until customer picks
+    delivery_method = Column(String(20), nullable=True)
+    # JSON object: {address1, address2, address3, address4, postcode}
+    delivery_address = Column(JSON, nullable=True)
+
     quotes = relationship("Quote", back_populates="conversation", cascade="all, delete-orphan")
 
     __table_args__ = (

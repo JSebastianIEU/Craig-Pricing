@@ -293,6 +293,24 @@ def build_payload_from_quote(
     cust_name = (getattr(conv, "customer_name", None) or "").strip()
     cust_email = (getattr(conv, "customer_email", None) or "").strip()
     cust_phone = (getattr(conv, "customer_phone", None) or "").strip()
+    is_company = bool(getattr(conv, "is_company", None))
+
+    # Phase E — pull delivery info off the conversation if the caller
+    # didn't pass an explicit dict. Conversation.delivery_address is
+    # stored as JSON `{address1..4, postcode}` from save_customer_info.
+    conv_delivery_method = (getattr(conv, "delivery_method", None) or "").strip().lower()
+    conv_delivery_addr = getattr(conv, "delivery_address", None)
+    if delivery_address is None and conv_delivery_method == "delivery" and isinstance(conv_delivery_addr, dict):
+        # Map our internal `address1..4 / postcode` keys to the kwarg
+        # shape the rest of this function expects (`delivery_address1..4 /
+        # delivery_postcode`).
+        delivery_address = {
+            "delivery_address1": (conv_delivery_addr.get("address1") or "").strip(),
+            "delivery_address2": (conv_delivery_addr.get("address2") or "").strip(),
+            "delivery_address3": (conv_delivery_addr.get("address3") or "").strip(),
+            "delivery_address4": (conv_delivery_addr.get("address4") or "").strip(),
+            "delivery_postcode": (conv_delivery_addr.get("postcode") or "").strip(),
+        }
 
     # Resolve VAT rate from the quote's stored amounts
     try:
@@ -303,7 +321,7 @@ def build_payload_from_quote(
         vat_rate_pct = 23.0
 
     short = _short_item_desc(quote, qty)
-    detail = _long_item_detail(quote, double_sided)
+    detail = _long_item_detail(quote, double_sided, conv=conv)
     w_mm, h_mm = width_height_mm(specs, quote.product_key)
     paper = paper_description_for(quote.product_key)
     finishing = finishing_description(specs, double_sided)
@@ -333,6 +351,14 @@ def build_payload_from_quote(
         "item_custom_data": json.dumps({
             "craig_quote_id": quote.id,
             "craig_specs": specs,
+            # Phase E — surface customer-funnel flags so PrintLogic's
+            # webhook (or whoever inspects custom_data) sees them too.
+            # Even though the spec says custom_data is silently dropped,
+            # leaving these here is harmless and gives a forward-link
+            # if the API behaviour changes later.
+            "craig_is_company": is_company,
+            "craig_is_returning_customer": bool(getattr(conv, "is_returning_customer", None)),
+            "craig_delivery_method": conv_delivery_method or "delivery",
         }),
     }
 
@@ -478,7 +504,7 @@ def _short_item_desc(quote, qty: int) -> str:
     return " ".join(parts) if parts else "Craig quote"
 
 
-def _long_item_detail(quote, double_sided: bool) -> str:
+def _long_item_detail(quote, double_sided: bool, conv=None) -> str:
     """
     Build the multi-line jobsheet that lands in PrintLogic's `detail`
     column. We pack EVERYTHING here because the rich per-item columns
@@ -493,6 +519,8 @@ def _long_item_detail(quote, double_sided: bool) -> str:
         Finishing:    soft-touch laminate, rounded corners
         Cover:        soft cover
         Binding:      saddle stitch
+        Customer:     Company  (or "Individual")
+        Delivery:     delivery to 12 Main St, D02 X1Y2
         Quote:        Craig qid=42
     """
     specs = quote.specs or {}
@@ -519,6 +547,42 @@ def _long_item_detail(quote, double_sided: bool) -> str:
         lines.append(f"Cover:       {str(specs['cover_type']).replace('_', ' ')}")
     if specs.get("binding"):
         lines.append(f"Binding:     {str(specs['binding']).replace('_', ' ')}")
+
+    # Phase E — pack customer-funnel facts into `detail` because the
+    # dedicated PrintLogic columns (delivery_address1..4, customer flags)
+    # are silently dropped on create. This is the field Justin actually
+    # reads when working an order, so the info has to land here.
+    if conv is not None:
+        if getattr(conv, "is_company", None) is True:
+            lines.append("Customer:    Company (B2B)")
+        elif getattr(conv, "is_company", None) is False:
+            lines.append("Customer:    Individual")
+
+        if getattr(conv, "is_returning_customer", None):
+            past = (getattr(conv, "past_customer_email", None) or "").strip()
+            if past:
+                lines.append(f"Returning:   yes (was {past})")
+            else:
+                lines.append("Returning:   yes")
+
+        method = (getattr(conv, "delivery_method", None) or "").strip().lower()
+        if method == "collect":
+            lines.append("Delivery:    collect from shop")
+        elif method == "delivery":
+            addr = getattr(conv, "delivery_address", None) or {}
+            if isinstance(addr, dict):
+                bits = [
+                    addr.get("address1"), addr.get("address2"),
+                    addr.get("address3"), addr.get("address4"),
+                    addr.get("postcode"),
+                ]
+                addr_str = ", ".join(b.strip() for b in bits if b and b.strip())
+                if addr_str:
+                    lines.append(f"Delivery:    delivery to {addr_str}")
+                else:
+                    lines.append("Delivery:    delivery (address pending)")
+            else:
+                lines.append("Delivery:    delivery (address pending)")
 
     if getattr(quote, "id", None):
         lines.append(f"Quote:       Craig qid={quote.id}")

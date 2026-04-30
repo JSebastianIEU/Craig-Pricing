@@ -127,7 +127,7 @@ DO:
 - Just say the total: "That'll be €46.74 for 500 business cards 👍"
 - After giving the price, ALWAYS ask if they want the full quote: "Want me to put together the full quote for you? 📋"
 - If they say yes, respond with EXACTLY this format (the widget will detect it): "Here's your quote! 📋 [QUOTE_READY]"
-- Artwork/design is €65+VAT per hour, quoted separately if they don't have print-ready files. Just say "€79.95 per hour for design work" (that's the inc VAT number).
+- Design service is a flat €65 ex VAT (€79.95 inc VAT) per order if the customer needs us to design their artwork. When they confirm they want it, on the NEXT pricing tool call pass `needs_artwork=true, artwork_hours=1.0` — that's how we bill it through the engine. If they have print-ready artwork, omit both arguments (no design line item).
 - Standard turnaround is 3-5 working days.
 
 ## When to collect contact details
@@ -462,6 +462,56 @@ def _build_business_rules_context(db: Session, organization_slug: str) -> str:
     )
 
 
+def _build_faq_context(db: Session, organization_slug: str) -> str:
+    """
+    Render the tenant's FAQ list as an injected knowledge block.
+
+    Stored in setting `craig_faqs_json` as a JSON array of `{q, a}`
+    objects. The `{{shop_address}}` placeholder in any answer is
+    expanded to the live `shop_address` setting so customers always get
+    the right address, even if Justin updates it.
+
+    Returned with a clear header so the LLM knows it's reference
+    material — paraphrase, don't recite verbatim.
+    """
+    from pricing_engine import _get_setting
+
+    raw = _get_setting(db, "craig_faqs_json", None, organization_slug=organization_slug)
+    if not raw:
+        return ""
+    try:
+        faqs = json.loads(raw)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(faqs, list):
+        return ""
+
+    shop_address = _get_setting(
+        db, "shop_address", "", organization_slug=organization_slug,
+    ) or ""
+
+    lines: list[str] = [
+        "## Frequently asked questions (Craig should answer naturally if asked)",
+        "Paraphrase in your own voice — don't recite the answer verbatim. "
+        "Do NOT escalate any of these to Justin.",
+        "",
+    ]
+    for entry in faqs:
+        if not isinstance(entry, dict):
+            continue
+        q = (entry.get("q") or entry.get("question") or "").strip()
+        a = (entry.get("a") or entry.get("answer") or "").strip()
+        if not q or not a:
+            continue
+        a = a.replace("{{shop_address}}", shop_address or "[shop address — pending]")
+        lines.append(f"Q: {q}")
+        lines.append(f"A: {a}")
+        lines.append("")
+    if len(lines) <= 3:
+        return ""
+    return "\n".join(lines).rstrip() + "\n"
+
+
 # =============================================================================
 # TOOL DEFINITIONS (OpenAI function-calling format)
 # =============================================================================
@@ -600,15 +650,20 @@ TOOLS = [
         "function": {
             "name": "save_customer_info",
             "description": (
-                "Save the customer's contact info to the conversation so Justin can follow up. "
-                "Call this after collecting name and email/phone."
+                "Save EVERYTHING you've collected from the customer in one call: "
+                "identity (name + email/phone), invoicing flag (company vs individual), "
+                "returning-customer status (with their previous email if relevant), "
+                "and delivery preference (delivery + address, or collect from shop). "
+                "All fields except `name` are optional — pass only what you've actually "
+                "collected; nulls don't overwrite prior values. Call ONCE at the end "
+                "of the contact-collection flow, not per-question."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Customer's name.",
+                        "description": "Customer's name (or company contact's name).",
                     },
                     "email": {
                         "type": "string",
@@ -623,8 +678,76 @@ TOOLS = [
                         "enum": ["email", "whatsapp", "phone"],
                         "description": "How they prefer to be contacted.",
                     },
+                    "is_company": {
+                        "type": "boolean",
+                        "description": (
+                            "true if ordering on behalf of a company (B2B invoicing), "
+                            "false if individual / consumer."
+                        ),
+                    },
+                    "is_returning_customer": {
+                        "type": "boolean",
+                        "description": (
+                            "true if they've ordered with Just Print before. If true, "
+                            "also fill `past_customer_email` so we can link to their "
+                            "existing record in PrintLogic."
+                        ),
+                    },
+                    "past_customer_email": {
+                        "type": "string",
+                        "description": (
+                            "The email address they used on a prior order. Only set "
+                            "when is_returning_customer=true."
+                        ),
+                    },
+                    "delivery_method": {
+                        "type": "string",
+                        "enum": ["delivery", "collect"],
+                        "description": (
+                            "How they want to receive the order. 'delivery' requires "
+                            "delivery_address; 'collect' means they'll pick up at the shop."
+                        ),
+                    },
+                    "delivery_address": {
+                        "type": "object",
+                        "description": (
+                            "Delivery address (only when delivery_method='delivery'). "
+                            "All fields strings; address1 + postcode minimum."
+                        ),
+                        "properties": {
+                            "address1": {"type": "string"},
+                            "address2": {"type": "string"},
+                            "address3": {"type": "string"},
+                            "address4": {"type": "string"},
+                            "postcode": {"type": "string"},
+                        },
+                    },
                 },
                 "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_past_quotes_by_email",
+            "description": (
+                "Look up prior approved/sent/accepted quotes for a returning customer "
+                "by their email address. Call this when a customer says they've ordered "
+                "before and gives you the email they used. Returns a short list of "
+                "their last quotes (product, qty, total, when) so you can offer to "
+                "re-order the same spec. Tenant-scoped — never returns other clients' "
+                "data."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "description": "The customer's previous email address.",
+                    },
+                },
+                "required": ["email"],
             },
         },
     },
@@ -749,11 +872,11 @@ def _exec_tool(
             }
 
         if name == "save_customer_info":
-            # Save contact info to the conversation record.
-            # Only overwrite when a non-empty value is supplied — LLMs routinely
-            # call this tool with a single new field (e.g. just `phone` after
-            # collecting the number) and would otherwise nuke the name/email
-            # we already stored on the previous turn.
+            # Save contact + funnel info to the conversation record.
+            # Only overwrite when a non-empty / non-null value is supplied —
+            # LLMs routinely call this tool with a partial update (e.g. just
+            # the new field they just collected) and would otherwise nuke
+            # data we stored on the previous turn.
             if conversation_id:
                 conv = db.query(Conversation).filter_by(id=conversation_id).first()
                 if conv:
@@ -763,6 +886,29 @@ def _exec_tool(
                         conv.customer_email = args["email"].strip()
                     if (args.get("phone") or "").strip():
                         conv.customer_phone = args["phone"].strip()
+                    # Phase E — extended funnel fields. Booleans accept
+                    # explicit False (don't drop it); strings/objects need
+                    # truthy check so empty strings don't blank existing data.
+                    if "is_company" in args and args["is_company"] is not None:
+                        conv.is_company = bool(args["is_company"])
+                    if "is_returning_customer" in args and args["is_returning_customer"] is not None:
+                        conv.is_returning_customer = bool(args["is_returning_customer"])
+                    if (args.get("past_customer_email") or "").strip():
+                        conv.past_customer_email = args["past_customer_email"].strip()
+                    method = (args.get("delivery_method") or "").strip().lower()
+                    if method in ("delivery", "collect"):
+                        conv.delivery_method = method
+                    addr = args.get("delivery_address")
+                    if isinstance(addr, dict) and any(
+                        (addr.get(k) or "").strip()
+                        for k in ("address1", "address2", "address3", "address4", "postcode")
+                    ):
+                        # Normalise — only persist non-empty subkeys
+                        conv.delivery_address = {
+                            k: (addr.get(k) or "").strip()
+                            for k in ("address1", "address2", "address3", "address4", "postcode")
+                            if (addr.get(k) or "").strip()
+                        }
                     db.flush()
             return {
                 "saved": True,
@@ -770,6 +916,58 @@ def _exec_tool(
                 "email": args.get("email"),
                 "phone": args.get("phone"),
                 "preferred_channel": args.get("preferred_channel"),
+                "is_company": args.get("is_company"),
+                "is_returning_customer": args.get("is_returning_customer"),
+                "past_customer_email": args.get("past_customer_email"),
+                "delivery_method": args.get("delivery_method"),
+                "delivery_address": args.get("delivery_address"),
+            }
+
+        if name == "find_past_quotes_by_email":
+            # Tenant-scoped lookup. Returns a compact list so the LLM can
+            # offer to re-order the same spec. Status filter intentionally
+            # narrow — only quotes the customer has actually accepted /
+            # paid for in the past, not abandoned ones.
+            email = (args.get("email") or "").strip().lower()
+            if not email:
+                return {"found": False, "quotes": [], "message": "No email provided."}
+            past = (
+                db.query(Quote)
+                .join(Conversation, Quote.conversation_id == Conversation.id)
+                .filter(
+                    Conversation.organization_slug == organization_slug,
+                    Conversation.customer_email.ilike(email),
+                    Quote.status.in_(("approved", "sent", "accepted")),
+                )
+                .order_by(Quote.created_at.desc())
+                .limit(5)
+                .all()
+            )
+            if not past:
+                return {
+                    "found": False, "quotes": [],
+                    "message": f"No prior quotes found for {email}. Treat them as a new customer.",
+                }
+            summary = [
+                {
+                    "ref": f"JP-{q.id:04d}",
+                    "quote_id": q.id,
+                    "product_key": q.product_key,
+                    "specs": q.specs or {},
+                    "total_inc_vat": float(q.final_price_inc_vat or 0),
+                    "created_at": q.created_at.isoformat() if q.created_at else None,
+                }
+                for q in past
+            ]
+            return {
+                "found": True,
+                "count": len(summary),
+                "quotes": summary,
+                "message": (
+                    f"Found {len(summary)} prior order(s) for {email}. Reference "
+                    f"them naturally if relevant — e.g. 'I see you ordered "
+                    f"{summary[0]['product_key']} before; want the same spec?'"
+                ),
             }
 
         if name == "escalate_to_justin":
@@ -971,13 +1169,21 @@ def chat_with_craig(
     if is_email:
         rules_ctx = ""
         effective_base_prompt = ""
+        # FAQs apply equally to email — customer might ask "do you ship?"
+        # in an email and we want the same answer Craig gives in chat.
+        faq_ctx = _build_faq_context(db, organization_slug)
     else:
         rules_ctx = _build_business_rules_context(db, organization_slug)
         effective_base_prompt = base_prompt
+        faq_ctx = _build_faq_context(db, organization_slug)
 
+    # Order: channel override (highest), business rules, base personality,
+    # FAQs (reference material), catalog (lookup). FAQs sit between the
+    # base prompt and the catalog so they're treated as background
+    # knowledge — Craig answers them inline rather than escalating.
     system_prompt = "\n\n".join(
         section
-        for section in (channel_ctx, rules_ctx, effective_base_prompt, catalog_ctx)
+        for section in (channel_ctx, rules_ctx, effective_base_prompt, faq_ctx, catalog_ctx)
         if section
     )
     # Diagnostic: confirm what the LLM actually receives. Cheap to log,

@@ -2138,6 +2138,14 @@ def _conv_summary(c: Conversation) -> dict[str, Any]:
         "last_message_preview": (last_content[:140] if last_content else None),
         "last_message_at": c.updated_at.isoformat() if c.updated_at else None,
         "created_at": c.created_at.isoformat() if c.created_at else None,
+        # Phase E — extended customer-funnel fields. Surface everything so
+        # Justin can see at a glance what Craig collected (or what's still
+        # missing) without opening the full conversation.
+        "is_company": getattr(c, "is_company", None),
+        "is_returning_customer": getattr(c, "is_returning_customer", None),
+        "past_customer_email": getattr(c, "past_customer_email", None),
+        "delivery_method": getattr(c, "delivery_method", None),
+        "delivery_address": getattr(c, "delivery_address", None),
     }
 
 
@@ -2216,6 +2224,75 @@ def get_conversation(
             "quotes": quote_dicts,
         }
     }
+
+
+class UpdateConversationRequest(BaseModel):
+    """Phase E — let Justin edit customer info from the dashboard if Craig
+    misread / failed to collect a field. Only the fields included in the
+    request body get touched (overwrite-when-non-null pattern, same as
+    save_customer_info)."""
+    model_config = ConfigDict(extra="forbid")
+    customer_name: Optional[str] = None
+    customer_email: Optional[str] = None
+    customer_phone: Optional[str] = None
+    is_company: Optional[bool] = None
+    is_returning_customer: Optional[bool] = None
+    past_customer_email: Optional[str] = None
+    delivery_method: Optional[str] = Field(None, pattern=r"^(delivery|collect)$")
+    delivery_address: Optional[dict] = None
+
+
+@router.patch("/orgs/{org_slug}/conversations/{cid}")
+def update_conversation(
+    org_slug: str,
+    cid: int,
+    body: UpdateConversationRequest,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Patch customer info on a Conversation. Phase E — supports the
+    extended funnel fields (is_company, is_returning_customer,
+    past_customer_email, delivery_method, delivery_address) on top of
+    the original name/email/phone.
+
+    Overwrite-when-non-null: passing `null` for a field is a no-op (so
+    callers don't accidentally blank data they didn't intend to). To
+    explicitly clear a field, pass an empty string for strings or `false`
+    for booleans.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_member")
+    c = _scope(db.query(Conversation), Conversation, claims, org_slug).filter(Conversation.id == cid).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if body.customer_name is not None:
+        c.customer_name = body.customer_name.strip()
+    if body.customer_email is not None:
+        c.customer_email = body.customer_email.strip()
+    if body.customer_phone is not None:
+        c.customer_phone = body.customer_phone.strip()
+    if body.is_company is not None:
+        c.is_company = body.is_company
+    if body.is_returning_customer is not None:
+        c.is_returning_customer = body.is_returning_customer
+    if body.past_customer_email is not None:
+        c.past_customer_email = body.past_customer_email.strip()
+    if body.delivery_method is not None:
+        c.delivery_method = body.delivery_method
+    if body.delivery_address is not None:
+        # Normalise to the {address1..4, postcode} shape we persist.
+        normalised = {}
+        for key in ("address1", "address2", "address3", "address4", "postcode"):
+            v = body.delivery_address.get(key)
+            if v is not None and str(v).strip():
+                normalised[key] = str(v).strip()
+        c.delivery_address = normalised or None
+
+    db.commit()
+    db.refresh(c)
+    return {"conversation": _conv_summary(c)}
 
 
 @router.delete("/orgs/{org_slug}/conversations/{cid}")

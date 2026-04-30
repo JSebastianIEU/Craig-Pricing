@@ -74,6 +74,7 @@ def main() -> None:
     from scripts.v19_missive_outbound_cols import migrate as v19_migrate
     from scripts.v20_client_confirmed_at import migrate as v20_migrate
     from scripts.v21_secretest_demo_product import migrate as v21_migrate
+    from scripts.v22_contact_funnel import migrate as v22_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -95,6 +96,7 @@ def main() -> None:
     _run("v19 missive outbound draft columns + setting", v19_migrate)
     _run("v20 client_confirmed_at on quotes", v20_migrate)
     _run("v21 secretest demo product seed", v21_migrate)
+    _run("v22 contact-funnel cols + FAQs + business_rules update", v22_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 
