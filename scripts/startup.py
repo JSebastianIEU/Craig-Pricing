@@ -71,6 +71,7 @@ def main() -> None:
     from scripts.v16_stripe_settings_seed import seed as v16_seed
     from scripts.v17_encrypt_existing_secrets import migrate as v17_migrate
     from scripts.v18_stripe_connect_migration import migrate as v18_migrate
+    from scripts.v19_missive_outbound_cols import migrate as v19_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -89,6 +90,7 @@ def main() -> None:
     _run("v16 stripe settings seed", v16_seed)
     _run("v17 encrypt existing secrets (soft-skips if no key)", v17_migrate)
     _run("v18 remove legacy stripe paste-flow keys", v18_migrate)
+    _run("v19 missive outbound draft columns + setting", v19_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

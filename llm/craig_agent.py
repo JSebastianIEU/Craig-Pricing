@@ -862,6 +862,26 @@ def _exec_tool(
             except Exception as e:
                 sp = {"ok": False, "error": f"stripe_crashed:{type(e).__name__}", "disabled": False}
 
+            # Best-effort outbound Missive draft. Sends an email to the
+            # customer with the PDF + payment link so they have a permanent
+            # copy outside the chat session. Strictly opt-in per tenant
+            # via missive_enabled + missive_auto_draft_enabled — defaults
+            # to "skip" if either flag is off. The draft sits in Justin's
+            # Missive inbox with send=False so he reviews before firing.
+            md: dict[str, object] = {"ok": False, "skipped": True,
+                                      "skip_reason": "not_attempted",
+                                      "draft_id": None, "error": None}
+            try:
+                # Re-read the quote so we pick up the stripe_payment_link_url
+                # that create_link_for_quote just persisted on this row.
+                db.flush()
+                from missive_outbound import send_quote_draft
+                md = send_quote_draft(db, q, organization_slug)
+            except Exception as e:
+                md = {"ok": False, "skipped": False, "skip_reason": None,
+                      "draft_id": None,
+                      "error": f"missive_crashed:{type(e).__name__}"}
+
             # Customer-facing message becomes "here's your payment link"
             # when we have one; otherwise falls back to the original.
             pay_url = sp.get("url")
@@ -886,6 +906,11 @@ def _exec_tool(
                 "stripe_link_url": sp.get("url"),
                 "stripe_disabled": bool(sp.get("disabled")),
                 "stripe_error": sp.get("error"),
+                "missive_draft_created": bool(md.get("ok") and not md.get("skipped")),
+                "missive_draft_id": md.get("draft_id"),
+                "missive_skipped": bool(md.get("skipped")),
+                "missive_skip_reason": md.get("skip_reason"),
+                "missive_error": md.get("error"),
             }
 
         return {"error": f"Unknown tool: {name}"}

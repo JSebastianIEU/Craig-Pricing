@@ -285,6 +285,17 @@ class Quote(Base):
     stripe_paid_at = Column(DateTime, nullable=True)
     stripe_last_error = Column(Text, nullable=True)
 
+    # Missive outbound draft (Phase C). When confirm_order fires on a web-
+    # widget conversation and the tenant has Missive enabled, we create
+    # a brand-new Missive thread (not a reply — the customer never emailed
+    # in) with the quote PDF + payment link. `missive_draft_id` is the
+    # idempotency guard — non-null means we already drafted, don't double-
+    # send. `missive_drafted_at` records when. `missive_last_error` keeps
+    # the failure mode if the draft creation 4xx'd / network'd.
+    missive_draft_id = Column(String(128), nullable=True, index=True)
+    missive_drafted_at = Column(DateTime, nullable=True)
+    missive_last_error = Column(Text, nullable=True)
+
     conversation = relationship("Conversation", back_populates="quotes")
 
     __table_args__ = (

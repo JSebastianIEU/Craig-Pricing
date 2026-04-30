@@ -94,6 +94,57 @@ async def get_message(message_id: str, token: str) -> dict[str, Any]:
         return r.json()
 
 
+async def create_new_thread_draft(
+    *,
+    html_body: str,
+    from_address: str,
+    from_name: str,
+    to_fields: list[dict[str, str]],
+    token: str,
+    subject: str,
+    attachments: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """
+    Create a draft in a BRAND-NEW Missive conversation (thread).
+
+    Use this when there's no existing thread to reply to — e.g. the
+    customer chatted with Craig in the web widget and we want to send
+    them an email confirmation with the quote PDF + payment link.
+
+    Per Missive's API, omitting `conversation` from the payload creates
+    a new thread keyed off `to_fields` + `from_field`. `send=False` keeps
+    it as a draft for Justin to review in his Missive inbox before
+    actually firing it to the customer.
+
+    Returns the draft object Missive returns (we persist `drafts.id` on
+    the Quote so we don't double-create on a retry).
+    """
+    payload: dict[str, Any] = {
+        "drafts": {
+            "subject": subject,
+            "body": html_body,
+            "from_field": {"address": from_address, "name": from_name},
+            "to_fields": to_fields,
+            "send": False,
+        }
+    }
+    if attachments:
+        payload["drafts"]["attachments"] = attachments
+
+    async with httpx.AsyncClient(timeout=_REST_TIMEOUT) as client:
+        r = await client.post(
+            f"{MISSIVE_BASE}/drafts",
+            headers=_auth_headers(token),
+            json=payload,
+        )
+        if r.status_code >= 400:
+            detail = r.text[:1500] if r.text else "<empty response body>"
+            raise RuntimeError(
+                f"Missive create_new_thread_draft {r.status_code}: {detail}"
+            )
+        return r.json()
+
+
 async def create_draft(
     *,
     conversation_id: str,
