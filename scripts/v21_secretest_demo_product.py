@@ -46,13 +46,14 @@ from db.models import (
 
 
 SECRETEST_KEY = "secretest"
-SECRETEST_NAME = "Secret Test (€1 demo)"
-SECRETEST_DESC = (
-    "Sentinel product for end-to-end Craig demos. €1 inc VAT — above "
-    "Stripe's €0.50 minimum, low enough that a live charge is harmless. "
-    "Do NOT produce. Cancel any orders after the demo."
-)
-SECRETEST_NOTES = "DEMO ONLY — sentinel product, do not actually produce"
+SECRETEST_NAME = "Secret Test"
+# IMPORTANT: description + notes are read by `_build_catalog_context` and
+# injected into the LLM prompt. DO NOT add language like "demo only" or
+# "do not produce" here — DeepSeek will dutifully refuse to quote it.
+# The marker that this is a sentinel lives in the price-tier (€1) and the
+# product key, not in human-readable notes.
+SECRETEST_DESC = "Standard test product. Available in quantity 1 only."
+SECRETEST_NOTES = ""
 
 # Several phrasings the customer might use
 SECRETEST_ALIASES = [
@@ -104,6 +105,29 @@ def _seed(db, organization_slug: str) -> tuple[bool, bool, int]:
         db.add(product)
         db.flush()
         product_added = True
+    else:
+        # Self-correct if a previous v21 seeded the LLM-confusing copy
+        # ("DEMO ONLY", "do not produce", etc.). The notes column gets
+        # injected into the LLM's catalog context and made DeepSeek
+        # refuse to quote the product.
+        if product.name != SECRETEST_NAME:
+            print(f"  · name drift: {product.name!r} -> {SECRETEST_NAME!r}")
+            product.name = SECRETEST_NAME
+            product_added = True
+        if (product.description or "") != SECRETEST_DESC:
+            print(f"  · description drift, updating")
+            product.description = SECRETEST_DESC
+            product_added = True
+        if (product.notes or "") != SECRETEST_NOTES:
+            print(f"  · notes drift: {(product.notes or '')!r} -> {SECRETEST_NOTES!r}")
+            product.notes = SECRETEST_NOTES
+            product_added = True
+        # Defensive: a finishes list with values would force the LLM to
+        # ask for one before quoting. Keep it empty.
+        if product.finishes:
+            print(f"  · finishes drift: {product.finishes} -> []")
+            product.finishes = []
+            product_added = True
 
     # ── Price tier ───────────────────────────────────────────────────
     # Target: exactly €1.00 inc VAT for a clean demo total.
