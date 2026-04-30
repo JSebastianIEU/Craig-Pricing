@@ -333,9 +333,21 @@ def quote_small_format(
                 )
 
         else:
-            # Validate against product's listed finishes
+            # Validate against product's listed finishes.
+            #
+            # Special case: if the product has NO finishes configured at all
+            # (`finishes` is null / empty list), the LLM should not have
+            # passed a finish in the first place — but DeepSeek often
+            # auto-fills `finish="uncoated"` for small_format products as a
+            # default. Treat that as a no-op rather than escalating: the
+            # product simply has no finish dimension to apply, so any finish
+            # the LLM names is irrelevant. This keeps "spec-less" sentinel
+            # products (like `secretest` for demos) quotable end-to-end.
             valid = [f.lower().replace("-", "_").replace(" ", "_") for f in (product.finishes or [])]
-            if normalized not in valid:
+            if not valid:
+                # No finishes configured — silently ignore whatever was passed
+                pass
+            elif normalized not in valid:
                 return EscalationResult(
                     reason=f"Finish '{finish}' is not available for {product.name}.",
                     product_name=product.name,

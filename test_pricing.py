@@ -52,6 +52,34 @@ def test_products_endpoint():
     assert r.status_code == 200
 
 
+def test_finish_param_ignored_when_product_has_no_finishes():
+    """
+    Regression: the LLM (DeepSeek) auto-fills `finish="uncoated"` as a
+    default for small_format products. Sentinel products like
+    `secretest` have `finishes=[]` configured. Before, the engine would
+    escalate "uncoated not available" — breaking the whole demo flow.
+
+    Now: when the product has NO finishes configured, any finish the
+    caller passes is silently ignored.
+    """
+    from pricing_engine import quote_small_format
+    from db import db_session
+
+    with db_session() as db:
+        # The sentinel `secretest` product has `finishes=[]` — seeded by
+        # scripts/v21_secretest_demo_product.py.
+        result = quote_small_format(
+            db, "secretest", quantity=1, finish="uncoated",
+        )
+    # Must succeed (not escalate)
+    assert result.success is True, (
+        f"Expected secretest to quote despite finish='uncoated', got "
+        f"escalation: {getattr(result, 'reason', None)!r}"
+    )
+    # And the price should still be the sentinel €1.00 inc VAT
+    assert abs(result.final_price_inc_vat - 1.00) < 0.01
+
+
 # =============================================================================
 # SMALL FORMAT — UNIT-BASED PRICING (per 100 cards/flyers, per 5 NCR pads)
 # =============================================================================
