@@ -142,6 +142,15 @@ The collection pattern (same for standard quotes and escalations):
    - Irish mobiles start with 08, 10 digits. International fine too.
 5. Confirm back: "Got you down as [Name] at [email/phone]. Justin will be in touch 👍"
 6. Call the save_customer_info tool.
+7. **CRITICAL** — if you already gave a verbal price earlier in this conversation
+   AND the customer just provided their contact details, the gated PDF needs to
+   be released. End your reply with the marker `[QUOTE_READY]` on its own line so
+   the widget renders the PDF card. Example:
+       "All set, here's your full quote 📋 We'll be in touch shortly to confirm 👍
+        [QUOTE_READY]"
+   If you forget the marker, the customer just sees "Justin will be in touch" with
+   no PDF — they'll think nothing happened. (The server has a fallback that
+   appends the marker automatically, but you should still emit it yourself.)
 
 ## Tone examples
 - "Nice one! That comes to €46.74 for 500 business cards 👍"
@@ -1226,6 +1235,53 @@ def chat_with_craig(
             # Put the tail AFTER the marker so the widget shows
             # "Here's your quote!" first, then the confirmation, then the card.
             final_reply = final_reply.replace("[QUOTE_READY]", f"[QUOTE_READY]{tail}")
+
+    # ── Release the PDF gate when the LLM forgets ────────────────────────
+    # Pattern: customer was asked for contact details (gate held the PDF),
+    # they provided email/phone this turn, save_customer_info ran, but the
+    # LLM closed with "you're all set!" and forgot to re-emit [QUOTE_READY].
+    # Without the marker the widget never renders the PDF card. We detect
+    # the situation server-side and auto-append the marker — belt-and-
+    # suspenders over the prompt instruction.
+    _save_contact_called = any(
+        (tc.get("tool") or "").lower() == "save_customer_info"
+        for tc in tool_calls_audit
+    )
+    _already_has_marker = "[QUOTE_READY]" in final_reply
+    _pdf_already_released_earlier = any(
+        "[QUOTE_READY]" in (m.get("content") or "")
+        for m in (conversation.messages or [])
+        if m.get("role") == "assistant"
+    )
+    if (
+        _channel_needs_gate
+        and not order_confirmed                  # don't fire on confirm_order paths
+        and _save_contact_called                 # contact was JUST collected
+        and _has_contact                         # …and persisted
+        and _had_prior_quote                     # …and a Quote already exists on this thread
+        and not _already_has_marker              # LLM didn't include the marker
+        and not _pdf_already_released_earlier    # the PDF wasn't already sent in a prior turn
+    ):
+        print(
+            f"[craig] AUTO-RELEASE: appending [QUOTE_READY] after "
+            f"save_customer_info — LLM forgot to re-emit it. "
+            f"channel={channel!r} org={organization_slug!r}",
+            flush=True,
+        )
+        # Append on its own line so the visible reply text stays clean
+        # (the marker itself is stripped by the widget before render).
+        if not final_reply.endswith("\n"):
+            final_reply += "\n"
+        final_reply += "\n[QUOTE_READY]"
+
+    # Always echo back the most recent quote_id so the widget can render
+    # the PDF card even if it lost local state (e.g. a reload between
+    # turns). When a tool ran THIS turn last_quote_id is already set;
+    # otherwise fall back to the most recent existing quote on the
+    # conversation.
+    if last_quote_id is None and existing_quotes:
+        # existing_quotes is ordered desc by created_at, so [0] is newest
+        last_quote_id = existing_quotes[0].id
 
     # Persist the turn
     history = list(conversation.messages or [])

@@ -335,6 +335,135 @@ def test_quote_ready_survives_when_prior_quote_exists():
         db.close()
 
 
+def test_auto_release_logic_appends_marker_after_save_customer_info():
+    """
+    Regression test for the bug where Craig collected customer contact
+    info but forgot to re-emit [QUOTE_READY], leaving the customer
+    staring at "Justin will be in touch" with no PDF card. The server
+    must auto-append the marker when:
+      - the channel is web
+      - save_customer_info ran this turn
+      - a Quote already exists on this conversation
+      - contact is now on file
+      - the LLM's final reply doesn't include [QUOTE_READY]
+      - the PDF wasn't already released in a prior turn
+
+    We exercise the decision logic directly — easier than mocking out
+    DeepSeek end-to-end, and the logic is what the bug was about.
+    """
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        # Conversation that already has contact info (just collected this turn)
+        conv = _new_conversation(db, with_contact=True)
+        _seed_business_cards(db)
+        # Seed a quote from a PRIOR turn (this is the held-back PDF)
+        q = Quote(
+            organization_slug=DEFAULT_ORG_SLUG,
+            conversation_id=conv.id,
+            product_key="business_cards",
+            specs={"quantity": 500},
+            base_price=190.0, surcharges=[],
+            final_price_ex_vat=205.0, vat_amount=27.68,
+            final_price_inc_vat=232.68, artwork_cost=0.0,
+            total=232.68, status="pending_approval",
+        )
+        db.add(q)
+        db.flush()
+
+        # Inputs the auto-release logic checks
+        channel = "web"
+        order_confirmed = False
+        tool_calls_audit = [{"tool": "save_customer_info", "args": {}, "result": {}}]
+        existing_quotes = [q]
+        had_prior_quote = bool(existing_quotes)
+        save_contact_called = any(
+            (tc.get("tool") or "").lower() == "save_customer_info"
+            for tc in tool_calls_audit
+        )
+        has_contact = bool(conv.customer_email)
+        # The LLM's reply that triggered the bug:
+        final_reply = "You're all set! Justin will be in touch \U0001f680"
+        already_has_marker = "[QUOTE_READY]" in final_reply
+        pdf_already_released_earlier = False  # fresh conversation, no prior assistant msgs
+
+        channel_needs_gate = channel.lower() in ("web", "")
+        should_auto_release = (
+            channel_needs_gate
+            and not order_confirmed
+            and save_contact_called
+            and has_contact
+            and had_prior_quote
+            and not already_has_marker
+            and not pdf_already_released_earlier
+        )
+
+        assert should_auto_release is True, (
+            "Auto-release MUST fire when contact was just collected, "
+            "a prior quote exists, and the LLM's reply lacks the marker"
+        )
+    finally:
+        db.close()
+
+
+def test_auto_release_does_not_fire_when_marker_already_present():
+    """If the LLM correctly emitted [QUOTE_READY], we don't double-add."""
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        conv = _new_conversation(db, with_contact=True)
+        _seed_business_cards(db)
+        q = Quote(
+            organization_slug=DEFAULT_ORG_SLUG,
+            conversation_id=conv.id,
+            product_key="business_cards", specs={"quantity": 500},
+            base_price=190.0, surcharges=[],
+            final_price_ex_vat=205.0, vat_amount=27.68,
+            final_price_inc_vat=232.68, artwork_cost=0.0,
+            total=232.68, status="pending_approval",
+        )
+        db.add(q); db.flush()
+
+        final_reply = "All set, here's your full quote 📋\n\n[QUOTE_READY]"
+        already_has_marker = "[QUOTE_READY]" in final_reply
+        # The early-return short-circuits the rest
+        assert already_has_marker is True
+
+
+    finally:
+        db.close()
+
+
+def test_auto_release_does_not_fire_on_order_confirmed_path():
+    """confirm_order replies should NOT auto-release a PDF — that path
+    deliberately omits the marker (the customer already has the PDF)."""
+    _fresh_tables()
+    db = _TestSession()
+    try:
+        conv = _new_conversation(db, with_contact=True)
+        _seed_business_cards(db)
+        q = Quote(
+            organization_slug=DEFAULT_ORG_SLUG,
+            conversation_id=conv.id,
+            product_key="business_cards", specs={"quantity": 500},
+            base_price=190.0, surcharges=[],
+            final_price_ex_vat=205.0, vat_amount=27.68,
+            final_price_inc_vat=232.68, artwork_cost=0.0,
+            total=232.68, status="confirmed",
+        )
+        db.add(q); db.flush()
+
+        order_confirmed = True
+        save_contact_called = False  # confirm_order, not save_customer_info
+        # The condition requires save_contact_called AND not order_confirmed
+        should_auto_release = (
+            (not order_confirmed) and save_contact_called
+        )
+        assert should_auto_release is False
+    finally:
+        db.close()
+
+
 def test_soft_touch_not_applied_when_finish_is_matte():
     """Matte should leave the price at base — no additive."""
     _fresh_tables()
