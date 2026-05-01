@@ -268,6 +268,7 @@ def build_payload_from_quote(
     turnaround_days: int = 5,
     customer_uid: str = "",
     delivery_address: dict[str, str] | None = None,
+    initial_order_status: str = "Awaiting Production",
 ) -> dict[str, Any]:
     """
     Construct a full PrintLogic create_order body from a Craig Quote +
@@ -375,6 +376,12 @@ def build_payload_from_quote(
         "customer_address4": "",
         "customer_postcode": "",
         "order_description": f"[CRAIG-PUSH qid={quote.id}] {short}",
+        # Phase F refined — explicit order_status (PrintLogic API does
+        # accept this field — verified). Default "Awaiting Production"
+        # because by push time, customer has paid. Override via
+        # `initial_order_status` kwarg or via the setting (resolved by
+        # the caller in printlogic_push.py).
+        "order_status": initial_order_status,
         # NOTE: `contact_*` fields are how PrintLogic populates
         # `order_contact_email` / `order_contact_phone` on the order
         # itself (vs. customer_*, which only land on the customer record).
@@ -508,27 +515,41 @@ def _long_item_detail(quote, double_sided: bool, conv=None) -> str:
     """
     Build the multi-line jobsheet that lands in PrintLogic's `detail`
     column. We pack EVERYTHING here because the rich per-item columns
-    (width_mm, paper_description, etc.) are silently dropped by
+    (width_mm, ws_stock, ws_laminate, etc.) are silently dropped by
     create_order — `detail` is the only field that survives and that
     Justin actually reads when he opens the order.
 
-    Format (one fact per line):
-        Paper:        400gsm silk
-        Size:         85 x 55 mm (Business card)
+    The labels match the workshop UI fields one-to-one so Justin can
+    copy/paste straight into the Edit Item form:
+      - "Stock" -> ws_stock textbox
+      - "Substrate" -> ws_stock2 textbox
+      - "Laminate" -> ws_laminate dropdown
+      - "Machine" -> ws_machine_wf dropdown
+      - "Finishing" -> ws_finish_notes textarea
+      - "Notes" -> ws_notes textarea
+
+    Format (one fact per line, aligned for readability):
+        Stock:        400gsm silk
+        Substrate:    (blank if N/A)
+        Size:         Business card (85 x 55 mm)
         Pages:        2 (DS, 4/4)
-        Finishing:    soft-touch laminate, rounded corners
+        Laminate:     soft-touch
+        Finishing:    rounded corners, double-sided
         Cover:        soft cover
         Binding:      saddle stitch
-        Customer:     Company  (or "Individual")
+        ──────────────
+        Customer:     Company (B2B)
         Delivery:     delivery to 12 Main St, D02 X1Y2
         Quote:        Craig qid=42
     """
     specs = quote.specs or {}
     lines: list[str] = []
 
+    # Workshop-aligned labels — mirror the UI fields so Justin can
+    # copy across.
     paper = paper_description_for(quote.product_key)
     if paper:
-        lines.append(f"Paper:       {paper}")
+        lines.append(f"Stock:       {paper}")
 
     size_text = finished_size_text(specs, quote.product_key)
     if size_text:
@@ -539,9 +560,25 @@ def _long_item_detail(quote, double_sided: bool, conv=None) -> str:
     sides = "DS" if double_sided else "SS"
     lines.append(f"Pages:       {pages} ({sides}, {colors})")
 
-    finishing = finishing_description(specs, double_sided)
-    if finishing:
-        lines.append(f"Finishing:   {finishing}")
+    # Split the existing finishing_description into laminate vs other
+    # finishing notes so it maps onto Justin's two separate UI fields
+    # (Laminate dropdown + Finishing textarea).
+    finish = (specs.get("finish") or "").strip().lower()
+    if finish in ("matte", "gloss", "soft-touch", "soft_touch", "silk"):
+        lines.append(f"Laminate:    {finish.replace('_', '-')}")
+    elif finish:
+        lines.append(f"Laminate:    {finish}")
+
+    other_finishing: list[str] = []
+    if specs.get("rounded_corners"):
+        other_finishing.append("rounded corners")
+    if specs.get("foil"):
+        other_finishing.append("foil")
+    if specs.get("die_cut"):
+        other_finishing.append("die cut")
+    other_finishing.append("double-sided" if double_sided else "single-sided")
+    if other_finishing:
+        lines.append(f"Finishing:   {', '.join(other_finishing)}")
 
     if specs.get("cover_type"):
         lines.append(f"Cover:       {str(specs['cover_type']).replace('_', ' ')}")

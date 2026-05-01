@@ -134,9 +134,15 @@ def push_quote(db, quote: Quote, organization_slug: str) -> dict[str, Any]:
             print(f"[printlogic_push] find_customer failed (non-fatal): {e}", flush=True)
 
     # ── 5. Build payload ─────────────────────────────────────────────
+    initial_order_status = _get_setting(
+        db, "printlogic_initial_order_status",
+        default="Awaiting Production",
+        organization_slug=organization_slug,
+    ) or "Awaiting Production"
     payload = printlogic_payload.build_payload_from_quote(
         quote, conv,
         customer_uid=existing_customer_uid or "",
+        initial_order_status=initial_order_status,
     )
 
     # ── 6. Fire create_order (or simulate) ───────────────────────────
