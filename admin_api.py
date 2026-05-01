@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from db import get_db
+from db import get_db, parse_artwork_files
 from db.models import (
     PRICING_STRATEGIES,
     Category,
@@ -1017,7 +1017,7 @@ def _quote_to_dict(q: Quote) -> dict[str, Any]:
                 "content_type": (e.get("content_type") if isinstance(e, dict) else None) or "application/octet-stream",
                 "uploaded_at": (e.get("uploaded_at") if isinstance(e, dict) else None),
             }
-            for i, e in enumerate(getattr(q, "artwork_files", None) or [])
+            for i, e in enumerate(parse_artwork_files(getattr(q, "artwork_files", None)))
         ],
     }
 
@@ -1177,7 +1177,7 @@ def get_quote_artwork_file(
     q = _scope(db.query(Quote), Quote, claims, org_slug).filter(Quote.id == quote_id).first()
     if not q:
         raise HTTPException(status_code=404, detail="Quote not found")
-    files = list(getattr(q, "artwork_files", None) or [])
+    files = parse_artwork_files(getattr(q, "artwork_files", None))
     if idx < 0 or idx >= len(files):
         raise HTTPException(status_code=404, detail="artwork index out of range")
 

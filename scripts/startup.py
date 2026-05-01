@@ -78,6 +78,7 @@ def main() -> None:
     from scripts.v23_shipping_artwork import migrate as v23_migrate
     from scripts.v24_artwork_status import migrate as v24_migrate
     from scripts.v25_artwork_files_array import migrate as v25_migrate
+    from scripts.v26_artwork_files_jsonb import migrate as v26_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -103,6 +104,7 @@ def main() -> None:
     _run("v23 shipping + artwork upload + Phase F business_rules", v23_migrate)
     _run("v24 artwork status + flow refinement", v24_migrate)
     _run("v25 multi-file artwork array + Phase G business_rules", v25_migrate)
+    _run("v26 artwork_files TEXT->JSONB + repair stale rows", v26_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

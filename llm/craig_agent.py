@@ -60,6 +60,7 @@ from sqlalchemy.orm import Session
 from pricing_engine import (
     quote_small_format, quote_large_format, quote_booklet, list_products,
 )
+from db import parse_artwork_files
 from db.models import Conversation, Quote
 
 # =============================================================================
@@ -1667,7 +1668,7 @@ def chat_with_craig(
         q = db.query(Quote).filter_by(id=last_quote_id).first()
         if q is None:
             return False
-        return bool((q.artwork_files or []) or (q.artwork_file_url or "").strip())
+        return bool(parse_artwork_files(q.artwork_files) or (q.artwork_file_url or "").strip())
 
     # Phase F refined — when LLM emits [QUOTE_READY] but prerequisites
     # aren't met, strip the marker, KEEP the verbal price the LLM wrote,
@@ -1999,7 +2000,7 @@ def chat_with_craig(
                 quote_total_inc_vat = float(latest_q.final_price_inc_vat or 0)
             except Exception:
                 quote_total_inc_vat = None
-            artwork_files_count = len(getattr(latest_q, "artwork_files", None) or [])
+            artwork_files_count = len(parse_artwork_files(getattr(latest_q, "artwork_files", None)))
 
     return {
         "reply": final_reply,

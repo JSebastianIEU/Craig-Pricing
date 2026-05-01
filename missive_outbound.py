@@ -44,6 +44,7 @@ import html as _html
 from typing import Any
 
 import missive
+from db import parse_artwork_files
 from db.models import Conversation, Quote
 from pricing_engine import _get_setting
 
@@ -175,7 +176,7 @@ def _build_attachments(quote: Quote) -> list[dict[str, str]] | None:
     # support). Falls back to the singular column for old quotes
     # that haven't been backfilled. Best-effort per-file: a single
     # bad file doesn't block the rest from being attached.
-    artwork_files = list(getattr(quote, "artwork_files", None) or [])
+    artwork_files = parse_artwork_files(getattr(quote, "artwork_files", None))
     if not artwork_files:
         # Backfill case — old quote with only the singular columns set.
         legacy_url = (getattr(quote, "artwork_file_url", None) or "").strip()

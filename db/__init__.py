@@ -2,12 +2,46 @@
 Database package — SQLAlchemy setup + session helpers.
 """
 
+import json
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
 
 from .models import Base
+
+
+def parse_artwork_files(value) -> list:
+    """
+    Return Quote.artwork_files as a Python list, regardless of how the
+    DB driver returned it.
+
+    Why this defensive helper exists: the v25 migration declared the
+    column as `TEXT NULL` (instead of JSONB), so on Postgres the value
+    round-trips as a JSON string rather than a deserialized list. Code
+    that did `enumerate(quote.artwork_files)` ended up iterating the
+    JSON string CHARACTER BY CHARACTER (one quote with one uploaded
+    file showed up as 179 fake "artwork" entries in the dashboard, the
+    upload cap of 10 fired immediately, and the proxy 500'd because no
+    char looked like a `gs://` URL). v26 migration fixes the column
+    type forward; this helper guards every read site.
+
+    Accepts: None, empty string, list, JSON-encoded string. Returns
+    [] for any unparseable value (never raises).
+    """
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return []
+    return []
 
 # Default: SQLite file in project root.
 # On mounted filesystems (like cloud-synced folders) SQLite can fail with I/O errors.

@@ -39,7 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
 from rate_limiter import rate_limit
-from db import get_db
+from db import get_db, parse_artwork_files
 from db.models import Conversation, Quote
 
 
@@ -257,7 +257,7 @@ def submit_customer_info(
         # artwork" from artwork_cost==0 (no design service) on a quote
         # whose conversation has no uploaded files yet.
         has_any_files = bool(
-            (pending_quote.artwork_files or [])
+            parse_artwork_files(pending_quote.artwork_files)
             or (pending_quote.artwork_file_url or "").strip()
         )
         promised_artwork = (
@@ -475,7 +475,7 @@ async def upload_artwork(
             ),
         )
 
-    existing = list(pending_quote.artwork_files or [])
+    existing = parse_artwork_files(pending_quote.artwork_files)
     if len(existing) >= MAX_ARTWORK_FILES_PER_QUOTE:
         raise HTTPException(
             status_code=409,
@@ -588,7 +588,7 @@ def delete_artwork_file(
     if pending_quote is None:
         raise HTTPException(status_code=409, detail="no pending quote")
 
-    files = list(pending_quote.artwork_files or [])
+    files = parse_artwork_files(pending_quote.artwork_files)
     if idx < 0 or idx >= len(files):
         raise HTTPException(status_code=404, detail="index out of range")
 
