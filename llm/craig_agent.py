@@ -1414,14 +1414,30 @@ def chat_with_craig(
     # but optional — some customers won't know or won't say.)
     _funnel_complete = bool((conversation.delivery_method or "").strip())
 
+    # Phase F: when funnel isn't complete, the ONLY way to collect
+    # remaining info is the structured form. Track whether we've already
+    # rendered it earlier so we don't double-render.
+    _form_already_shown_earlier = any(
+        "[CUSTOMER_FORM]" in (m.get("content") or "")
+        for m in (conversation.messages or [])
+        if m.get("role") == "assistant"
+    )
+
     if _channel_needs_gate and "[QUOTE_READY]" in final_reply and not _has_contact:
         # Replace the ENTIRE reply with the contact ask. Keeping the LLM's
         # "Here's your quote! 📋" pre-text in front of the ask confused
         # customers — they saw two conflicting sentences in one message.
-        final_reply = (
-            "Before I send the full quote \u2014 what's your name and email "
-            "(or WhatsApp number)? Justin will need that to follow up \U0001f44d"
-        )
+        # Phase F \u2014 fire the structured form instead of asking in chat.
+        if _form_already_shown_earlier:
+            final_reply = (
+                "Still waiting on the form above so I can finalise the "
+                "quote \U0001f44d"
+            )
+        else:
+            final_reply = (
+                "Just need a few more details before I send the full quote \ud83d\udc47\n\n"
+                "[CUSTOMER_FORM]"
+            )
     elif _channel_needs_gate and "[QUOTE_READY]" in final_reply and _has_contact and not _funnel_complete:
         # Phase E gate — contact present, but the funnel still has open
         # questions (company/individual? returning? delivery vs collect?).
@@ -1435,28 +1451,19 @@ def chat_with_craig(
             flush=True,
         )
         final_reply = final_reply.replace("[QUOTE_READY]", "").rstrip()
-        missing: list[str] = []
-        if conversation.is_company is None:
-            missing.append(
-                "Are you ordering for a company or as an individual? "
-                "(helps with invoicing)"
+        # Phase F — funnel collected via the structured form, not free text.
+        if _form_already_shown_earlier:
+            # Form was shown but funnel still incomplete — gentle nudge.
+            final_reply = (
+                (final_reply + "\n\n") if final_reply else ""
+            ) + (
+                "Still waiting on the form above to finalise things \U0001f44d"
             )
-        if conversation.is_returning_customer is None:
-            missing.append(
-                "Have you ordered with us before? If yes, what email did "
-                "you use last time?"
+        else:
+            final_reply = (
+                "Just need a few more details before I send the full quote 👇\n\n"
+                "[CUSTOMER_FORM]"
             )
-        if not (conversation.delivery_method or "").strip():
-            missing.append(
-                "Delivery to an address, or would you collect from our shop?"
-            )
-        ask = "\n\n".join(missing[:2])
-        prefix = (final_reply + "\n\n") if final_reply else ""
-        final_reply = (
-            prefix
-            + "Almost there — a couple of quick things before I send "
-            "the full quote:\n\n" + ask
-        ).strip()
     elif _channel_needs_gate and "[QUOTE_READY]" in final_reply and _has_contact:
         # The PDF is going out. Append a confirmation tail so the customer
         # knows Justin will follow up — unless the LLM already said it.
@@ -1508,6 +1515,92 @@ def chat_with_craig(
         if not final_reply.endswith("\n"):
             final_reply += "\n"
         final_reply += "\n[QUOTE_READY]"
+
+    # ── Phase F: auto-emit [ARTWORK_UPLOAD] when LLM forgets ──────────
+    # When a pricing tool runs with needs_artwork=False (customer said
+    # they have artwork), the LLM should emit [ARTWORK_UPLOAD] so the
+    # widget renders the upload button. DeepSeek frequently forgets.
+    # Detect the situation server-side: pricing succeeded this turn AND
+    # was called with needs_artwork=False AND the resulting Quote has
+    # no artwork yet AND the marker is missing. Auto-append.
+    _pricing_called_no_design = any(
+        (tc.get("tool") or "").lower() in (
+            "quote_small_format", "quote_large_format", "quote_booklet",
+        )
+        and (tc.get("result") or {}).get("success") is True
+        and not bool((tc.get("args") or {}).get("needs_artwork"))
+        for tc in tool_calls_audit
+    )
+    _quote_has_artwork = bool(
+        last_quote_id is not None
+        and (
+            db.query(Quote)
+            .filter_by(id=last_quote_id)
+            .first()
+            .artwork_file_url
+            if last_quote_id is not None else False
+        )
+    ) if last_quote_id is not None else False
+    _upload_marker_already = "[ARTWORK_UPLOAD]" in final_reply
+    _upload_marker_earlier = any(
+        "[ARTWORK_UPLOAD]" in (m.get("content") or "")
+        for m in (conversation.messages or [])
+        if m.get("role") == "assistant"
+    )
+    if (
+        _channel_needs_gate
+        and _pricing_called_no_design
+        and not _quote_has_artwork
+        and not _upload_marker_already
+        and not _upload_marker_earlier
+    ):
+        print(
+            f"[craig] AUTO-EMIT [ARTWORK_UPLOAD] — pricing ran with "
+            f"needs_artwork=False on conv {conversation.id} but LLM "
+            f"didn't render the upload button. channel={channel!r}",
+            flush=True,
+        )
+        if not final_reply.endswith("\n"):
+            final_reply += "\n"
+        final_reply += "\n[ARTWORK_UPLOAD]"
+
+    # ── Phase F: auto-emit [CUSTOMER_FORM] when user accepts full quote ──
+    # Trigger: a Quote exists on this conversation AND the funnel is
+    # incomplete (delivery_method null) AND the user's last message is
+    # an affirmative ("yes", "go ahead", "please send it", etc.) AND
+    # we haven't already shown the form. Belt-and-suspenders for when
+    # DeepSeek replies in free text instead of emitting the marker.
+    _last_user_msg = (user_message or "").strip().lower()
+    _looks_affirmative = any(
+        word in _last_user_msg
+        for word in (
+            "yes", "yeah", "yep", "yup", "ok", "okay", "sure",
+            "go ahead", "go for it", "please", "do it", "send it",
+        )
+    ) and len(_last_user_msg) < 80  # short affirmatives only
+    _form_marker_in_reply = "[CUSTOMER_FORM]" in final_reply
+    if (
+        _channel_needs_gate
+        and (_had_prior_quote or last_quote_id is not None)
+        and not _funnel_complete
+        and _looks_affirmative
+        and not _form_marker_in_reply
+        and not _form_already_shown_earlier
+        and not order_confirmed
+    ):
+        print(
+            f"[craig] AUTO-EMIT [CUSTOMER_FORM] — user accepted full "
+            f"quote but funnel incomplete on conv {conversation.id}. "
+            f"channel={channel!r}",
+            flush=True,
+        )
+        # Wholesale replace the LLM's free-text "what's your name and email"
+        # with the form trigger — the form already says "we need a few more
+        # details" so the LLM's version is redundant.
+        final_reply = (
+            "Just need a few more details before I send the full quote 👇\n\n"
+            "[CUSTOMER_FORM]"
+        )
 
     # Always echo back the most recent quote_id so the widget can render
     # the PDF card even if it lost local state (e.g. a reload between
