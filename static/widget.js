@@ -2173,28 +2173,40 @@
             const _vv = window.visualViewport;
             const _adjustForKeyboard = () => {
                 if (panel.classList.contains('jp-hidden')) return;
-                // Set the panel height to the visible viewport — the
-                // browser collapses it when the keyboard slides up.
-                // We only do this on small screens (mobile breakpoint).
                 if (window.innerWidth <= 480) {
+                    // v30.3 — pin BOTH top + height to the visual
+                    // viewport. On the second tap, iOS Safari scrolls
+                    // the layout viewport so the focused input is in
+                    // view, which shifts our top:0 anchor off-screen.
+                    // visualViewport.offsetTop tells us how much the
+                    // visual viewport is offset from the layout
+                    // viewport — pin to that and the panel always
+                    // covers exactly the visible area.
+                    panel.style.top = _vv.offsetTop + 'px';
                     panel.style.height = _vv.height + 'px';
-                    // Also scroll the latest message into view so the
-                    // user sees what they just typed.
+                    panel.style.bottom = 'auto';
                     if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
                 } else {
+                    panel.style.top = '';
                     panel.style.height = '';
+                    panel.style.bottom = '';
                 }
             };
             _vv.addEventListener('resize', _adjustForKeyboard);
             _vv.addEventListener('scroll', _adjustForKeyboard);
-            // Also re-run when the panel opens (input focus is the
-            // most common keyboard trigger).
             input.addEventListener('focus', () => {
-                // Small delay so the keyboard finishes animating in.
                 setTimeout(_adjustForKeyboard, 250);
             });
             input.addEventListener('blur', () => {
-                setTimeout(_adjustForKeyboard, 250);
+                // Clear inline overrides so CSS top:0/bottom:0 anchors
+                // re-take effect once the keyboard goes down.
+                setTimeout(() => {
+                    if (window.innerWidth <= 480) {
+                        panel.style.top = '';
+                        panel.style.height = '';
+                        panel.style.bottom = '';
+                    }
+                }, 250);
             });
         }
 
