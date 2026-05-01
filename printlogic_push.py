@@ -136,9 +136,9 @@ def push_quote(db, quote: Quote, organization_slug: str) -> dict[str, Any]:
     # ── 5. Build payload ─────────────────────────────────────────────
     initial_order_status = _get_setting(
         db, "printlogic_initial_order_status",
-        default="Awaiting Production",
+        default="In Progress",
         organization_slug=organization_slug,
-    ) or "Awaiting Production"
+    ) or "In Progress"
     payload = printlogic_payload.build_payload_from_quote(
         quote, conv,
         customer_uid=existing_customer_uid or "",

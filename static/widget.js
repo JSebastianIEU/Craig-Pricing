@@ -1779,7 +1779,7 @@
                 + '</button>'
                 + '<button type="button" class="jp-choice-btn" data-choice="design">'
                 + '  <div class="jp-choice-title">I need your design service</div>'
-                + '  <div class="jp-choice-sub">Flat €65 ex VAT (€79.95 inc)</div>'
+                + '  <div class="jp-choice-sub">€65 ex VAT for one hour of design (€79.95 inc)</div>'
                 + '</button>'
             );
             messagesEl.appendChild(wrap);

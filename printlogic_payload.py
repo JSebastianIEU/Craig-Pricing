@@ -268,7 +268,7 @@ def build_payload_from_quote(
     turnaround_days: int = 5,
     customer_uid: str = "",
     delivery_address: dict[str, str] | None = None,
-    initial_order_status: str = "Awaiting Production",
+    initial_order_status: str = "In Progress",
 ) -> dict[str, Any]:
     """
     Construct a full PrintLogic create_order body from a Craig Quote +
@@ -377,8 +377,9 @@ def build_payload_from_quote(
         "customer_postcode": "",
         "order_description": f"[CRAIG-PUSH qid={quote.id}] {short}",
         # Phase F refined — explicit order_status (PrintLogic API does
-        # accept this field — verified). Default "Awaiting Production"
-        # because by push time, customer has paid. Override via
+        # accept this field — verified). Default "In Progress" — that's
+        # the lifecycle state Just-Print's workshop uses to mark a job
+        # ready to run (per Justin, May 2026). Override via the
         # `initial_order_status` kwarg or via the setting (resolved by
         # the caller in printlogic_push.py).
         "order_status": initial_order_status,
