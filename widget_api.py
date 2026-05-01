@@ -256,9 +256,22 @@ def submit_customer_info(
         # the upload is required before we finalize. We infer "promised
         # artwork" from artwork_cost==0 (no design service) on a quote
         # whose conversation has no uploaded files yet.
-        has_any_files = bool(
-            parse_artwork_files(pending_quote.artwork_files)
-            or (pending_quote.artwork_file_url or "").strip()
+        #
+        # v26 — scan ALL quotes on the conversation for files, not just
+        # the most recent. DeepSeek sometimes calls the pricing tool a
+        # second time after the customer uploads, creating a fresh empty
+        # quote — the upload is on the FIRST quote and the gate
+        # incorrectly blocked the form submit. Mirror the cross-quote
+        # check we use in craig_agent's _quote_has_artwork_check.
+        all_pending = (
+            db.query(Quote)
+            .filter_by(conversation_id=conv.id)
+            .all()
+        )
+        has_any_files = any(
+            bool(parse_artwork_files(q.artwork_files))
+            or bool((q.artwork_file_url or "").strip())
+            for q in all_pending
         )
         promised_artwork = (
             float(pending_quote.artwork_cost or 0) == 0.0
