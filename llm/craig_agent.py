@@ -1512,6 +1512,56 @@ def chat_with_craig(
     # Done once, here, so both the persisted history and the API reply are clean.
     final_reply = _humanize_reply(final_reply)
 
+    # ── Phase G: artwork-question isolation guard ─────────────────
+    # When the artwork question hasn't been answered yet, Craig's reply
+    # MUST be ONLY the artwork question — no spec recap, no "want full
+    # quote?", no price. DeepSeek frequently bundles them despite the
+    # business_rules. We detect the fusion and surgically strip the
+    # extra sentences so the customer sees ONLY the artwork question
+    # this turn.
+    if (
+        conversation.customer_has_own_artwork is None
+        and "?" in final_reply
+        and any(p in final_reply.lower() for p in ("artwork", "design service"))
+    ):
+        # Detect fusion: the reply mentions artwork AND ALSO either
+        # "full quote" or "to confirm" (spec recap). Trim everything
+        # after the first artwork-question paragraph.
+        lower = final_reply.lower()
+        has_full_quote_ask = (
+            "want me to put together" in lower
+            or "want the full quote" in lower
+            or "full quote" in lower and "?" in lower
+        )
+        # Spec-recap: "just to confirm — N business cards..." style
+        has_spec_recap = (
+            "just to confirm" in lower
+            or "to confirm" in lower and any(
+                w in lower for w in ("business cards", "flyers", "brochures",
+                                     "letterheads", "ncr", "stationery",
+                                     "single-sided", "double-sided", "matte",
+                                     "gloss", "soft-touch")
+            )
+        )
+        if has_full_quote_ask or has_spec_recap:
+            # Find the artwork-question sentence and keep only that.
+            # Strategy: split into paragraphs, keep the FIRST paragraph
+            # that mentions "artwork" or "design service".
+            paragraphs = [p.strip() for p in final_reply.split("\n\n") if p.strip()]
+            kept: list[str] = []
+            for p in paragraphs:
+                if "artwork" in p.lower() or "design service" in p.lower():
+                    kept.append(p)
+                    break
+            if kept:
+                print(
+                    f"[craig] ARTWORK ISOLATION GUARD: trimmed fused message "
+                    f"on conv {conversation.id}. original_len={len(final_reply)} "
+                    f"trimmed_len={len(kept[0])}",
+                    flush=True,
+                )
+                final_reply = kept[0]
+
     # Hallucinated-quote gate.
     #
     # If the LLM emitted [QUOTE_READY] without any real Quote row existing
@@ -1842,11 +1892,28 @@ def chat_with_craig(
 
     db.commit()
 
+    # Phase G — surface the quote total + customer artwork status so
+    # the widget can render the dynamic shipping label and show the
+    # artwork upload state without an extra round trip.
+    quote_total_inc_vat: float | None = None
+    artwork_files_count = 0
+    if last_quote_id is not None:
+        latest_q = db.query(Quote).filter_by(id=last_quote_id).first()
+        if latest_q is not None:
+            try:
+                quote_total_inc_vat = float(latest_q.final_price_inc_vat or 0)
+            except Exception:
+                quote_total_inc_vat = None
+            artwork_files_count = len(getattr(latest_q, "artwork_files", None) or [])
+
     return {
         "reply": final_reply,
         "conversation_id": conversation.id,
         "quote_generated": quote_generated,
         "quote_id": last_quote_id,
+        "quote_total_inc_vat": quote_total_inc_vat,
+        "artwork_files_count": artwork_files_count,
+        "customer_has_own_artwork": getattr(conversation, "customer_has_own_artwork", None),
         "escalated": escalated,
         "order_confirmed": order_confirmed,
         "tool_calls": tool_calls_audit,

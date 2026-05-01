@@ -170,46 +170,72 @@ def _build_attachments(quote: Quote) -> list[dict[str, str]] | None:
         # Don't return None yet — we still want to try the artwork
         # attachment below. PDF-less draft is better than no draft.
 
-    # ── Customer-uploaded artwork (Phase F) ────────────────────────
-    # If the customer uploaded artwork via the chat widget, fetch the
-    # bytes and attach them too. Best-effort: if the URL is dead or the
-    # fetch fails, we log and proceed without — the PDF still goes out.
-    artwork_url = (getattr(quote, "artwork_file_url", None) or "").strip()
-    artwork_name = (getattr(quote, "artwork_file_name", None) or "").strip()
-    if artwork_url and artwork_name:
-        try:
-            import httpx
-            import base64 as _b64
+    # ── Customer-uploaded artwork (Phase F + G) ────────────────────
+    # Phase G — loop over EACH file in artwork_files (multi-file
+    # support). Falls back to the singular column for old quotes
+    # that haven't been backfilled. Best-effort per-file: a single
+    # bad file doesn't block the rest from being attached.
+    artwork_files = list(getattr(quote, "artwork_files", None) or [])
+    if not artwork_files:
+        # Backfill case — old quote with only the singular columns set.
+        legacy_url = (getattr(quote, "artwork_file_url", None) or "").strip()
+        legacy_name = (getattr(quote, "artwork_file_name", None) or "").strip()
+        if legacy_url and legacy_name:
+            artwork_files = [{
+                "url": legacy_url,
+                "filename": legacy_name,
+                "content_type": "application/octet-stream",
+            }]
 
-            # Local-mode URLs start with /artwork-local/ — read from disk
-            # directly instead of HTTP-fetching ourselves.
-            if artwork_url.startswith("/artwork-local/"):
-                import os as _os
+    import base64 as _b64
+    import os as _os
+
+    for entry in artwork_files:
+        if not isinstance(entry, dict):
+            continue
+        url = (entry.get("url") or "").strip()
+        name = (entry.get("filename") or "artwork").strip()
+        if not url:
+            continue
+        try:
+            if url.startswith("/artwork-local/"):
                 local_dir = _os.environ.get(
                     "CRAIG_ARTWORK_LOCAL_DIR", "/tmp/craig-artwork",
                 )
-                fname = artwork_url.rsplit("/", 1)[-1]
+                fname = url.rsplit("/", 1)[-1]
                 with open(_os.path.join(local_dir, fname), "rb") as f:
                     art_bytes = f.read()
+            elif url.startswith("gs://"):
+                # Phase G — fetch authenticated via the Cloud Run
+                # service account's bucket-level read permission.
+                from google.cloud import storage  # type: ignore[import-not-found]
+                rest = url[len("gs://"):]
+                bucket_name, _, blob_name = rest.partition("/")
+                client = storage.Client()
+                blob = client.bucket(bucket_name).blob(blob_name)
+                art_bytes = blob.download_as_bytes()
             else:
+                # Legacy: assume HTTP-fetchable URL. Phase F's signed
+                # URLs / public URLs would land here.
+                import httpx
                 with httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0)) as c:
-                    r = c.get(artwork_url)
+                    r = c.get(url)
                     r.raise_for_status()
                     art_bytes = r.content
 
             attachments.append({
-                "filename": artwork_name,
+                "filename": name,
                 "base64_data": _b64.b64encode(art_bytes).decode("ascii"),
             })
             print(
                 f"[missive_outbound] artwork attached: quote={quote.id} "
-                f"name={artwork_name!r} size={len(art_bytes)}",
+                f"name={name!r} size={len(art_bytes)}",
                 flush=True,
             )
         except Exception as e:
             print(
                 f"[missive_outbound] artwork attach FAILED for quote "
-                f"{quote.id} url={artwork_url!r}: {e}",
+                f"{quote.id} url={url!r}: {e}",
                 flush=True,
             )
 

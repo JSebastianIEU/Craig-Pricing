@@ -340,15 +340,20 @@ class Quote(Base):
     shipping_cost_inc_vat = Column(Float, nullable=False, default=0.0, server_default="0")
 
     # Phase F — customer-uploaded artwork file. Cloud Storage URL +
-    # original filename + size. Filled by the /widget/.../upload-artwork
-    # endpoint when the customer uploads via the chat widget. URL is
-    # forwarded to Missive (as a second draft attachment) and to
-    # PrintLogic (in item_custom_data, since PL probably doesn't accept
-    # artwork files via API directly). Null when the customer chose
-    # "need design service" or hasn't uploaded yet.
+    # original filename + size. (Singular columns kept for backwards
+    # compat with code paths that haven't been updated to read the
+    # array. Every write to `artwork_files` mirrors the FIRST entry
+    # into these.)
     artwork_file_url = Column(Text, nullable=True)
     artwork_file_name = Column(String(255), nullable=True)
     artwork_file_size = Column(Integer, nullable=True)
+
+    # Phase G — multi-file artwork support. JSON array where each entry
+    # is `{url, filename, size, content_type, uploaded_at}`. Customers
+    # commonly need to attach front + back PDFs, design + reference
+    # images, etc. Capped at 10 files per quote (matches Missive's
+    # attachment limit). Null = no uploads yet.
+    artwork_files = Column(JSON, nullable=True)
 
     conversation = relationship("Conversation", back_populates="quotes")
 

@@ -965,6 +965,52 @@
         }
         .jp-upload-status.ok { background: #f0fdf4; color: #166534; }
         .jp-upload-status.err { background: #fef2f2; color: #991b1b; }
+
+        /* Phase G — multi-file artwork list */
+        .jp-upload-list {
+            margin-top: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .jp-upload-file {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+            border-radius: 8px;
+            font-size: 12px;
+        }
+        .jp-upload-file-icon { font-size: 14px; flex-shrink: 0; }
+        .jp-upload-file-name {
+            flex: 1;
+            min-width: 0;
+            font-weight: 600;
+            color: #166534;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .jp-upload-file-size {
+            color: #4d7c5a;
+            font-size: 11px;
+            flex-shrink: 0;
+        }
+        .jp-upload-file-remove {
+            background: transparent;
+            border: none;
+            color: #166534;
+            cursor: pointer;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 13px;
+            font-weight: 600;
+            line-height: 1;
+            flex-shrink: 0;
+        }
+        .jp-upload-file-remove:hover { background: #dcfce7; color: #991b1b; }
     `;
 
     // ======================================================================
@@ -1301,7 +1347,19 @@
                 + '  <label class="jp-form-label">How would you like to receive it? *'
                 + '    <select name="delivery_method" id="jpDeliveryMethod" required>'
                 + '      <option value="" disabled selected>Choose one…</option>'
-                + '      <option value="delivery">Just Print Delivery (+€15)</option>'
+                + '      <option value="delivery">' + (() => {
+                    // Phase G - dynamic shipping label based on quote total
+                    const goods = (lastQuoteData && typeof lastQuoteData.quote_total_inc_vat === 'number')
+                        ? lastQuoteData.quote_total_inc_vat : null;
+                    if (goods !== null && goods >= 100) {
+                        return 'Just Print Delivery (free - over €100 order)';
+                    }
+                    if (goods !== null && goods > 0) {
+                        const away = (100 - goods).toFixed(2);
+                        return 'Just Print Delivery (+€15) - free over €100, you are €' + away + ' away';
+                    }
+                    return 'Just Print Delivery (+€15, free over €100)';
+                })() + '</option>'
                 + '      <option value="collect">Collection from our shop</option>'
                 + '    </select>'
                 + '  </label>'
@@ -1451,7 +1509,145 @@
         // Phase F — artwork upload button
         // ─────────────────────────────────────────────────────────────
 
+        // Phase G — multi-file artwork upload state
+        const ARTWORK_MAX_FILES = 10;
+        let uploadedFiles = [];  // [{ url, filename, size, content_type, uploaded_at }]
+
+        async function _uploadOneArtwork(file, wrap) {
+            const statusEl = document.getElementById('jpUploadStatus');
+            if (file.size > 100 * 1024 * 1024) {
+                if (statusEl) {
+                    statusEl.textContent = 'File "' + file.name + '" too big - max 100 MB.';
+                    statusEl.style.display = 'block';
+                    statusEl.classList.add('err');
+                    statusEl.classList.remove('ok');
+                }
+                return;
+            }
+            if (statusEl) {
+                statusEl.classList.remove('err');
+                statusEl.classList.add('ok');
+                statusEl.style.display = 'block';
+                statusEl.textContent = 'Uploading ' + file.name + ' ...';
+            }
+            const fd = new FormData();
+            fd.append('file', file);
+            fd.append('external_id', sessionId);
+            try {
+                const resp = await fetch(
+                    API_BASE + '/widget/conversations/' + conversationId + '/upload-artwork',
+                    { method: 'POST', body: fd },
+                );
+                if (!resp.ok) {
+                    let msg = 'Upload failed (HTTP ' + resp.status + ').';
+                    try {
+                        const j = await resp.json();
+                        if (j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+                    } catch (_) { /* swallow */ }
+                    if (statusEl) {
+                        statusEl.textContent = msg;
+                        statusEl.classList.remove('ok');
+                        statusEl.classList.add('err');
+                    }
+                    return;
+                }
+                const result = await resp.json();
+                uploadedFiles = result.files || [];
+                _renderArtworkCard(wrap);
+            } catch (e) {
+                if (statusEl) {
+                    statusEl.textContent = 'Network error: ' + e.message;
+                    statusEl.classList.remove('ok');
+                    statusEl.classList.add('err');
+                }
+            }
+        }
+
+        async function _removeArtwork(idx, wrap) {
+            try {
+                const resp = await fetch(
+                    API_BASE + '/widget/conversations/' + conversationId + '/upload-artwork/' + idx
+                    + '?external_id=' + encodeURIComponent(sessionId),
+                    { method: 'DELETE' },
+                );
+                if (!resp.ok) return;
+                const result = await resp.json();
+                uploadedFiles = result.files || [];
+                _renderArtworkCard(wrap);
+            } catch (_) { /* swallow */ }
+        }
+
+        function _renderArtworkCard(wrap) {
+            const filesHtml = uploadedFiles.length
+                ? '<div class="jp-upload-list">'
+                  + uploadedFiles.map((f, i) => {
+                      const sizeMb = (f.size / (1024 * 1024)).toFixed(1);
+                      return (
+                          '<div class="jp-upload-file" data-idx="' + i + '">'
+                          + '  <span class="jp-upload-file-icon">📎</span>'
+                          + '  <span class="jp-upload-file-name">' + escapeHtml(f.filename) + '</span>'
+                          + '  <span class="jp-upload-file-size">' + sizeMb + ' MB</span>'
+                          + '  <button type="button" class="jp-upload-file-remove" data-idx="' + i + '" aria-label="Remove">✕</button>'
+                          + '</div>'
+                      );
+                  }).join('')
+                  + '</div>'
+                : '';
+            const canAddMore = uploadedFiles.length < ARTWORK_MAX_FILES;
+            const btnLabel = uploadedFiles.length ? 'Add another' : 'Choose files';
+            wrap.innerHTML = (
+                '<div class="jp-upload-row">'
+                + '  <div class="jp-upload-icon">📎</div>'
+                + '  <div class="jp-upload-body">'
+                + '    <div class="jp-upload-title">Your artwork</div>'
+                + '    <div class="jp-upload-sub">'
+                + '      PDF, AI, INDD, JPG, PNG, EPS, TIFF, PSD, SVG up to 100 MB each'
+                + (uploadedFiles.length ? ' &middot; ' + uploadedFiles.length + '/' + ARTWORK_MAX_FILES : '')
+                + '    </div>'
+                + '  </div>'
+                + (canAddMore
+                    ? '  <button type="button" class="jp-upload-btn" id="jpUploadBtn">' + btnLabel + '</button>'
+                      + '  <input type="file" id="jpUploadInput" multiple '
+                      + 'accept=".pdf,.ai,.indd,.jpg,.jpeg,.png,.eps,.tiff,.tif,.psd,.svg" '
+                      + 'style="display:none;">'
+                    : ''
+                )
+                + '</div>'
+                + filesHtml
+                + '<div class="jp-upload-status" id="jpUploadStatus" style="display:none;"></div>'
+            );
+            const btn = document.getElementById('jpUploadBtn');
+            const fileInput = document.getElementById('jpUploadInput');
+            if (btn && fileInput) {
+                btn.addEventListener('click', () => fileInput.click());
+                fileInput.addEventListener('change', async () => {
+                    for (const f of Array.from(fileInput.files)) {
+                        if (uploadedFiles.length >= ARTWORK_MAX_FILES) break;
+                        await _uploadOneArtwork(f, wrap);
+                    }
+                    fileInput.value = '';
+                });
+            }
+            wrap.querySelectorAll('.jp-upload-file-remove').forEach((b) => {
+                b.addEventListener('click', async () => {
+                    const idx = parseInt(b.getAttribute('data-idx'), 10);
+                    await _removeArtwork(idx, wrap);
+                });
+            });
+        }
+
         function showArtworkUploadButton() {
+            // Don't double-render if widget already mounted earlier in chat
+            if (document.getElementById('jpUploadCard')) return;
+            const wrap = document.createElement('div');
+            wrap.className = 'jp-upload-card';
+            wrap.id = 'jpUploadCard';
+            messagesEl.appendChild(wrap);
+            _renderArtworkCard(wrap);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        function _legacy_unused_showArtworkUploadButton() {
             const wrap = document.createElement('div');
             wrap.className = 'jp-upload-card';
             wrap.id = 'jpUploadCard';
@@ -1610,6 +1806,13 @@
             if (data.quote_generated && data.quote_id) {
                 lastQuoteId = data.quote_id;
                 lastQuoteData = data;
+            } else if (typeof data.quote_total_inc_vat === 'number') {
+                // Phase G - keep lastQuoteData in sync on every turn that
+                // carries a quote total, so the form's dynamic shipping
+                // label has fresh data even on turns where no new quote
+                // was generated.
+                lastQuoteData = data;
+                if (data.quote_id) lastQuoteId = data.quote_id;
             }
 
             const rawReply = data.reply || '';

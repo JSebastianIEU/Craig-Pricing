@@ -21,8 +21,18 @@ os.environ.setdefault("CRAIG_ARTWORK_LOCAL_DIR", "/tmp/craig-artwork-test")
 from app import app  # noqa: E402
 from db import db_session  # noqa: E402
 from db.models import Conversation, Quote, Setting, DEFAULT_ORG_SLUG  # noqa: E402
+from rate_limiter import _reset_for_tests as _rl_reset  # noqa: E402
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """The widget upload endpoint is rate-limited at 5/min — tests that
+    exercise multi-file flows easily blow past it. Reset between tests."""
+    _rl_reset()
+    yield
+    _rl_reset()
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +284,8 @@ def test_form_blocks_when_artwork_required_but_missing():
 
 
 def test_upload_persists_url_on_quote():
+    """Phase G — upload now appends to artwork_files list and returns
+    the full list with proxy URLs (not raw GCS URLs)."""
     cid, eid = _seed_conv_and_quote()
     fake_pdf = b"%PDF-1.4\n%test fake pdf for unit test\n"
     r = client.post(
@@ -284,13 +296,93 @@ def test_upload_persists_url_on_quote():
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["ok"] is True
-    assert data["filename"] == "design.pdf"
-    assert data["url"].startswith("/artwork-local/")
+    assert data["count"] == 1
+    files = data["files"]
+    assert len(files) == 1
+    assert files[0]["filename"] == "design.pdf"
+    assert files[0]["size"] == len(fake_pdf)
+    # Proxy URL shape: /admin/api/orgs/{slug}/quotes/{id}/artwork/0/file
+    assert "/artwork/0/file" in files[0]["url"]
     with db_session() as db:
         q = db.query(Quote).filter_by(conversation_id=cid).first()
-        assert q.artwork_file_url == data["url"]
+        assert q.artwork_files is not None
+        assert len(q.artwork_files) == 1
+        # Internal storage URL (gs:// in prod, /artwork-local/ in dev)
+        internal_url = q.artwork_files[0]["url"]
+        assert (
+            internal_url.startswith("/artwork-local/")
+            or internal_url.startswith("gs://")
+        ), f"unexpected url shape: {internal_url}"
+        # Singular columns mirror the first file (back-compat)
+        assert q.artwork_file_url == internal_url
         assert q.artwork_file_name == "design.pdf"
         assert q.artwork_file_size == len(fake_pdf)
+
+
+def test_upload_appends_multiple_files():
+    """Phase G — successive uploads APPEND to the list, not replace."""
+    cid, eid = _seed_conv_and_quote()
+    for n in ("front.pdf", "back.pdf", "ref.png"):
+        _rl_reset()  # widget_upload limit is 5/min — reset between calls
+        ct = "application/pdf" if n.endswith(".pdf") else "image/png"
+        r = client.post(
+            f"/widget/conversations/{cid}/upload-artwork",
+            data={"external_id": eid},
+            files={"file": (n, io.BytesIO(b"fake"), ct)},
+        )
+        assert r.status_code == 200, r.text
+    final = r.json()
+    assert final["count"] == 3
+    assert [f["filename"] for f in final["files"]] == ["front.pdf", "back.pdf", "ref.png"]
+
+
+def test_upload_caps_at_max():
+    """11th upload is rejected with 409."""
+    cid, eid = _seed_conv_and_quote()
+    for i in range(10):
+        _rl_reset()
+        client.post(
+            f"/widget/conversations/{cid}/upload-artwork",
+            data={"external_id": eid},
+            files={"file": (f"f{i}.pdf", io.BytesIO(b"x"), "application/pdf")},
+        )
+    _rl_reset()
+    r = client.post(
+        f"/widget/conversations/{cid}/upload-artwork",
+        data={"external_id": eid},
+        files={"file": ("f10.pdf", io.BytesIO(b"x"), "application/pdf")},
+    )
+    assert r.status_code == 409
+    assert "Already have" in r.json()["detail"]
+
+
+def test_delete_artwork_removes_one():
+    """DELETE endpoint pops the file at the given index."""
+    cid, eid = _seed_conv_and_quote()
+    for n in ("a.pdf", "b.pdf", "c.pdf"):
+        _rl_reset()
+        client.post(
+            f"/widget/conversations/{cid}/upload-artwork",
+            data={"external_id": eid},
+            files={"file": (n, io.BytesIO(b"x"), "application/pdf")},
+        )
+    _rl_reset()
+    r = client.delete(
+        f"/widget/conversations/{cid}/upload-artwork/1?external_id={eid}",
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["count"] == 2
+    names = [f["filename"] for f in data["files"]]
+    assert names == ["a.pdf", "c.pdf"]
+
+
+def test_delete_artwork_out_of_range():
+    cid, eid = _seed_conv_and_quote()
+    r = client.delete(
+        f"/widget/conversations/{cid}/upload-artwork/5?external_id={eid}",
+    )
+    assert r.status_code == 404
 
 
 def test_upload_rejects_unknown_extension():

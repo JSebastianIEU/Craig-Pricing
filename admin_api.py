@@ -999,12 +999,26 @@ def _quote_to_dict(q: Quote) -> dict[str, Any]:
             q.client_confirmed_at.isoformat()
             if getattr(q, "client_confirmed_at", None) else None
         ),
-        # Phase F — shipping + artwork
+        # Phase F — shipping + artwork (singular fields kept for back-compat)
         "shipping_cost_ex_vat": float(getattr(q, "shipping_cost_ex_vat", 0) or 0),
         "shipping_cost_inc_vat": float(getattr(q, "shipping_cost_inc_vat", 0) or 0),
         "artwork_file_url": getattr(q, "artwork_file_url", None),
         "artwork_file_name": getattr(q, "artwork_file_name", None),
         "artwork_file_size": getattr(q, "artwork_file_size", None),
+        # Phase G — multi-file artwork. Each entry exposes a PROXY URL
+        # the dashboard can fetch authenticated (no GCS 403). The
+        # `url` field on each entry is the proxy path; the dashboard
+        # prefixes the agent API base URL.
+        "artwork_files": [
+            {
+                "url": f"/admin/api/orgs/{q.organization_slug}/quotes/{q.id}/artwork/{i}/file",
+                "filename": (e.get("filename") if isinstance(e, dict) else None) or "artwork",
+                "size": int((e.get("size") if isinstance(e, dict) else 0) or 0),
+                "content_type": (e.get("content_type") if isinstance(e, dict) else None) or "application/octet-stream",
+                "uploaded_at": (e.get("uploaded_at") if isinstance(e, dict) else None),
+            }
+            for i, e in enumerate(getattr(q, "artwork_files", None) or [])
+        ],
     }
 
 
@@ -1120,6 +1134,110 @@ def update_quote(
     if integrations:
         response["integrations"] = integrations
     return response
+
+
+# ----------------------------------------------------------------------------
+# Phase G — artwork file proxy endpoint
+#
+# Why this exists: artwork uploads land in a private GCS bucket. The
+# dashboard can't fetch them directly (anonymous GCS GETs 403). Rather
+# than juggle signed URLs (which require a service-account-token-creator
+# IAM role we'd rather not grant), we proxy the file through Cloud Run
+# using the service account's bucket-level read permission.
+#
+# Bonus: the proxy URL is JWT-protected exactly like the rest of the
+# admin API, and the dashboard can render image previews via <img src>.
+# ----------------------------------------------------------------------------
+@router.get("/orgs/{org_slug}/quotes/{quote_id}/artwork/{idx}/file")
+def get_quote_artwork_file(
+    org_slug: str,
+    quote_id: int,
+    idx: int,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+):
+    """
+    Stream an artwork file the customer uploaded to this Quote.
+
+    Resolution:
+      - quote.artwork_files[idx].url contains either a `gs://...`
+        reference (prod) or a `/artwork-local/...` path (dev).
+      - For gs://, fetch via `google-cloud-storage` using the Cloud
+        Run service account's bucket-read permission.
+      - For local, read from disk.
+
+    Auth: standard JWT (claims.org_slug must match for non-admin roles).
+    """
+    from fastapi.responses import StreamingResponse, FileResponse
+    import io
+
+    access_guard(org_slug, claims)
+    require_role(claims, "client_member")
+
+    q = _scope(db.query(Quote), Quote, claims, org_slug).filter(Quote.id == quote_id).first()
+    if not q:
+        raise HTTPException(status_code=404, detail="Quote not found")
+    files = list(getattr(q, "artwork_files", None) or [])
+    if idx < 0 or idx >= len(files):
+        raise HTTPException(status_code=404, detail="artwork index out of range")
+
+    entry = files[idx]
+    url = (entry.get("url") if isinstance(entry, dict) else "") or ""
+    filename = (entry.get("filename") if isinstance(entry, dict) else "artwork") or "artwork"
+    content_type = (
+        (entry.get("content_type") if isinstance(entry, dict) else None)
+        or "application/octet-stream"
+    )
+
+    # Local-mode: serve from disk.
+    if url.startswith("/artwork-local/"):
+        local_dir = os.environ.get("CRAIG_ARTWORK_LOCAL_DIR", "/tmp/craig-artwork")
+        local_path = os.path.join(local_dir, url.rsplit("/", 1)[-1])
+        if not os.path.exists(local_path):
+            raise HTTPException(status_code=404, detail="file missing on disk")
+        return FileResponse(
+            local_path,
+            media_type=content_type,
+            filename=filename,
+        )
+
+    # GCS-mode: fetch authenticated via service account.
+    if url.startswith("gs://"):
+        try:
+            from google.cloud import storage  # type: ignore[import-not-found]
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="google-cloud-storage not installed",
+            )
+        rest = url[len("gs://"):]
+        bucket_name, _, blob_name = rest.partition("/")
+        if not bucket_name or not blob_name:
+            raise HTTPException(status_code=500, detail=f"malformed gs:// url: {url!r}")
+        try:
+            client = storage.Client()
+            blob = client.bucket(bucket_name).blob(blob_name)
+            data = blob.download_as_bytes()
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"GCS fetch failed: {type(e).__name__}: {str(e)[:200]}",
+            )
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "Cache-Control": "private, max-age=300",  # 5 min so the
+                # dashboard doesn't refetch every render
+            },
+        )
+
+    # Legacy / unsupported url shape — surface a clear error.
+    raise HTTPException(
+        status_code=500,
+        detail=f"unsupported artwork url: {url!r}",
+    )
 
 
 @router.post("/orgs/{org_slug}/quotes/{quote_id}/push-to-printlogic")

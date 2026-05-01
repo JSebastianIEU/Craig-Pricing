@@ -255,10 +255,14 @@ def submit_customer_info(
         # Phase F gate: if the customer earlier said they have own artwork,
         # the upload is required before we finalize. We infer "promised
         # artwork" from artwork_cost==0 (no design service) on a quote
-        # whose conversation has no artwork_file_url yet.
+        # whose conversation has no uploaded files yet.
+        has_any_files = bool(
+            (pending_quote.artwork_files or [])
+            or (pending_quote.artwork_file_url or "").strip()
+        )
         promised_artwork = (
             float(pending_quote.artwork_cost or 0) == 0.0
-            and not (pending_quote.artwork_file_url or "").strip()
+            and not has_any_files
         )
         if promised_artwork:
             # Inspect conversation messages for an explicit "I have artwork"
@@ -361,13 +365,20 @@ _LOCAL_UPLOAD_DIR = os.environ.get("CRAIG_ARTWORK_LOCAL_DIR", "/tmp/craig-artwor
 
 def _store_file(filename: str, data: bytes, content_type: str) -> str:
     """
-    Upload to Cloud Storage if the bucket is configured (prod), else fall
-    back to local disk (dev). Returns a public-ish URL the dashboard +
-    Missive can fetch.
+    Upload to Cloud Storage if the bucket is configured (prod), else
+    fall back to local disk (dev). Returns a STORAGE KEY — for GCS,
+    this is `gs://{bucket}/artwork/{filename}` (an internal reference);
+    for local mode, `/artwork-local/{filename}` which the FastAPI app
+    serves directly.
 
-    Local mode serves files from a directory the FastAPI app mounts at
-    /artwork-local; in prod we use signed URLs (3-day expiry) on private
-    GCS objects.
+    Phase G — we no longer fall back to `blob.public_url` on signed URL
+    failure. The bucket is private and that fallback used to mask real
+    config bugs (it produces 403s for clients). The dashboard now
+    fetches files via a backend proxy (`/admin/api/orgs/{slug}/quotes/
+    {id}/artwork/{idx}/file`) which authenticates against GCS using the
+    Cloud Run service account — no signed URLs needed at all. We keep
+    this function returning a stable key so the proxy can resolve it
+    server-side.
     """
     if _GCS_BUCKET:
         try:
@@ -381,18 +392,9 @@ def _store_file(filename: str, data: bytes, content_type: str) -> str:
         bucket = client.bucket(_GCS_BUCKET)
         blob = bucket.blob(f"artwork/{filename}")
         blob.upload_from_string(data, content_type=content_type or "application/octet-stream")
-        # 3-day signed URL — long enough for Justin to review + push to
-        # PrintLogic, short enough that abandoned artwork doesn't linger.
-        try:
-            from datetime import timedelta
-            return blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(days=3),
-                method="GET",
-            )
-        except Exception:
-            # Fallback: public URL (only works if bucket is public).
-            return blob.public_url
+        # Return a stable internal reference. Dashboard never hits this
+        # URL directly — it goes through the proxy endpoint.
+        return f"gs://{_GCS_BUCKET}/artwork/{filename}"
 
     # Local fallback (dev)
     os.makedirs(_LOCAL_UPLOAD_DIR, exist_ok=True)
@@ -400,6 +402,36 @@ def _store_file(filename: str, data: bytes, content_type: str) -> str:
     with open(local_path, "wb") as f:
         f.write(data)
     return f"/artwork-local/{filename}"
+
+
+# Phase G — cap on the number of artwork files per quote. Matches
+# Missive's per-draft attachment limit so we don't have to truncate
+# silently when emailing.
+MAX_ARTWORK_FILES_PER_QUOTE = 10
+
+
+def _resolve_pending_quote(db: Session, conv_id: int):
+    return (
+        db.query(Quote)
+        .filter_by(conversation_id=conv_id, status="pending_approval")
+        .order_by(Quote.created_at.desc())
+        .first()
+    )
+
+
+def _public_artwork_entry(entry: dict, *, quote_id: int, idx: int) -> dict:
+    """
+    Build the shape the widget receives — strips the internal `gs://`
+    URL and replaces it with the proxy URL the dashboard / widget can
+    fetch (the proxy authenticates against GCS server-side).
+    """
+    return {
+        "url": f"/admin/api/orgs/{{org}}/quotes/{quote_id}/artwork/{idx}/file",
+        "filename": entry.get("filename") or "artwork",
+        "size": int(entry.get("size") or 0),
+        "content_type": entry.get("content_type") or "application/octet-stream",
+        "uploaded_at": entry.get("uploaded_at"),
+    }
 
 
 @router.post(
@@ -413,13 +445,12 @@ async def upload_artwork(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """
-    Multipart upload of a print-ready artwork file. Validates type +
-    size, stores it, and persists the URL onto the most-recent pending
-    Quote on this conversation. Replaces any prior artwork on the same
-    Quote (customer can re-upload before finalizing).
+    Phase G — multi-file artwork. Each call APPENDS to
+    `Quote.artwork_files`. Cap at MAX_ARTWORK_FILES_PER_QUOTE per quote
+    (matches Missive's attachment limit).
 
     Returns:
-      {ok, url, filename, size, content_type}
+      {ok, files: [...], count}    — the full list after append
     """
     conv = _validate_session(db, cid, external_id)
 
@@ -434,8 +465,28 @@ async def upload_artwork(
             ),
         )
 
-    # Read the body (FastAPI's UploadFile is async). Enforce max size as
-    # we read so a malicious 10 GB upload doesn't OOM the worker.
+    pending_quote = _resolve_pending_quote(db, conv.id)
+    if pending_quote is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No pending quote on this conversation. Get a price first, "
+                "then upload artwork."
+            ),
+        )
+
+    existing = list(pending_quote.artwork_files or [])
+    if len(existing) >= MAX_ARTWORK_FILES_PER_QUOTE:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Already have {MAX_ARTWORK_FILES_PER_QUOTE} files on this "
+                "quote. Remove one before uploading another."
+            ),
+        )
+
+    # Read body (enforce max size as we read so a 10 GB malicious upload
+    # doesn't OOM the worker).
     chunks: list[bytes] = []
     total = 0
     while True:
@@ -452,47 +503,93 @@ async def upload_artwork(
     data = b"".join(chunks)
 
     content_type = (file.content_type or "application/octet-stream").lower()
-    if (
-        content_type not in ALLOWED_CONTENT_TYPES
-        and content_type != "application/octet-stream"
-    ):
-        # Some browsers / OSes report unusual types for AI/INDD/EPS. We
-        # already enforced extension above, so warn but don't block.
+    if content_type not in ALLOWED_CONTENT_TYPES and content_type != "application/octet-stream":
+        # Some browsers report unusual types for AI/INDD/EPS — extension
+        # whitelist already passed, so warn-and-allow.
         print(
             f"[widget_upload] unusual content_type={content_type!r} for "
             f"ext={ext!r} — accepting anyway (extension whitelisted)",
             flush=True,
         )
 
-    # Random filename to avoid collisions + leak of PII (customer's
-    # original filename might be sensitive).
     safe_filename = f"{conv.id}-{uuid.uuid4().hex[:12]}{ext}"
     url = _store_file(safe_filename, data, content_type)
 
-    # Persist on most-recent pending Quote
-    pending_quote = (
-        db.query(Quote)
-        .filter_by(conversation_id=conv.id, status="pending_approval")
-        .order_by(Quote.created_at.desc())
-        .first()
-    )
-    if pending_quote is None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "No pending quote on this conversation. Get a price first, "
-                "then upload artwork."
-            ),
-        )
-    pending_quote.artwork_file_url = url
-    pending_quote.artwork_file_name = name
-    pending_quote.artwork_file_size = total
-    db.commit()
-
-    return {
-        "ok": True,
+    import datetime as _dt
+    new_entry = {
         "url": url,
         "filename": name,
         "size": total,
         "content_type": content_type,
+        "uploaded_at": _dt.datetime.utcnow().isoformat(timespec="seconds"),
+    }
+    new_list = existing + [new_entry]
+    pending_quote.artwork_files = new_list
+    # Mirror first entry into singular columns for backwards compat
+    pending_quote.artwork_file_url = new_list[0]["url"]
+    pending_quote.artwork_file_name = new_list[0]["filename"]
+    pending_quote.artwork_file_size = new_list[0]["size"]
+    db.commit()
+
+    # Return the public-shape list so the widget can render it (proxy
+    # URLs, not internal gs:// references).
+    return {
+        "ok": True,
+        "count": len(new_list),
+        "files": [
+            _public_artwork_entry(
+                e, quote_id=pending_quote.id, idx=i,
+            )
+            for i, e in enumerate(new_list)
+        ],
+    }
+
+
+@router.delete(
+    "/conversations/{cid}/upload-artwork/{idx}",
+    dependencies=[Depends(rate_limit("widget_upload", 5))],
+)
+def delete_artwork_file(
+    cid: int,
+    idx: int,
+    external_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Phase G — remove a single file from the artwork_files list at the
+    given index. Used when the customer clicks the ✕ on an uploaded
+    file in the widget. Does NOT delete the underlying GCS blob (those
+    expire via the bucket's 90-day lifecycle rule); just removes the
+    pointer so it won't show in the form / get attached to Missive.
+    """
+    conv = _validate_session(db, cid, external_id)
+    pending_quote = _resolve_pending_quote(db, conv.id)
+    if pending_quote is None:
+        raise HTTPException(status_code=409, detail="no pending quote")
+
+    files = list(pending_quote.artwork_files or [])
+    if idx < 0 or idx >= len(files):
+        raise HTTPException(status_code=404, detail="index out of range")
+
+    files.pop(idx)
+    pending_quote.artwork_files = files
+    if files:
+        pending_quote.artwork_file_url = files[0]["url"]
+        pending_quote.artwork_file_name = files[0]["filename"]
+        pending_quote.artwork_file_size = files[0]["size"]
+    else:
+        pending_quote.artwork_file_url = None
+        pending_quote.artwork_file_name = None
+        pending_quote.artwork_file_size = None
+    db.commit()
+
+    return {
+        "ok": True,
+        "count": len(files),
+        "files": [
+            _public_artwork_entry(
+                e, quote_id=pending_quote.id, idx=i,
+            )
+            for i, e in enumerate(files)
+        ],
     }
