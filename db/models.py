@@ -248,6 +248,15 @@ class Conversation(Base):
     # JSON object: {address1, address2, address3, address4, postcode}
     delivery_address = Column(JSON, nullable=True)
 
+    # Phase F (refined) — explicit artwork status. Set by the server-side
+    # sniff in chat_with_craig (looks at "do you have artwork?" reply
+    # patterns) and read back by the [ARTWORK_UPLOAD] gate so the upload
+    # button only appears when the customer actually said they have own
+    # artwork. True  = customer says they have print-ready artwork
+    # False = customer wants the €65 design service
+    # null  = the artwork question hasn't been answered yet
+    customer_has_own_artwork = Column(Boolean, nullable=True)
+
     quotes = relationship("Quote", back_populates="conversation", cascade="all, delete-orphan")
 
     __table_args__ = (

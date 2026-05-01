@@ -284,22 +284,52 @@ def submit_customer_info(
         )
         shipping_summary["applied"] = True
 
+    # Phase F refined — short-circuit the assistant reply server-side
+    # rather than round-tripping through the LLM. The LLM was producing
+    # noisy duplications ("That'll be €X... want me to put together the
+    # full quote?") on the [SYSTEM] form-submitted trigger. Bypassing it
+    # gives the customer a clean, deterministic confirmation and saves
+    # tokens. We append the canned message to the conversation
+    # transcript so the dashboard's view is complete.
+    quote_id_for_widget: int | None = None
+    canned_reply = (
+        "All set 👍 here's your full quote — Justin will review it and "
+        "email you shortly with the official confirmation and payment "
+        "details to continue with your order."
+    )
+    if pending_quote is not None:
+        quote_id_for_widget = pending_quote.id
+        # Also append a synthetic SYSTEM "form submitted" line so the
+        # dashboard transcript shows what just happened.
+        history = list(conv.messages or [])
+        history.append({
+            "role": "system",
+            "content": (
+                f"[SYSTEM] Customer submitted the details form: "
+                f"name={conv.customer_name}, email={conv.customer_email}, "
+                f"company={conv.is_company}, returning={conv.is_returning_customer}, "
+                f"delivery={method}."
+            ),
+        })
+        history.append({
+            "role": "assistant",
+            "content": canned_reply + "\n\n[QUOTE_READY]",
+        })
+        conv.messages = history
+
     db.commit()
     db.refresh(conv)
 
     return {
         "ok": True,
         "conversation_id": conv.id,
+        "quote_id": quote_id_for_widget,
         "shipping": shipping_summary,
-        # The widget feeds this string back to /chat as the next user
-        # message — Craig will see the conversation now has every funnel
-        # field populated and emit [QUOTE_READY]. Wrapped in [SYSTEM] so
-        # the user-facing transcript shows it as a system note rather
-        # than a literal customer line.
-        "next_message": (
-            "[SYSTEM] Customer submitted the details form. Acknowledge "
-            "briefly and emit [QUOTE_READY] to release the PDF."
-        ),
+        # The widget renders this directly in the chat as Craig's reply
+        # AND shows the PDF card. No LLM round-trip needed — the canned
+        # text is deterministic and clean, and we already persisted it
+        # to the conversation history above.
+        "assistant_reply": canned_reply,
     }
 
 

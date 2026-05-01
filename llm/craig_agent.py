@@ -217,6 +217,78 @@ def _sniff_contact_from_message(message: str) -> tuple[str | None, str | None]:
     return email, phone
 
 
+# Phase F refined — sniff the customer's answer to the artwork question.
+# Looks at the previous assistant turn (was Craig asking about artwork?)
+# and the current user message (does it look like "yes I have" or "I
+# need design"?). Used to stamp Conversation.customer_has_own_artwork
+# server-side, before the LLM call, so the gates have a canonical signal.
+
+_ARTWORK_QUESTION_PATTERNS = (
+    "print-ready artwork", "have artwork", "have your own", "have your artwork",
+    "design help", "design service", "would you need design",
+    "do you have", "or would you like us to", "or need",
+)
+_ARTWORK_HAVE_AFFIRMATIVE = (
+    "i have", "i've got", "ive got", "got it", "got my own",
+    "have my own", "my own", "yes i have", "yeah i have",
+    "have artwork", "have the artwork", "have a design", "have one",
+    "yes have", "got artwork", "ready", "print-ready",
+)
+_ARTWORK_NEED_DESIGN = (
+    "need design", "need help", "design service", "design please",
+    "no i don", "no, design", "design it", "make one", "create one",
+    "i need", "no artwork", "don't have", "dont have",
+    "no, i need", "can you design", "can you make",
+)
+
+
+def _sniff_artwork_answer(
+    last_assistant_msg: str | None, user_message: str,
+) -> bool | None:
+    """
+    Returns:
+      True  — customer said they have own artwork
+      False — customer said they need design service
+      None  — can't tell (no clear signal, OR Craig wasn't asking the
+              artwork question this turn)
+
+    Pattern: only fires when the previous assistant message looks like
+    it was asking about artwork. Naked "yes" with no question context
+    isn't enough — we'd misread "yes confirm specs" as "yes I have
+    artwork".
+    """
+    if not user_message:
+        return None
+    last = (last_assistant_msg or "").lower()
+    user = user_message.lower().strip()
+
+    # Heuristic for "Craig asked about artwork": at least one of the
+    # phrases a Craig prompt would use.
+    asked = any(p in last for p in _ARTWORK_QUESTION_PATTERNS) and (
+        "artwork" in last or "design" in last
+    )
+    if not asked:
+        return None
+
+    # Need-design signals win — customer explicitly opting into the €65
+    # service is unambiguous.
+    if any(p in user for p in _ARTWORK_NEED_DESIGN):
+        return False
+
+    # Have-artwork signals
+    if any(p in user for p in _ARTWORK_HAVE_AFFIRMATIVE):
+        return True
+
+    # Bare "yes" / "yeah" / "yep" — when Craig just asked artwork, we
+    # treat as "yes I have" (the more common case). This is a heuristic
+    # but bounded: customer can correct later by saying "actually I need
+    # design" and the LLM will re-quote.
+    if user in ("yes", "yeah", "yep", "yup", "ok", "okay", "sure", "y", "yh"):
+        return True
+
+    return None
+
+
 def _humanize_reply(text: str) -> str:
     """Strip markdown + list formatting so the chat widget gets clean prose.
 
@@ -1263,6 +1335,53 @@ def chat_with_craig(
     if sniffed_email or sniffed_phone:
         db.flush()
 
+    # Phase F refined — sniff the customer's answer to the artwork
+    # question if they're answering it. Only sets the field if the
+    # signal is unambiguous. The result is also surfaced as a soft
+    # system hint to the LLM below so it picks the right needs_artwork
+    # value when it next calls a pricing tool.
+    if conversation.customer_has_own_artwork is None:
+        last_asst = next(
+            (m.get("content") for m in reversed(prior_messages)
+             if m.get("role") == "assistant"),
+            None,
+        )
+        sniffed_art = _sniff_artwork_answer(last_asst, user_message)
+        if sniffed_art is not None:
+            conversation.customer_has_own_artwork = sniffed_art
+            db.flush()
+            print(
+                f"[craig] artwork sniff: conv={conversation.id} "
+                f"customer_has_own_artwork={sniffed_art}",
+                flush=True,
+            )
+
+    # Inject artwork status as a developer-side hint so the LLM picks the
+    # right needs_artwork on its next pricing tool call. Soft instruction
+    # — DeepSeek can still get it wrong, but at least it has the signal.
+    if conversation.customer_has_own_artwork is True:
+        messages.append({
+            "role": "system",
+            "content": (
+                "[INTERNAL] The customer has confirmed they have their own "
+                "print-ready artwork. When you call a pricing tool, pass "
+                "needs_artwork=false (no design line item). After quoting, "
+                "end the reply with [ARTWORK_UPLOAD] on its own line so the "
+                "widget renders the upload button."
+            ),
+        })
+    elif conversation.customer_has_own_artwork is False:
+        messages.append({
+            "role": "system",
+            "content": (
+                "[INTERNAL] The customer wants the design service. When you "
+                "call a pricing tool, pass needs_artwork=true and "
+                "artwork_hours=1.0 — that's the standard flat €65 ex VAT "
+                "design service. Do NOT emit [ARTWORK_UPLOAD] (no upload "
+                "needed; we're designing for them)."
+            ),
+        })
+
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
     tool_calls_audit: list[dict] = []
@@ -1423,7 +1542,48 @@ def chat_with_craig(
         if m.get("role") == "assistant"
     )
 
-    if _channel_needs_gate and "[QUOTE_READY]" in final_reply and not _has_contact:
+    # Phase F refined — when LLM emits [QUOTE_READY] but prerequisites
+    # aren't met, strip the marker, KEEP the verbal price the LLM wrote,
+    # and append the right next-step. Three states:
+    #   - artwork not answered     -> ask the artwork question
+    #   - artwork ok, funnel open  -> emit [CUSTOMER_FORM]
+    #   - funnel complete           -> let [QUOTE_READY] pass through
+    _quote_ready_premature = (
+        _channel_needs_gate
+        and "[QUOTE_READY]" in final_reply
+        and (
+            not _has_contact
+            or not _funnel_complete
+            or conversation.customer_has_own_artwork is None
+        )
+    )
+    if _quote_ready_premature:
+        print(
+            f"[craig] PREMATURE [QUOTE_READY] — preserving verbal price; "
+            f"has_contact={_has_contact} funnel_complete={_funnel_complete} "
+            f"artwork_answered={conversation.customer_has_own_artwork is not None} "
+            f"conv={conversation.id}",
+            flush=True,
+        )
+        kept = final_reply.replace("[QUOTE_READY]", "").strip()
+        if conversation.customer_has_own_artwork is None:
+            tail = (
+                "Quick question before I put the full quote together: do "
+                "you have print-ready artwork, or would you like our "
+                "design service (€65 ex VAT, €79.95 inc)?"
+            )
+        elif _form_already_shown_earlier:
+            tail = (
+                "Still waiting on the form above so I can finalise the "
+                "quote \U0001f44d"
+            )
+        else:
+            tail = (
+                "Just need a few more details to send the full quote \U0001f447\n\n"
+                "[CUSTOMER_FORM]"
+            )
+        final_reply = (kept + "\n\n" + tail) if kept else tail
+    elif False and _channel_needs_gate and "[QUOTE_READY]" in final_reply and not _has_contact:
         # Replace the ENTIRE reply with the contact ask. Keeping the LLM's
         # "Here's your quote! 📋" pre-text in front of the ask confused
         # customers — they saw two conflicting sentences in one message.
@@ -1517,18 +1677,16 @@ def chat_with_craig(
         final_reply += "\n[QUOTE_READY]"
 
     # ── Phase F: auto-emit [ARTWORK_UPLOAD] when LLM forgets ──────────
-    # When a pricing tool runs with needs_artwork=False (customer said
-    # they have artwork), the LLM should emit [ARTWORK_UPLOAD] so the
-    # widget renders the upload button. DeepSeek frequently forgets.
-    # Detect the situation server-side: pricing succeeded this turn AND
-    # was called with needs_artwork=False AND the resulting Quote has
-    # no artwork yet AND the marker is missing. Auto-append.
-    _pricing_called_no_design = any(
+    # Tightened in v24 — we ONLY fire this when the customer EXPLICITLY
+    # said they have own artwork (server-side sniff stamped
+    # customer_has_own_artwork=True). The previous gate fired on the
+    # default needs_artwork=False, which made the upload button appear
+    # on every quote even when the customer hadn't been asked.
+    _pricing_called_this_turn = any(
         (tc.get("tool") or "").lower() in (
             "quote_small_format", "quote_large_format", "quote_booklet",
         )
         and (tc.get("result") or {}).get("success") is True
-        and not bool((tc.get("args") or {}).get("needs_artwork"))
         for tc in tool_calls_audit
     )
     _quote_has_artwork = bool(
@@ -1549,8 +1707,9 @@ def chat_with_craig(
     )
     if (
         _channel_needs_gate
-        and _pricing_called_no_design
-        and not _quote_has_artwork
+        and conversation.customer_has_own_artwork is True   # explicit signal
+        and _pricing_called_this_turn                       # quote just generated
+        and not _quote_has_artwork                          # not uploaded yet
         and not _upload_marker_already
         and not _upload_marker_earlier
     ):
@@ -1565,11 +1724,16 @@ def chat_with_craig(
         final_reply += "\n[ARTWORK_UPLOAD]"
 
     # ── Phase F: auto-emit [CUSTOMER_FORM] when user accepts full quote ──
-    # Trigger: a Quote exists on this conversation AND the funnel is
-    # incomplete (delivery_method null) AND the user's last message is
-    # an affirmative ("yes", "go ahead", "please send it", etc.) AND
-    # we haven't already shown the form. Belt-and-suspenders for when
-    # DeepSeek replies in free text instead of emitting the marker.
+    # Tightened in v24 — must satisfy ALL:
+    #   - a Quote exists (price was given)
+    #   - funnel incomplete
+    #   - artwork question was answered (customer_has_own_artwork is set)
+    #   - user message is a short affirmative
+    #   - form not already shown
+    #   - not on confirm_order path
+    # The artwork-answered requirement prevents the form firing before
+    # the customer sees the price (Craig should: ask artwork → price →
+    # ask "want full quote?" → user yes → form).
     _last_user_msg = (user_message or "").strip().lower()
     _looks_affirmative = any(
         word in _last_user_msg
@@ -1579,10 +1743,12 @@ def chat_with_craig(
         )
     ) and len(_last_user_msg) < 80  # short affirmatives only
     _form_marker_in_reply = "[CUSTOMER_FORM]" in final_reply
+    _artwork_answered = conversation.customer_has_own_artwork is not None
     if (
         _channel_needs_gate
         and (_had_prior_quote or last_quote_id is not None)
         and not _funnel_complete
+        and _artwork_answered                  # NEW: gate requires explicit artwork answer
         and _looks_affirmative
         and not _form_marker_in_reply
         and not _form_already_shown_earlier

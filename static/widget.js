@@ -1413,12 +1413,25 @@
                     );
                     input.placeholder = 'Type a message…';
 
-                    // Trigger Craig's [QUOTE_READY] reply via a synthetic
-                    // message. The server returned a `next_message` we can
-                    // forward — Craig sees the conversation is fully populated
-                    // and emits the marker.
-                    const trigger = (result.next_message || '[SYSTEM] form submitted, please emit [QUOTE_READY]');
-                    sendMessage(trigger);
+                    // Phase F refined — server already wrote the canned
+                    // assistant reply into the conversation transcript +
+                    // returned the text + quote_id. Render it directly,
+                    // no /chat round-trip needed.
+                    if (result.assistant_reply) {
+                        addMsg(result.assistant_reply, 'assistant');
+                    }
+                    const finalQuoteId = result.quote_id || lastQuoteId;
+                    if (finalQuoteId) {
+                        showQuoteLoading();
+                        await new Promise(function (resolve) { setTimeout(resolve, 1400); });
+                        removeQuoteLoading();
+                        showQuoteCard(finalQuoteId);
+                        lastQuoteId = finalQuoteId;
+                    }
+                    // Re-enable the input so the customer can ask follow-ups.
+                    input.disabled = false;
+                    sendBtn.disabled = false;
+                    input.focus();
                 } catch (e) {
                     errEl.textContent = 'Network error: ' + e.message;
                     errEl.style.display = 'block';
