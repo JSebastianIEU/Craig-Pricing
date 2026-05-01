@@ -165,10 +165,15 @@ def migrate() -> None:
     #               no artwork_files JSON yet.
     backfilled = 0
     with db_session() as db:
+        # Note: we used to also filter `Quote.artwork_files == ""` (for
+        # a TEXT column that held an empty string). After v26 the column
+        # is JSONB on Postgres, where `== ""` raises a type error. Just
+        # filter on IS NULL — empty arrays are not None, so they still
+        # get correctly skipped.
         rows = (
             db.query(Quote)
             .filter(Quote.artwork_file_url.isnot(None))
-            .filter((Quote.artwork_files.is_(None)) | (Quote.artwork_files == ""))
+            .filter(Quote.artwork_files.is_(None))
             .all()
         )
         for q in rows:
