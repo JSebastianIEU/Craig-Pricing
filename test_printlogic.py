@@ -246,7 +246,10 @@ def test_update_order_status_cancel_happy_path():
     assert result["error"] is None
     body = json.loads(route.calls[0].request.content)
     assert body["action"] == "update_order_status"
-    assert body["order_number"] == "154879"
+    # PrintLogic's update_order_status expects `order_id`, not
+    # `order_number` (verified live 2026-05-01 against order 2925490
+    # — order_number returns "no such order").
+    assert body["order_id"] == "154879"
     assert body["status"] == "Cancelled"
 
 

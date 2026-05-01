@@ -252,10 +252,16 @@ async def update_order_status(order_number: str, status: str, api_key: str) -> d
     """
     Change the lifecycle state of an order (e.g. to 'Cancelled' for our
     rollback path after a mistaken push). Returns `{ok, raw, error}`.
+
+    Note: despite the parameter name, PrintLogic's `update_order_status`
+    action expects the field `order_id` in the body — verified live on
+    2026-05-01 against order 2925490. Sending `order_number=...` returns
+    `{"result":"no such order"}`. Fixed here so the helper actually
+    works in production.
     """
     code, parsed, err = await _post(
         "update_order_status", api_key,
-        order_number=str(order_number), status=status,
+        order_id=str(order_number), status=status,
     )
     if err:
         return {"ok": False, "raw": parsed, "error": err}
