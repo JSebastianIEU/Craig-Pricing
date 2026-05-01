@@ -249,42 +249,36 @@ def _sniff_artwork_answer(
     Returns:
       True  — customer said they have own artwork
       False — customer said they need design service
-      None  — can't tell (no clear signal, OR Craig wasn't asking the
-              artwork question this turn)
+      None  — can't tell
 
-    Pattern: only fires when the previous assistant message looks like
-    it was asking about artwork. Naked "yes" with no question context
-    isn't enough — we'd misread "yes confirm specs" as "yes I have
-    artwork".
+    Two strategies:
+      1. Direct, unambiguous phrases ("I have my own artwork",
+         "I need design help") — fire regardless of question context.
+      2. Bare "yes" / "yeah" — only when Craig's previous message was
+         actually asking the artwork question (avoids reading
+         "yes confirm specs" as "yes I have artwork").
     """
     if not user_message:
         return None
     last = (last_assistant_msg or "").lower()
     user = user_message.lower().strip()
 
-    # Heuristic for "Craig asked about artwork": at least one of the
-    # phrases a Craig prompt would use.
-    asked = any(p in last for p in _ARTWORK_QUESTION_PATTERNS) and (
-        "artwork" in last or "design" in last
-    )
-    if not asked:
-        return None
-
-    # Need-design signals win — customer explicitly opting into the €65
-    # service is unambiguous.
+    # ── Strategy 1: direct phrases (always trust) ────────────────────
     if any(p in user for p in _ARTWORK_NEED_DESIGN):
         return False
-
-    # Have-artwork signals
     if any(p in user for p in _ARTWORK_HAVE_AFFIRMATIVE):
         return True
 
-    # Bare "yes" / "yeah" / "yep" — when Craig just asked artwork, we
-    # treat as "yes I have" (the more common case). This is a heuristic
-    # but bounded: customer can correct later by saying "actually I need
-    # design" and the LLM will re-quote.
-    if user in ("yes", "yeah", "yep", "yup", "ok", "okay", "sure", "y", "yh"):
-        return True
+    # ── Strategy 2: bare yes/no when Craig was asking artwork ────────
+    asked = (
+        ("artwork" in last or "design" in last)
+        and any(p in last for p in _ARTWORK_QUESTION_PATTERNS)
+    )
+    if asked:
+        if user in ("yes", "yeah", "yep", "yup", "ok", "okay", "sure", "y", "yh"):
+            return True
+        if user in ("no", "nope", "nah", "n"):
+            return False
 
     return None
 
@@ -896,6 +890,35 @@ def _exec_tool(
     """Execute a tool call and return a dict the LLM can read. All pricing is
     scoped to `organization_slug` so Craig reads the right tenant's catalog."""
     try:
+        # Phase F refined — pricing tool guard. Refuse to price until the
+        # artwork question has been answered. Forces the LLM to ask the
+        # customer "do you have artwork or need design service?" first,
+        # since DeepSeek tends to skip that step otherwise. The widget
+        # then sniffs the answer and stamps the conversation flag, which
+        # unlocks pricing.
+        if name in ("quote_small_format", "quote_large_format", "quote_booklet"):
+            if conversation_id is not None:
+                _conv = db.query(Conversation).filter_by(id=conversation_id).first()
+                if (
+                    _conv is not None
+                    and _conv.customer_has_own_artwork is None
+                    and not bool(args.get("needs_artwork"))
+                ):
+                    return {
+                        "success": False,
+                        "escalate": False,
+                        "error": (
+                            "ARTWORK_QUESTION_REQUIRED: Before quoting, ask "
+                            "the customer this exact question: 'Do you have "
+                            "print-ready artwork, or would you like our "
+                            "design service (€65 ex VAT, €79.95 inc)?'. Wait "
+                            "for their answer, then call the pricing tool "
+                            "with the appropriate needs_artwork value. Do "
+                            "NOT proceed to quoting until they've answered."
+                        ),
+                        "needs_artwork_question": True,
+                    }
+
         if name == "quote_small_format":
             result = quote_small_format(
                 db,
