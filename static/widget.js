@@ -609,7 +609,11 @@
             border-radius: 22px;
             outline: none;
             font-family: inherit;
-            font-size: 14px;
+            /* Must be ≥16px on iOS or Safari force-zooms when the
+               input gets focus. That zoom-on-focus also throws off
+               our panel layout — the X moves off-screen, the
+               whole widget feels broken. 16px is the safe minimum. */
+            font-size: 16px;
             color: #040f2a;
             background: #fff;
             transition: border-color 0.2s, box-shadow 0.2s;
@@ -2138,10 +2142,61 @@
             input.focus();
         }
 
-        sendBtn.addEventListener('click', sendMessage);
+        // v30.2 — on mobile Safari, tapping a button while the input
+        // is focused dismisses the keyboard FIRST, then the click event
+        // gets eaten by the focus-loss handler. Customers reported the
+        // send button only worked from the keyboard's "return" key, not
+        // the button itself. Fix: handle pointerdown + preventDefault to
+        // keep input focused and fire send before keyboard dismiss.
+        sendBtn.addEventListener('pointerdown', (e) => {
+            e.preventDefault();
+            sendMessage();
+        });
+        // Fallback for browsers without PointerEvents — also keeps
+        // keyboard-only users (Tab + Enter) working.
+        sendBtn.addEventListener('click', (e) => {
+            // If pointerdown already handled it, click is a no-op (the
+            // input is empty by then and sendMessage early-returns).
+            sendMessage();
+        });
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') sendMessage();
         });
+
+        // v30.2 — when the iOS keyboard pops up, the visual viewport
+        // shrinks but our `position: fixed` panel keeps full height,
+        // so the input bar at the bottom slides BELOW the keyboard.
+        // Listen to visualViewport resize and pin the panel to the
+        // visible portion. visualViewport is supported on iOS 13+ and
+        // every Android Chrome — quietly no-ops on older browsers.
+        if (window.visualViewport) {
+            const _vv = window.visualViewport;
+            const _adjustForKeyboard = () => {
+                if (panel.classList.contains('jp-hidden')) return;
+                // Set the panel height to the visible viewport — the
+                // browser collapses it when the keyboard slides up.
+                // We only do this on small screens (mobile breakpoint).
+                if (window.innerWidth <= 480) {
+                    panel.style.height = _vv.height + 'px';
+                    // Also scroll the latest message into view so the
+                    // user sees what they just typed.
+                    if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+                } else {
+                    panel.style.height = '';
+                }
+            };
+            _vv.addEventListener('resize', _adjustForKeyboard);
+            _vv.addEventListener('scroll', _adjustForKeyboard);
+            // Also re-run when the panel opens (input focus is the
+            // most common keyboard trigger).
+            input.addEventListener('focus', () => {
+                // Small delay so the keyboard finishes animating in.
+                setTimeout(_adjustForKeyboard, 250);
+            });
+            input.addEventListener('blur', () => {
+                setTimeout(_adjustForKeyboard, 250);
+            });
+        }
 
         async function bootChat() {
             // Show the configured greeting immediately — no DeepSeek round-trip
