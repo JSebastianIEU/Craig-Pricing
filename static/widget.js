@@ -827,48 +827,72 @@
 
         /* ===== Mobile ===== */
         @media (max-width: 480px) {
+            /* v30.1 — iOS Safari + Arc Mobile fixes.
+               100vh on mobile Safari INCLUDES the URL bar / notch /
+               Dynamic Island area, so the panel gets sized taller than
+               the actual visible viewport. The header (and the X) end
+               up pushed above the visible area or behind the notch.
+               Fix: anchor the panel to top:0 + bottom:0 (no height) so
+               the browser uses the actual visible viewport, plus
+               env(safe-area-inset-top) padding on the header so logo
+               and close button sit BELOW the notch. */
             .jp-panel {
+                /* top + bottom anchors give us the actual visible
+                   viewport on iOS Safari (URL bar offset is handled
+                   by the browser, not our height calc). No height
+                   needed — top:0 + bottom:0 stretches automatically. */
+                top: 0;
                 right: 0;
                 bottom: 0;
-                width: 100%;
-                height: 100vh;
-                max-height: 100vh;
+                left: 0;
+                width: auto;
+                height: auto;
+                max-height: none;
                 border-radius: 0;
+                box-sizing: border-box;
             }
             .jp-bubble {
                 right: 16px;
-                bottom: 16px;
+                bottom: calc(16px + env(safe-area-inset-bottom, 0));
             }
-            /* v30 — bigger, more visible close button on mobile.
-               28×28px was below Apple HIG min tap target on full-screen
-               panels and customers were reporting they couldn't find
-               or tap it. 40×40 with brighter background fixes that. */
+            /* Bigger, MUCH more visible close button. Solid white with
+               navy ✕ — impossible to miss against the dark gradient
+               header. 44×44 = Apple HIG primary CTA target. */
             .jp-close {
-                width: 40px;
-                height: 40px;
-                top: 12px;
-                right: 12px;
-                font-size: 26px;
-                background: rgba(255,255,255,0.22);
+                width: 44px;
+                height: 44px;
+                top: calc(env(safe-area-inset-top, 0) + 10px);
+                right: 10px;
+                font-size: 28px;
+                font-weight: 600;
+                background: #ffffff;
+                color: #040f2a;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+                z-index: 10;
             }
             .jp-close:hover, .jp-close:active {
-                background: rgba(255,255,255,0.35);
+                background: #f0f3fa;
+                transform: scale(0.94);
             }
             .jp-header {
-                padding-right: 60px;
+                /* Push the logo + brand text below the iPhone notch /
+                   Dynamic Island. env() returns 0 on browsers without
+                   a notch (Android, older iPhones). */
+                padding-top: calc(env(safe-area-inset-top, 0) + 18px);
+                padding-right: 64px;
             }
-            /* v30 — drag handle pill at the top of the header, signals
+            /* Drag handle pill at the top of the header, signals
                "this panel can be dismissed". Tied to a touchstart/move
                listener that closes the panel on a 80px+ downward drag. */
             .jp-drag-handle {
                 position: absolute;
-                top: 6px;
+                top: calc(env(safe-area-inset-top, 0) + 6px);
                 left: 50%;
                 transform: translateX(-50%);
-                width: 36px;
-                height: 4px;
-                border-radius: 2px;
-                background: rgba(255,255,255,0.4);
+                width: 44px;
+                height: 5px;
+                border-radius: 3px;
+                background: rgba(255,255,255,0.5);
                 pointer-events: none;
             }
         }
