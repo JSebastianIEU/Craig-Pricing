@@ -1518,9 +1518,13 @@ def chat_with_craig(
         # existing_quotes is ordered desc by created_at, so [0] is newest
         last_quote_id = existing_quotes[0].id
 
-    # Persist the turn
+    # Persist the turn. Phase F: synthetic [SYSTEM] messages (sent by the
+    # widget after a form submit to nudge Craig into emitting [QUOTE_READY])
+    # are stored as `role="system"` so the dashboard transcript doesn't
+    # render them as customer dialogue.
     history = list(conversation.messages or [])
-    history.append({"role": "user", "content": user_message})
+    user_role = "system" if user_message.startswith("[SYSTEM]") else "user"
+    history.append({"role": user_role, "content": user_message})
     history.append({"role": "assistant", "content": final_reply})
     conversation.messages = history
 

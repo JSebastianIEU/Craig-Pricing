@@ -824,6 +824,147 @@
                 bottom: 16px;
             }
         }
+
+        /* ===== Phase F — Customer info form ===== */
+        .jp-form-card {
+            align-self: stretch;
+            width: 100%;
+            background: #fff;
+            border: 1px solid #e1e6f0;
+            border-radius: 14px;
+            padding: 16px 16px 18px;
+            margin: 4px 0 8px;
+            animation: jp-msg-in 0.35s ease-out;
+            box-shadow: 0 2px 8px rgba(4,15,42,0.08);
+        }
+        .jp-form-card.submitted {
+            text-align: center;
+            padding: 18px 16px;
+            background: #f0fdf4;
+            border-color: #bbf7d0;
+        }
+        .jp-form-title {
+            font-weight: 700;
+            font-size: 15px;
+            color: #040f2a;
+            margin-bottom: 4px;
+        }
+        .jp-form-sub {
+            font-size: 12px;
+            color: #6b7a99;
+            margin-bottom: 14px;
+        }
+        .jp-form-card form {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .jp-form-label {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #2f3a55;
+        }
+        .jp-form-label input,
+        .jp-form-label select {
+            font-family: inherit;
+            font-size: 13px;
+            padding: 8px 10px;
+            border: 1px solid #d6dde9;
+            border-radius: 8px;
+            background: #fff;
+            color: #040f2a;
+            font-weight: 400;
+            outline: none;
+            transition: border 0.15s, box-shadow 0.15s;
+        }
+        .jp-form-label input:focus,
+        .jp-form-label select:focus {
+            border-color: #3e8fcd;
+            box-shadow: 0 0 0 3px rgba(62,143,205,0.15);
+        }
+        .jp-form-label input:invalid:not(:placeholder-shown) {
+            border-color: #dc2626;
+        }
+        .jp-form-collect-block {
+            background: #f6f8fc;
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 12px;
+            color: #2f3a55;
+            line-height: 1.5;
+        }
+        .jp-form-err {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            color: #991b1b;
+            border-radius: 8px;
+            padding: 8px 10px;
+            font-size: 12px;
+            margin-top: 4px;
+        }
+        .jp-form-submit {
+            margin-top: 6px;
+            padding: 11px 14px;
+            background: #040f2a;
+            color: #fefefe;
+            border: none;
+            border-radius: 8px;
+            font-family: inherit;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.15s, transform 0.1s;
+        }
+        .jp-form-submit:hover { opacity: 0.9; }
+        .jp-form-submit:active { transform: translateY(1px); }
+        .jp-form-submit:disabled { opacity: 0.6; cursor: not-allowed; }
+
+        /* ===== Phase F — Artwork upload card ===== */
+        .jp-upload-card {
+            align-self: flex-start;
+            max-width: 92%;
+            background: #fff;
+            border: 1px solid #e1e6f0;
+            border-radius: 12px;
+            padding: 12px;
+            margin: 4px 0 6px;
+            animation: jp-msg-in 0.35s ease-out;
+        }
+        .jp-upload-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .jp-upload-icon { font-size: 22px; }
+        .jp-upload-body { flex: 1; min-width: 0; }
+        .jp-upload-title { font-weight: 600; font-size: 13px; color: #040f2a; }
+        .jp-upload-sub { font-size: 11px; color: #6b7a99; margin-top: 1px; }
+        .jp-upload-btn {
+            background: #040f2a;
+            color: #fefefe;
+            border: none;
+            border-radius: 8px;
+            padding: 8px 12px;
+            font-family: inherit;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .jp-upload-btn:hover { opacity: 0.9; }
+        .jp-upload-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .jp-upload-status {
+            margin-top: 8px;
+            font-size: 12px;
+            padding: 6px 8px;
+            border-radius: 6px;
+            background: #f6f8fc;
+            color: #2f3a55;
+        }
+        .jp-upload-status.ok { background: #f0fdf4; color: #166534; }
+        .jp-upload-status.err { background: #fef2f2; color: #991b1b; }
     `;
 
     // ======================================================================
@@ -1120,6 +1261,259 @@
         window._jpOpenPdf = function(url, quoteId) {
             window.open(url, '_blank');
         };
+
+        // ─────────────────────────────────────────────────────────────
+        // Phase F — interactive customer-info form (replaces free-text Q&A)
+        // ─────────────────────────────────────────────────────────────
+
+        function showCustomerForm() {
+            // Lock the chat input visibly so the customer knows the
+            // form is the active surface, not the text box.
+            input.placeholder = "Fill in the form above to continue …";
+            input.disabled = true;
+            sendBtn.disabled = true;
+
+            const formEl = document.createElement('div');
+            formEl.className = 'jp-form-card';
+            formEl.id = 'jpForm';
+            formEl.innerHTML = (
+                '<div class="jp-form-title">A few more details</div>'
+                + '<div class="jp-form-sub">All fields marked * are required.</div>'
+                + '<form id="jpFormEl" autocomplete="on">'
+                + '  <label class="jp-form-label">Your name *<input type="text" name="name" required minlength="2" maxlength="200"></label>'
+                + '  <label class="jp-form-label">Email *<input type="email" name="email" required></label>'
+                + '  <label class="jp-form-label">Phone (optional)<input type="tel" name="phone" placeholder="+353 ..."></label>'
+                + '  <label class="jp-form-label">Are you ordering as *'
+                + '    <select name="is_company" required>'
+                + '      <option value="false" selected>Individual</option>'
+                + '      <option value="true">Company</option>'
+                + '    </select>'
+                + '  </label>'
+                + '  <label class="jp-form-label">Have you ordered with us before?'
+                + '    <select name="is_returning_customer" id="jpReturning">'
+                + '      <option value="false" selected>No</option>'
+                + '      <option value="true">Yes</option>'
+                + '    </select>'
+                + '  </label>'
+                + '  <label class="jp-form-label" id="jpPastEmailWrap" style="display:none;">Email you used last time'
+                + '    <input type="email" name="past_customer_email">'
+                + '  </label>'
+                + '  <label class="jp-form-label">How would you like to receive it? *'
+                + '    <select name="delivery_method" id="jpDeliveryMethod" required>'
+                + '      <option value="" disabled selected>Choose one…</option>'
+                + '      <option value="delivery">Just Print Delivery (+€15)</option>'
+                + '      <option value="collect">Collection from our shop</option>'
+                + '    </select>'
+                + '  </label>'
+                + '  <div id="jpDeliveryAddrWrap" style="display:none;">'
+                + '    <label class="jp-form-label">Address line 1 *<input type="text" name="address1" maxlength="200"></label>'
+                + '    <label class="jp-form-label">Address line 2 (optional)<input type="text" name="address2" maxlength="200"></label>'
+                + '    <label class="jp-form-label">Town / City *<input type="text" name="address4" maxlength="200"></label>'
+                + '    <label class="jp-form-label">Eircode *<input type="text" name="postcode" placeholder="D02 X1Y2" maxlength="8"></label>'
+                + '  </div>'
+                + '  <div id="jpCollectInfo" style="display:none;" class="jp-form-collect-block">'
+                + '    📍 <strong>Pickup at:</strong><br>'
+                + '    Ballymount Cross Business Park, 7,<br>Ballymount, Dublin, D24 E5NH'
+                + '  </div>'
+                + '  <div id="jpFormErr" class="jp-form-err" style="display:none;"></div>'
+                + '  <button type="submit" class="jp-form-submit" id="jpFormSubmit">Send my details</button>'
+                + '</form>'
+            );
+            messagesEl.appendChild(formEl);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+
+            const form = document.getElementById('jpFormEl');
+            const returning = document.getElementById('jpReturning');
+            const pastWrap = document.getElementById('jpPastEmailWrap');
+            const dm = document.getElementById('jpDeliveryMethod');
+            const addrWrap = document.getElementById('jpDeliveryAddrWrap');
+            const collectInfo = document.getElementById('jpCollectInfo');
+            const errEl = document.getElementById('jpFormErr');
+            const submitBtn = document.getElementById('jpFormSubmit');
+
+            returning.addEventListener('change', () => {
+                pastWrap.style.display = returning.value === 'true' ? 'block' : 'none';
+                if (returning.value !== 'true') {
+                    pastWrap.querySelector('input').value = '';
+                }
+            });
+            dm.addEventListener('change', () => {
+                addrWrap.style.display = dm.value === 'delivery' ? 'block' : 'none';
+                collectInfo.style.display = dm.value === 'collect' ? 'block' : 'none';
+                // Address inputs only required when delivery
+                addrWrap.querySelectorAll('input').forEach((el) => {
+                    if (el.name === 'address2') return;  // optional
+                    el.required = (dm.value === 'delivery');
+                });
+            });
+
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                errEl.style.display = 'none';
+                errEl.textContent = '';
+
+                const fd = new FormData(form);
+                const method = fd.get('delivery_method');
+                const body = {
+                    external_id: sessionId,
+                    name: (fd.get('name') || '').trim(),
+                    email: (fd.get('email') || '').trim(),
+                    phone: (fd.get('phone') || '').trim() || null,
+                    is_company: fd.get('is_company') === 'true',
+                    is_returning_customer: fd.get('is_returning_customer') === 'true',
+                    past_customer_email: (fd.get('past_customer_email') || '').trim() || null,
+                    delivery_method: method,
+                };
+                if (method === 'delivery') {
+                    body.delivery_address = {
+                        address1: (fd.get('address1') || '').trim(),
+                        address2: (fd.get('address2') || '').trim(),
+                        address3: '',
+                        address4: (fd.get('address4') || '').trim(),
+                        postcode: (fd.get('postcode') || '').trim(),
+                    };
+                    if (!/^[A-Za-z]\d{2}\s?[A-Za-z0-9]{4}$/.test(body.delivery_address.postcode)) {
+                        errEl.textContent = 'Please enter a valid Irish eircode (e.g. D02 X1Y2).';
+                        errEl.style.display = 'block';
+                        return;
+                    }
+                }
+
+                submitBtn.disabled = true;
+                submitBtn.textContent = 'Saving…';
+
+                try {
+                    const resp = await fetch(
+                        API_BASE + '/widget/conversations/' + conversationId + '/customer-info',
+                        {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(body),
+                        },
+                    );
+                    if (!resp.ok) {
+                        let msg = 'Could not save details (HTTP ' + resp.status + ').';
+                        try {
+                            const j = await resp.json();
+                            if (j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+                        } catch (_) { /* swallow */ }
+                        errEl.textContent = msg;
+                        errEl.style.display = 'block';
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = 'Send my details';
+                        return;
+                    }
+                    const result = await resp.json();
+                    // Form succeeded — collapse it into a confirmation summary
+                    formEl.classList.add('submitted');
+                    formEl.innerHTML = (
+                        '<div class="jp-form-title">✓ Got everything</div>'
+                        + '<div class="jp-form-sub">' + escapeHtml(body.name) + ' · '
+                        + escapeHtml(body.email) + '</div>'
+                    );
+                    input.placeholder = 'Type a message…';
+
+                    // Trigger Craig's [QUOTE_READY] reply via a synthetic
+                    // message. The server returned a `next_message` we can
+                    // forward — Craig sees the conversation is fully populated
+                    // and emits the marker.
+                    const trigger = (result.next_message || '[SYSTEM] form submitted, please emit [QUOTE_READY]');
+                    sendMessage(trigger);
+                } catch (e) {
+                    errEl.textContent = 'Network error: ' + e.message;
+                    errEl.style.display = 'block';
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = 'Send my details';
+                }
+            });
+        }
+
+        function escapeHtml(s) {
+            return String(s || '').replace(/[&<>"']/g, (c) => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+            })[c]);
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Phase F — artwork upload button
+        // ─────────────────────────────────────────────────────────────
+
+        function showArtworkUploadButton() {
+            const wrap = document.createElement('div');
+            wrap.className = 'jp-upload-card';
+            wrap.id = 'jpUploadCard';
+            wrap.innerHTML = (
+                '<div class="jp-upload-row">'
+                + '  <div class="jp-upload-icon">📎</div>'
+                + '  <div class="jp-upload-body">'
+                + '    <div class="jp-upload-title">Upload your artwork</div>'
+                + '    <div class="jp-upload-sub">PDF, AI, INDD, JPG, PNG… up to 100 MB</div>'
+                + '  </div>'
+                + '  <button type="button" class="jp-upload-btn" id="jpUploadBtn">Choose file</button>'
+                + '  <input type="file" id="jpUploadInput" accept=".pdf,.ai,.indd,.jpg,.jpeg,.png,.eps,.tiff,.tif,.psd,.svg" style="display:none;">'
+                + '</div>'
+                + '<div class="jp-upload-status" id="jpUploadStatus" style="display:none;"></div>'
+            );
+            messagesEl.appendChild(wrap);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+
+            const btn = document.getElementById('jpUploadBtn');
+            const fileInput = document.getElementById('jpUploadInput');
+            const statusEl = document.getElementById('jpUploadStatus');
+
+            btn.addEventListener('click', () => fileInput.click());
+            fileInput.addEventListener('change', async () => {
+                const file = fileInput.files[0];
+                if (!file) return;
+                if (file.size > 100 * 1024 * 1024) {
+                    statusEl.textContent = 'File too big — max 100 MB.';
+                    statusEl.style.display = 'block';
+                    statusEl.classList.add('err');
+                    return;
+                }
+                statusEl.classList.remove('err');
+                statusEl.style.display = 'block';
+                statusEl.textContent = 'Uploading …';
+                btn.disabled = true;
+                btn.textContent = 'Uploading…';
+
+                const fd = new FormData();
+                fd.append('file', file);
+                fd.append('external_id', sessionId);
+
+                try {
+                    const resp = await fetch(
+                        API_BASE + '/widget/conversations/' + conversationId + '/upload-artwork',
+                        { method: 'POST', body: fd },
+                    );
+                    if (!resp.ok) {
+                        let msg = 'Upload failed (HTTP ' + resp.status + ').';
+                        try {
+                            const j = await resp.json();
+                            if (j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+                        } catch (_) { /* swallow */ }
+                        statusEl.textContent = msg;
+                        statusEl.classList.add('err');
+                        btn.disabled = false;
+                        btn.textContent = 'Choose file';
+                        return;
+                    }
+                    const result = await resp.json();
+                    uploadedArtwork = result;
+                    btn.style.display = 'none';
+                    statusEl.classList.remove('err');
+                    statusEl.classList.add('ok');
+                    const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+                    statusEl.innerHTML = '✓ ' + escapeHtml(file.name) + ' · ' + sizeMb + ' MB';
+                } catch (e) {
+                    statusEl.textContent = 'Network error: ' + e.message;
+                    statusEl.classList.add('err');
+                    btn.disabled = false;
+                    btn.textContent = 'Choose file';
+                }
+            });
+        }
+
         function addTyping() {
             const el = document.createElement('div');
             el.className = 'jp-typing';
@@ -1174,11 +1568,21 @@
             }
         }
 
-        async function sendMessage() {
-            const text = input.value.trim();
-            if (!text) return;
-            addMsg(text, 'user');
-            input.value = '';
+        // Phase F state: track which markers have already been "consumed"
+        // so we don't render the form / upload button twice if the LLM
+        // repeats them in subsequent turns.
+        let formAlreadyShown = false;
+        let uploadAlreadyShown = false;
+        let uploadedArtwork = null;  // { url, filename, size }
+
+        async function sendMessage(messageOverride) {
+            const text = messageOverride !== undefined ? messageOverride : input.value.trim();
+            if (!text && messageOverride === undefined) return;
+            const isSynthetic = messageOverride !== undefined;
+            if (!isSynthetic) {
+                addMsg(text, 'user');
+                input.value = '';
+            }
             input.disabled = true;
             sendBtn.disabled = true;
 
@@ -1196,10 +1600,29 @@
             }
 
             const rawReply = data.reply || '';
-            const cleanReply = rawReply.replace(/\[QUOTE_READY\]/g, '').trim();
+            const wantsForm = rawReply.indexOf('[CUSTOMER_FORM]') !== -1;
+            const wantsUpload = rawReply.indexOf('[ARTWORK_UPLOAD]') !== -1;
+            // Strip ALL machine markers from what the customer sees.
+            const cleanReply = rawReply
+                .replace(/\[QUOTE_READY\]/g, '')
+                .replace(/\[CUSTOMER_FORM\]/g, '')
+                .replace(/\[ARTWORK_UPLOAD\]/g, '')
+                .trim();
             const wantsQuote = rawReply.indexOf('[QUOTE_READY]') !== -1 && lastQuoteId;
 
             if (cleanReply) addMsg(cleanReply, 'assistant');
+
+            if (wantsUpload && !uploadAlreadyShown) {
+                uploadAlreadyShown = true;
+                showArtworkUploadButton();
+            }
+
+            if (wantsForm && !formAlreadyShown) {
+                formAlreadyShown = true;
+                showCustomerForm();
+                // The form takes over; don't re-enable the chat input.
+                return;
+            }
 
             if (wantsQuote) {
                 // Brief loading animation, then the quote card with View + Download buttons.

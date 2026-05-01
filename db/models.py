@@ -322,6 +322,25 @@ class Quote(Base):
     #     = 'paid', no PrintLogic order yet)
     client_confirmed_at = Column(DateTime, nullable=True)
 
+    # Phase F — shipping line item. Just Print's policy: €15 inc VAT
+    # flat fee for delivery, free over €100 goods inc VAT. The cost is
+    # 0 for collection or for orders that hit the threshold. We persist
+    # both ex-VAT and inc-VAT so the PDF can render the line item with
+    # an accurate VAT breakdown without re-derivation.
+    shipping_cost_ex_vat = Column(Float, nullable=False, default=0.0, server_default="0")
+    shipping_cost_inc_vat = Column(Float, nullable=False, default=0.0, server_default="0")
+
+    # Phase F — customer-uploaded artwork file. Cloud Storage URL +
+    # original filename + size. Filled by the /widget/.../upload-artwork
+    # endpoint when the customer uploads via the chat widget. URL is
+    # forwarded to Missive (as a second draft attachment) and to
+    # PrintLogic (in item_custom_data, since PL probably doesn't accept
+    # artwork files via API directly). Null when the customer chose
+    # "need design service" or hasn't uploaded yet.
+    artwork_file_url = Column(Text, nullable=True)
+    artwork_file_name = Column(String(255), nullable=True)
+    artwork_file_size = Column(Integer, nullable=True)
+
     conversation = relationship("Conversation", back_populates="quotes")
 
     __table_args__ = (

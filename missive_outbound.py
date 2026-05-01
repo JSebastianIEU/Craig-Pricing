@@ -64,9 +64,17 @@ def _build_html_body(quote: Quote, conv: Conversation | None) -> str:
         name = conv.customer_name.strip().split()[0]
     greeting = f"Hi {_html.escape(name)}," if name else "Hi,"
 
-    total = float(quote.final_price_inc_vat or quote.total or 0)
+    goods_total = float(quote.final_price_inc_vat or 0)
+    shipping_inc = float(getattr(quote, "shipping_cost_inc_vat", 0) or 0)
+    total = float(quote.total or (goods_total + shipping_inc))
     pay_url = (quote.stripe_payment_link_url or "").strip()
     ref = f"JP-{quote.id:04d}"
+
+    # Phase F — render delivery vs collection differently in the body
+    # so the customer sees what they signed up for (and Justin reviewing
+    # the draft sees it too at a glance).
+    delivery_method = (getattr(conv, "delivery_method", None) or "").strip().lower()
+    delivery_address = getattr(conv, "delivery_address", None) or {}
 
     parts = [f"<p>{greeting}</p>"]
     parts.append(
@@ -75,6 +83,42 @@ def _build_html_body(quote: Quote, conv: Conversation | None) -> str:
         f"&euro;{total:.2f} including VAT) is attached as a PDF for "
         "your records.</p>"
     )
+
+    # Quote breakdown (only if shipping is non-zero — keeps simple
+    # collect-from-shop emails clean).
+    if shipping_inc > 0:
+        parts.append(
+            "<p>Breakdown:<br>"
+            f"&nbsp;&nbsp;Goods: &euro;{goods_total:.2f}<br>"
+            f"&nbsp;&nbsp;Just Print Delivery: &euro;{shipping_inc:.2f}<br>"
+            f"&nbsp;&nbsp;<strong>Total: &euro;{total:.2f}</strong>"
+            "</p>"
+        )
+
+    # Delivery / collection block
+    if delivery_method == "delivery" and isinstance(delivery_address, dict):
+        addr_lines = ", ".join(
+            v.strip()
+            for v in (
+                delivery_address.get("address1"),
+                delivery_address.get("address2"),
+                delivery_address.get("address3"),
+                delivery_address.get("address4"),
+                delivery_address.get("postcode"),
+            )
+            if v and v.strip()
+        )
+        if addr_lines:
+            parts.append(
+                f"<p>Delivery to: {_html.escape(addr_lines)}</p>"
+            )
+    elif delivery_method == "collect":
+        parts.append(
+            "<p>You'll be collecting from our shop at "
+            "Ballymount Cross Business Park, 7, Ballymount, Dublin, D24 E5NH. "
+            "We'll let you know when it's ready to pick up.</p>"
+        )
+
     if pay_url:
         parts.append(
             "<p>You can pay securely here: "
@@ -83,8 +127,8 @@ def _build_html_body(quote: Quote, conv: Conversation | None) -> str:
         )
     parts.append(
         "<p>Turnaround is 3-5 working days from when we have print-ready "
-        "artwork. Reply to this email to share artwork or confirm any "
-        "delivery details, and we&rsquo;ll get things moving on our side.</p>"
+        "artwork. Reply to this email if you need any adjustments, and we&rsquo;ll "
+        "get things moving on our side.</p>"
     )
     parts.append("<p>Best,<br>Justin<br>Just Print</p>")
     return "".join(parts)
@@ -97,25 +141,79 @@ def _build_subject(quote: Quote) -> str:
 
 def _build_attachments(quote: Quote) -> list[dict[str, str]] | None:
     """
-    Build the PDF attachment list for the draft. Returns None if PDF
+    Build the attachment list for the draft. Returns None if PDF
     generation fails (the draft still goes out, just without the
     attachment — better than no draft at all).
+
+    Phase F: when the customer uploaded their own artwork (via the chat
+    widget's [ARTWORK_UPLOAD] flow), we fetch it from Cloud Storage and
+    add it as a SECOND attachment so Justin's email goes out with both
+    the branded quote PDF and the customer's print-ready file in one
+    shot — the customer has everything they need without bouncing back
+    and forth.
     """
+    attachments: list[dict[str, str]] = []
     try:
         from pdf_generator import generate_quote_pdf
         import base64
 
         pdf_bytes = generate_quote_pdf(quote)
-        return [{
+        attachments.append({
             "filename": f"JustPrint-Quote-JP-{quote.id:04d}.pdf",
             "base64_data": base64.b64encode(pdf_bytes).decode("ascii"),
-        }]
+        })
     except Exception as e:
         print(
             f"[missive_outbound] PDF generation failed for quote {quote.id}: {e}",
             flush=True,
         )
-        return None
+        # Don't return None yet — we still want to try the artwork
+        # attachment below. PDF-less draft is better than no draft.
+
+    # ── Customer-uploaded artwork (Phase F) ────────────────────────
+    # If the customer uploaded artwork via the chat widget, fetch the
+    # bytes and attach them too. Best-effort: if the URL is dead or the
+    # fetch fails, we log and proceed without — the PDF still goes out.
+    artwork_url = (getattr(quote, "artwork_file_url", None) or "").strip()
+    artwork_name = (getattr(quote, "artwork_file_name", None) or "").strip()
+    if artwork_url and artwork_name:
+        try:
+            import httpx
+            import base64 as _b64
+
+            # Local-mode URLs start with /artwork-local/ — read from disk
+            # directly instead of HTTP-fetching ourselves.
+            if artwork_url.startswith("/artwork-local/"):
+                import os as _os
+                local_dir = _os.environ.get(
+                    "CRAIG_ARTWORK_LOCAL_DIR", "/tmp/craig-artwork",
+                )
+                fname = artwork_url.rsplit("/", 1)[-1]
+                with open(_os.path.join(local_dir, fname), "rb") as f:
+                    art_bytes = f.read()
+            else:
+                with httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0)) as c:
+                    r = c.get(artwork_url)
+                    r.raise_for_status()
+                    art_bytes = r.content
+
+            attachments.append({
+                "filename": artwork_name,
+                "base64_data": _b64.b64encode(art_bytes).decode("ascii"),
+            })
+            print(
+                f"[missive_outbound] artwork attached: quote={quote.id} "
+                f"name={artwork_name!r} size={len(art_bytes)}",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"[missive_outbound] artwork attach FAILED for quote "
+                f"{quote.id} url={artwork_url!r}: {e}",
+                flush=True,
+            )
+
+    return attachments or None
 
 
 def send_quote_draft(db, quote: Quote, organization_slug: str) -> dict[str, Any]:

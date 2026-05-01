@@ -1,0 +1,468 @@
+"""
+Widget-public endpoints — Phase F.
+
+These are reached by the JavaScript chat widget (the floating bubble
+on just-print.ie or the preview at /). They are NOT protected by the
+JWT auth that admin_api.py enforces. Auth model:
+
+  - The widget knows two opaque values: its own client-side `external_id`
+    (a session token it generates on first load) and the
+    `conversation_id` returned by the first `/chat` call.
+  - Every widget endpoint requires BOTH to be passed and verifies they
+    match — guessing both at random has a probability of effectively 0.
+  - If they don't match, the request is rejected with 403.
+
+Two endpoints currently:
+  - POST /widget/conversations/{cid}/customer-info — submit the
+    structured funnel form (name, email, phone, is_company,
+    is_returning_customer, past_customer_email, delivery_method,
+    delivery_address). Auto-fills delivery_address with shop_address
+    when delivery_method=collect, applies shipping when delivery, and
+    triggers the next-turn LLM reply via a synthetic system message.
+  - POST /widget/conversations/{cid}/upload-artwork — multipart upload
+    of a print-ready file. Stores in Cloud Storage (or local fs in
+    dev), persists URL on the most-recent pending Quote on this
+    conversation, returns the URL.
+
+Rate-limited the same as /chat to prevent abuse.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import uuid
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy.orm import Session
+
+from rate_limiter import rate_limit
+from db import get_db
+from db.models import Conversation, Quote
+
+
+router = APIRouter(prefix="/widget", tags=["Widget"])
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+# Irish eircode format: 1 letter + 2 digits, optional space, then 4
+# alphanumerics. We accept upper/lower case + optional space.
+_EIRCODE_RX = re.compile(r"^[A-Za-z]\d{2}\s?[A-Za-z0-9]{4}$")
+
+# RFC-5322-ish email check — same regex as the rest of the codebase.
+_EMAIL_RX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+_DISPOSABLE_DOMAINS = {
+    "yopmail.com", "tempmail.com", "tempmail.org", "10minutemail.com",
+    "guerrillamail.com", "mailinator.com", "throwaway.email",
+}
+
+_VALID_DELIVERY_METHODS = ("delivery", "collect")
+
+
+def _validate_session(
+    db: Session, cid: int, external_id: str,
+) -> Conversation:
+    """
+    Pseudo-session check: verify that the conversation_id and
+    external_id pair is one we issued via /chat. Either missing or a
+    mismatch returns 403 — same as the admin layer's access_guard.
+    """
+    if not external_id:
+        raise HTTPException(status_code=403, detail="missing external_id")
+    conv = db.query(Conversation).filter_by(id=cid).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    if (conv.external_id or "") != external_id:
+        raise HTTPException(status_code=403, detail="external_id mismatch")
+    return conv
+
+
+def _parse_shop_address(shop_address: str) -> dict[str, str]:
+    """
+    Best-effort parse of the human-readable shop_address setting into
+    the {address1..4, postcode} structured shape we persist.
+
+    The current value is:
+      "Ballymount Cross Business Park, 7, Ballymount, Dublin, D24 E5NH, Ireland"
+
+    Strategy: split by commas, strip whitespace, last segment ending
+    with "Ireland" / "Eire" is dropped (country implicit), the segment
+    before it that matches the eircode regex is `postcode`, the rest
+    folds into address1..4 in order.
+    """
+    parts = [p.strip() for p in (shop_address or "").split(",") if p.strip()]
+    # Drop trailing "Ireland" / "Eire" / "IE"
+    if parts and parts[-1].lower() in ("ireland", "eire", "ie"):
+        parts = parts[:-1]
+    postcode = ""
+    if parts and _EIRCODE_RX.match(parts[-1]):
+        postcode = parts[-1]
+        parts = parts[:-1]
+    out: dict[str, str] = {}
+    for idx, part in enumerate(parts[:4], start=1):
+        out[f"address{idx}"] = part
+    if postcode:
+        out["postcode"] = postcode
+    return out
+
+
+# ---------------------------------------------------------------------------
+# POST /widget/conversations/{cid}/customer-info
+# ---------------------------------------------------------------------------
+
+
+class _DeliveryAddressIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    address1: str = Field("", max_length=200)
+    address2: Optional[str] = Field("", max_length=200)
+    address3: Optional[str] = Field("", max_length=200)
+    address4: Optional[str] = Field("", max_length=200)
+    postcode: str = Field("", max_length=40)
+
+
+class CustomerInfoForm(BaseModel):
+    """Phase F structured funnel form. Replaces free-text Q&A in chat."""
+    model_config = ConfigDict(extra="forbid")
+
+    external_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=2, max_length=200)
+    email: str = Field(..., min_length=5, max_length=200)
+    phone: Optional[str] = Field(None, max_length=50)
+    is_company: bool = False
+    is_returning_customer: bool = False
+    past_customer_email: Optional[str] = Field(None, max_length=200)
+    delivery_method: str = Field(..., pattern=r"^(delivery|collect)$")
+    # Required ONLY when delivery_method='delivery'. We re-check in code
+    # because Pydantic conditional required-ness is awkward.
+    delivery_address: Optional[_DeliveryAddressIn] = None
+
+    @field_validator("email")
+    @classmethod
+    def _email_shape_and_no_disposable(cls, v: str) -> str:
+        v = v.strip()
+        if not _EMAIL_RX.match(v):
+            raise ValueError("must be a valid email")
+        domain = v.lower().split("@")[-1]
+        if domain in _DISPOSABLE_DOMAINS:
+            raise ValueError("disposable email domains aren't accepted")
+        return v
+
+    @field_validator("phone")
+    @classmethod
+    def _phone_min_digits(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return None
+        digits = re.sub(r"\D", "", v)
+        if len(digits) < 8:
+            raise ValueError("phone must have at least 8 digits")
+        return v.strip()
+
+
+@router.post(
+    "/conversations/{cid}/customer-info",
+    dependencies=[Depends(rate_limit("widget_form", 10))],
+)
+def submit_customer_info(
+    cid: int,
+    body: CustomerInfoForm,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Submit the structured funnel form. Persists every field to the
+    Conversation row. Side-effects:
+
+      - If delivery_method='collect', auto-fills delivery_address by
+        parsing the tenant's shop_address setting.
+      - If delivery_method='delivery', requires delivery_address.address1
+        and delivery_address.postcode (Irish eircode format).
+      - On the most-recent pending Quote on this conversation,
+        applies shipping (€15 inc VAT, free over €100 inc VAT goods).
+      - Returns a `next_message` payload the widget can either render
+        directly or feed to /chat to trigger Craig's [QUOTE_READY] reply.
+    """
+    from pricing_engine import _get_setting, apply_shipping_to_quote
+
+    conv = _validate_session(db, cid, body.external_id)
+
+    method = body.delivery_method.strip().lower()
+    if method not in _VALID_DELIVERY_METHODS:
+        raise HTTPException(status_code=422, detail="invalid delivery_method")
+
+    # Resolve delivery_address based on method
+    addr_dict: dict[str, str] = {}
+    if method == "delivery":
+        if body.delivery_address is None or not body.delivery_address.address1.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="delivery_address.address1 is required when delivery_method='delivery'",
+            )
+        if not _EIRCODE_RX.match(body.delivery_address.postcode or ""):
+            raise HTTPException(
+                status_code=422,
+                detail="delivery_address.postcode must be a valid Irish eircode (e.g. D02 X1Y2)",
+            )
+        for k in ("address1", "address2", "address3", "address4", "postcode"):
+            v = (getattr(body.delivery_address, k, None) or "").strip()
+            if v:
+                addr_dict[k] = v
+    else:
+        # Collection — auto-fill from shop_address setting
+        shop = _get_setting(
+            db, "shop_address", "",
+            organization_slug=conv.organization_slug,
+        )
+        addr_dict = _parse_shop_address(shop or "")
+
+    # Returning-customer bookkeeping
+    past_email = (body.past_customer_email or "").strip()
+    if body.is_returning_customer and not past_email:
+        raise HTTPException(
+            status_code=422,
+            detail="past_customer_email is required when is_returning_customer=true",
+        )
+
+    # Persist to Conversation
+    conv.customer_name = body.name.strip()
+    conv.customer_email = body.email.lower().strip()
+    if body.phone:
+        conv.customer_phone = body.phone.strip()
+    conv.is_company = body.is_company
+    conv.is_returning_customer = body.is_returning_customer
+    conv.past_customer_email = past_email or None
+    conv.delivery_method = method
+    conv.delivery_address = addr_dict or None
+    db.flush()
+
+    # Find the most-recent pending Quote on this conversation and
+    # apply shipping. If there is no quote yet (edge case: form submitted
+    # before Craig priced), skip.
+    pending_quote = (
+        db.query(Quote)
+        .filter_by(conversation_id=conv.id, status="pending_approval")
+        .order_by(Quote.created_at.desc())
+        .first()
+    )
+
+    shipping_summary: dict[str, Any] = {"applied": False}
+    if pending_quote is not None:
+        # Phase F gate: if the customer earlier said they have own artwork,
+        # the upload is required before we finalize. We infer "promised
+        # artwork" from artwork_cost==0 (no design service) on a quote
+        # whose conversation has no artwork_file_url yet.
+        promised_artwork = (
+            float(pending_quote.artwork_cost or 0) == 0.0
+            and not (pending_quote.artwork_file_url or "").strip()
+        )
+        if promised_artwork:
+            # Inspect conversation messages for an explicit "I have artwork"
+            # signal — only block if Craig actually emitted [ARTWORK_UPLOAD]
+            # earlier (i.e. the user was offered the upload). We use that
+            # marker as the canonical signal.
+            had_upload_offer = any(
+                "[ARTWORK_UPLOAD]" in (m.get("content") or "")
+                for m in (conv.messages or [])
+                if m.get("role") == "assistant"
+            )
+            if had_upload_offer:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Please upload your print-ready artwork before "
+                        "we finalise the quote."
+                    ),
+                )
+
+        shipping_summary = apply_shipping_to_quote(
+            db, pending_quote, method, organization_slug=conv.organization_slug,
+        )
+        shipping_summary["applied"] = True
+
+    db.commit()
+    db.refresh(conv)
+
+    return {
+        "ok": True,
+        "conversation_id": conv.id,
+        "shipping": shipping_summary,
+        # The widget feeds this string back to /chat as the next user
+        # message — Craig will see the conversation now has every funnel
+        # field populated and emit [QUOTE_READY]. Wrapped in [SYSTEM] so
+        # the user-facing transcript shows it as a system note rather
+        # than a literal customer line.
+        "next_message": (
+            "[SYSTEM] Customer submitted the details form. Acknowledge "
+            "briefly and emit [QUOTE_READY] to release the PDF."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /widget/conversations/{cid}/upload-artwork
+# ---------------------------------------------------------------------------
+
+
+# Allowed file types — matches Roi's FAQ #2 list expanded with raster
+# print formats Just Print's customers commonly send. Validated by
+# extension AND content-type.
+ALLOWED_EXTENSIONS = {
+    ".pdf", ".jpg", ".jpeg", ".png",
+    ".ai", ".indd", ".eps", ".tiff", ".tif", ".psd", ".svg",
+}
+ALLOWED_CONTENT_TYPES = {
+    "application/pdf",
+    "image/jpeg", "image/png", "image/tiff", "image/svg+xml",
+    "application/postscript",                           # .eps + .ai sometimes
+    "application/illustrator", "application/x-illustrator",
+    "application/x-photoshop", "image/vnd.adobe.photoshop",
+    "application/x-indesign", "application/octet-stream",  # .indd often falls here
+}
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+
+_GCS_BUCKET = os.environ.get("CRAIG_ARTWORK_BUCKET", "")  # set in prod
+_LOCAL_UPLOAD_DIR = os.environ.get("CRAIG_ARTWORK_LOCAL_DIR", "/tmp/craig-artwork")
+
+
+def _store_file(filename: str, data: bytes, content_type: str) -> str:
+    """
+    Upload to Cloud Storage if the bucket is configured (prod), else fall
+    back to local disk (dev). Returns a public-ish URL the dashboard +
+    Missive can fetch.
+
+    Local mode serves files from a directory the FastAPI app mounts at
+    /artwork-local; in prod we use signed URLs (3-day expiry) on private
+    GCS objects.
+    """
+    if _GCS_BUCKET:
+        try:
+            from google.cloud import storage  # type: ignore[import-not-found]
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="google-cloud-storage not installed but CRAIG_ARTWORK_BUCKET is set",
+            )
+        client = storage.Client()
+        bucket = client.bucket(_GCS_BUCKET)
+        blob = bucket.blob(f"artwork/{filename}")
+        blob.upload_from_string(data, content_type=content_type or "application/octet-stream")
+        # 3-day signed URL — long enough for Justin to review + push to
+        # PrintLogic, short enough that abandoned artwork doesn't linger.
+        try:
+            from datetime import timedelta
+            return blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(days=3),
+                method="GET",
+            )
+        except Exception:
+            # Fallback: public URL (only works if bucket is public).
+            return blob.public_url
+
+    # Local fallback (dev)
+    os.makedirs(_LOCAL_UPLOAD_DIR, exist_ok=True)
+    local_path = os.path.join(_LOCAL_UPLOAD_DIR, filename)
+    with open(local_path, "wb") as f:
+        f.write(data)
+    return f"/artwork-local/{filename}"
+
+
+@router.post(
+    "/conversations/{cid}/upload-artwork",
+    dependencies=[Depends(rate_limit("widget_upload", 5))],
+)
+async def upload_artwork(
+    cid: int,
+    external_id: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Multipart upload of a print-ready artwork file. Validates type +
+    size, stores it, and persists the URL onto the most-recent pending
+    Quote on this conversation. Replaces any prior artwork on the same
+    Quote (customer can re-upload before finalizing).
+
+    Returns:
+      {ok, url, filename, size, content_type}
+    """
+    conv = _validate_session(db, cid, external_id)
+
+    name = (file.filename or "upload").strip()
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"file type {ext!r} not accepted. We take PDF, JPG, PNG, "
+                "AI, INDD, EPS, TIFF, PSD, SVG."
+            ),
+        )
+
+    # Read the body (FastAPI's UploadFile is async). Enforce max size as
+    # we read so a malicious 10 GB upload doesn't OOM the worker.
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"file too large — max {MAX_UPLOAD_BYTES // (1024*1024)} MB",
+            )
+        chunks.append(chunk)
+    data = b"".join(chunks)
+
+    content_type = (file.content_type or "application/octet-stream").lower()
+    if (
+        content_type not in ALLOWED_CONTENT_TYPES
+        and content_type != "application/octet-stream"
+    ):
+        # Some browsers / OSes report unusual types for AI/INDD/EPS. We
+        # already enforced extension above, so warn but don't block.
+        print(
+            f"[widget_upload] unusual content_type={content_type!r} for "
+            f"ext={ext!r} — accepting anyway (extension whitelisted)",
+            flush=True,
+        )
+
+    # Random filename to avoid collisions + leak of PII (customer's
+    # original filename might be sensitive).
+    safe_filename = f"{conv.id}-{uuid.uuid4().hex[:12]}{ext}"
+    url = _store_file(safe_filename, data, content_type)
+
+    # Persist on most-recent pending Quote
+    pending_quote = (
+        db.query(Quote)
+        .filter_by(conversation_id=conv.id, status="pending_approval")
+        .order_by(Quote.created_at.desc())
+        .first()
+    )
+    if pending_quote is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No pending quote on this conversation. Get a price first, "
+                "then upload artwork."
+            ),
+        )
+    pending_quote.artwork_file_url = url
+    pending_quote.artwork_file_name = name
+    pending_quote.artwork_file_size = total
+    db.commit()
+
+    return {
+        "ok": True,
+        "url": url,
+        "filename": name,
+        "size": total,
+        "content_type": content_type,
+    }

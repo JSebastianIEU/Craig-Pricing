@@ -34,6 +34,7 @@ from pricing_engine import (
 )
 from llm.craig_agent import chat_with_craig
 from admin_api import router as admin_router
+from widget_api import router as widget_router
 
 
 app = FastAPI(
@@ -75,6 +76,7 @@ app.add_middleware(
 
 # Admin API consumed by Strategos Dashboard. JWT-protected per endpoint.
 app.include_router(admin_router)
+app.include_router(widget_router)
 
 
 @app.on_event("startup")
@@ -399,6 +401,18 @@ def quote_pdf(quote_id: int, db: Session = Depends(get_db)):
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 if os.path.isdir(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# Phase F — local-mode artwork serving. When CRAIG_ARTWORK_BUCKET is unset
+# (dev), uploads go to disk and we serve them from /artwork-local. In prod
+# the GCS signed URLs are absolute, so this mount is a no-op there.
+_ARTWORK_LOCAL_DIR = os.environ.get("CRAIG_ARTWORK_LOCAL_DIR", "/tmp/craig-artwork")
+if not os.environ.get("CRAIG_ARTWORK_BUCKET"):
+    os.makedirs(_ARTWORK_LOCAL_DIR, exist_ok=True)
+    app.mount(
+        "/artwork-local",
+        StaticFiles(directory=_ARTWORK_LOCAL_DIR),
+        name="artwork-local",
+    )
 
 
 @app.get("/", tags=["Frontend"])

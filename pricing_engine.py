@@ -230,6 +230,93 @@ def _get_vat_rate_for_product(
     return _get_vat_rate_for_category(db, product.category, organization_slug)
 
 
+# Standard Irish service-rate VAT — applied to shipping (a service line item).
+# Goods follow their own product-category rate; shipping doesn't.
+_SHIPPING_VAT_RATE = 0.23
+
+
+def apply_shipping_to_quote(
+    db: Session,
+    quote,
+    delivery_method: str | None,
+    organization_slug: str = DEFAULT_ORG_SLUG,
+) -> dict:
+    """
+    Phase F — compute and persist shipping costs on a Quote based on the
+    chosen `delivery_method`. Mutates `quote.shipping_cost_ex_vat`,
+    `quote.shipping_cost_inc_vat`, and `quote.total` in place. Caller
+    is responsible for committing.
+
+    Policy (per Justin / Roi):
+      - delivery_method != 'delivery'  -> €0 (collection or anything else)
+      - goods inc VAT >= threshold     -> €0 (free over the threshold)
+      - else                           -> flat fee inc VAT (default €15)
+
+    The threshold compares against `quote.final_price_inc_vat` (goods
+    only — does NOT include shipping itself, so adding shipping doesn't
+    push a €99 quote over €100 retroactively).
+
+    Both fee + threshold come from settings so Justin / future tenants
+    can tweak via the Settings tab without a code change:
+      - shipping_fee_inc_vat            (default 15.00)
+      - free_shipping_threshold_inc_vat (default 100.00)
+
+    Returns:
+      {
+        "shipping_ex_vat":  float,
+        "shipping_inc_vat": float,
+        "free_shipping":    bool,    # true iff the threshold was met
+        "applies":          bool,    # true iff delivery_method == 'delivery'
+      }
+    """
+    method = (delivery_method or "").strip().lower()
+    fee_inc = float(_get_setting(
+        db, "shipping_fee_inc_vat", 15.00, organization_slug=organization_slug,
+    ))
+    threshold_inc = float(_get_setting(
+        db, "free_shipping_threshold_inc_vat", 100.00, organization_slug=organization_slug,
+    ))
+
+    goods_inc = float(quote.final_price_inc_vat or 0.0)
+    applies = method == "delivery"
+    free_shipping = goods_inc >= threshold_inc
+
+    if applies and not free_shipping:
+        shipping_inc = round(fee_inc, 2)
+        shipping_ex = round(shipping_inc / (1 + _SHIPPING_VAT_RATE), 2)
+    else:
+        shipping_inc = 0.0
+        shipping_ex = 0.0
+
+    quote.shipping_cost_ex_vat = shipping_ex
+    quote.shipping_cost_inc_vat = shipping_inc
+    # Recompute total. `quote.total` historically equals
+    # `final_price_inc_vat + artwork_inc_vat`. Now we add shipping too.
+    artwork_inc_vat_implicit = max(
+        0.0,
+        float(quote.total or 0.0)
+        - float(quote.final_price_inc_vat or 0.0)
+        - float(getattr(quote, "shipping_cost_inc_vat", 0.0) or 0.0)
+        # Heuristic: artwork_cost stored ex VAT in our schema
+        # (see quote_*_format functions). The "old" total embedded
+        # artwork_cost_inc. We re-derive it as artwork_ex × 1.23.
+    )
+    artwork_ex = float(quote.artwork_cost or 0.0)
+    artwork_inc = round(artwork_ex * (1 + _SHIPPING_VAT_RATE), 2)
+
+    quote.total = round(
+        float(quote.final_price_inc_vat or 0.0) + artwork_inc + shipping_inc,
+        2,
+    )
+
+    return {
+        "shipping_ex_vat":  shipping_ex,
+        "shipping_inc_vat": shipping_inc,
+        "free_shipping":    bool(applies and free_shipping),
+        "applies":          applies,
+    }
+
+
 # =============================================================================
 # SMALL FORMAT
 # =============================================================================

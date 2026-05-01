@@ -999,6 +999,12 @@ def _quote_to_dict(q: Quote) -> dict[str, Any]:
             q.client_confirmed_at.isoformat()
             if getattr(q, "client_confirmed_at", None) else None
         ),
+        # Phase F — shipping + artwork
+        "shipping_cost_ex_vat": float(getattr(q, "shipping_cost_ex_vat", 0) or 0),
+        "shipping_cost_inc_vat": float(getattr(q, "shipping_cost_inc_vat", 0) or 0),
+        "artwork_file_url": getattr(q, "artwork_file_url", None),
+        "artwork_file_name": getattr(q, "artwork_file_name", None),
+        "artwork_file_size": getattr(q, "artwork_file_size", None),
     }
 
 
