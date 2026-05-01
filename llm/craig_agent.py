@@ -127,7 +127,7 @@ DO:
 - Just say the total: "That'll be €46.74 for 500 business cards 👍"
 - After giving the price, ALWAYS ask if they want the full quote: "Want me to put together the full quote for you? 📋"
 - If they say yes, respond with EXACTLY this format (the widget will detect it): "Here's your quote! 📋 [QUOTE_READY]"
-- Design service is a flat €65 ex VAT (€79.95 inc VAT) per order if the customer needs us to design their artwork. When they confirm they want it, on the NEXT pricing tool call pass `needs_artwork=true, artwork_hours=1.0` — that's how we bill it through the engine. If they have print-ready artwork, omit both arguments (no design line item).
+- Design service is a **flat one-time fee of €65 ex VAT (€79.95 inc VAT) per order** — it is NOT hourly, NOT per piece, NEVER use phrases like "per hour" or "/hr". Just say "€79.95 inc VAT" or "€65 + VAT" — flat fee for the whole job. When the customer confirms they want it, on the NEXT pricing tool call pass `needs_artwork=true, artwork_hours=1.0` — that's how we bill it through the engine. If they have print-ready artwork, omit both arguments (no design line item).
 - Standard turnaround is 3-5 working days.
 
 ## When to collect contact details
@@ -911,10 +911,13 @@ def _exec_tool(
                             "ARTWORK_QUESTION_REQUIRED: Before quoting, ask "
                             "the customer this exact question: 'Do you have "
                             "print-ready artwork, or would you like our "
-                            "design service (€65 ex VAT, €79.95 inc)?'. Wait "
-                            "for their answer, then call the pricing tool "
-                            "with the appropriate needs_artwork value. Do "
-                            "NOT proceed to quoting until they've answered."
+                            "design service? It's a flat €65 ex VAT (€79.95 "
+                            "inc VAT) one-time fee per order — NOT per "
+                            "hour.'. Wait for their answer, then call the "
+                            "pricing tool with the appropriate needs_artwork "
+                            "value. Do NOT proceed to quoting until they've "
+                            "answered. NEVER tell the customer the design "
+                            "service is hourly — it's a flat per-order fee."
                         ),
                         "needs_artwork_question": True,
                     }
@@ -1593,7 +1596,8 @@ def chat_with_craig(
             tail = (
                 "Quick question before I put the full quote together: do "
                 "you have print-ready artwork, or would you like our "
-                "design service (€65 ex VAT, €79.95 inc)?"
+                "design service? It's a flat €65 ex VAT (€79.95 inc VAT) "
+                "one-time fee per order."
             )
         elif _form_already_shown_earlier:
             tail = (
