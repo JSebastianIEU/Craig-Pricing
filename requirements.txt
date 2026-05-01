@@ -15,3 +15,9 @@ pg8000>=1.30.0
 # itself is sourced from CRAIG_SECRETS_KEY env var (mounted by Cloud Run from
 # Secret Manager). See secrets_crypto.py.
 cryptography>=42.0.0
+# Required by FastAPI for UploadFile / Form() endpoints — used by
+# widget_api.py for the artwork-upload endpoint (multipart/form-data).
+python-multipart>=0.0.9
+# Cloud Storage client for production artwork uploads. Falls back to
+# local disk in dev when CRAIG_ARTWORK_BUCKET is unset.
+google-cloud-storage>=2.14.0
