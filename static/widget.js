@@ -951,8 +951,12 @@
         .jp-form-label input,
         .jp-form-label select {
             font-family: inherit;
-            font-size: 13px;
-            padding: 8px 10px;
+            /* 16px is the iOS Safari minimum to avoid the auto-zoom-on-
+               focus behaviour. Anything below 16 = the page zooms in
+               when the input gets focus, which on a fullscreen widget
+               throws the X off-screen and makes the layout look broken. */
+            font-size: 16px;
+            padding: 10px 12px;
             border: 1px solid #d6dde9;
             border-radius: 8px;
             background: #fff;
@@ -1332,12 +1336,30 @@
         const _header = $('jpHeader');
         if (_header) {
             let _dragStartY = null;
+            const _isKeyboardUp = () => {
+                // If the visualViewport is much shorter than the
+                // window (>120px gap), the keyboard is up. Don't
+                // treat header drags as close-gestures while typing
+                // — Safari's keyboard-slide animations cause spurious
+                // touchmove events that closed the panel mid-typing.
+                if (!window.visualViewport) return false;
+                return (window.innerHeight - window.visualViewport.height) > 120;
+            };
             _header.addEventListener('touchstart', (e) => {
+                if (_isKeyboardUp()) return;
                 if (!e.touches || e.touches.length !== 1) return;
+                // Skip drag-close when the touch starts on the close
+                // button itself — that's a tap, not a drag.
+                const t = e.target;
+                if (t && t.closest && t.closest('.jp-close')) return;
                 _dragStartY = e.touches[0].clientY;
             }, { passive: true });
             _header.addEventListener('touchmove', (e) => {
                 if (_dragStartY == null) return;
+                if (_isKeyboardUp()) {
+                    _dragStartY = null;
+                    return;
+                }
                 if (!e.touches || e.touches.length !== 1) return;
                 const dy = e.touches[0].clientY - _dragStartY;
                 if (dy > 80) {
@@ -2174,14 +2196,12 @@
             const _adjustForKeyboard = () => {
                 if (panel.classList.contains('jp-hidden')) return;
                 if (window.innerWidth <= 480) {
-                    // v30.3 — pin BOTH top + height to the visual
-                    // viewport. On the second tap, iOS Safari scrolls
-                    // the layout viewport so the focused input is in
-                    // view, which shifts our top:0 anchor off-screen.
-                    // visualViewport.offsetTop tells us how much the
-                    // visual viewport is offset from the layout
-                    // viewport — pin to that and the panel always
-                    // covers exactly the visible area.
+                    // v30.4 — single source of truth: visualViewport
+                    // resize/scroll. No focus/blur handlers (they
+                    // fought each other and caused the chat-closes
+                    // bug). The vv events fire reliably on keyboard
+                    // open/close AND on Safari's layout-viewport
+                    // scroll, so we always know the visible area.
                     panel.style.top = _vv.offsetTop + 'px';
                     panel.style.height = _vv.height + 'px';
                     panel.style.bottom = 'auto';
@@ -2194,20 +2214,6 @@
             };
             _vv.addEventListener('resize', _adjustForKeyboard);
             _vv.addEventListener('scroll', _adjustForKeyboard);
-            input.addEventListener('focus', () => {
-                setTimeout(_adjustForKeyboard, 250);
-            });
-            input.addEventListener('blur', () => {
-                // Clear inline overrides so CSS top:0/bottom:0 anchors
-                // re-take effect once the keyboard goes down.
-                setTimeout(() => {
-                    if (window.innerWidth <= 480) {
-                        panel.style.top = '';
-                        panel.style.height = '';
-                        panel.style.bottom = '';
-                    }
-                }, 250);
-            });
         }
 
         async function bootChat() {
