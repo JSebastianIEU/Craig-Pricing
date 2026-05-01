@@ -1523,27 +1523,83 @@ def chat_with_craig(
                     order_confirmed = True
             elif result.get("success") and "final_price_ex_vat" in result:
                 quote_generated = True
-                # Save the quote to DB
-                q = Quote(
-                    organization_slug=organization_slug,
-                    conversation_id=conversation.id,
-                    product_key=args.get("product_key") or (
-                        f"booklet_{args.get('format')}_{args.get('binding')}"
-                        if tc.function.name == "quote_booklet" else None
-                    ),
-                    specs=args,
-                    base_price=result["base_price"],
-                    surcharges=result["surcharges_applied"],
-                    final_price_ex_vat=result["final_price_ex_vat"],
-                    vat_amount=result["vat_amount"],
-                    final_price_inc_vat=result["final_price_inc_vat"],
-                    artwork_cost=result.get("artwork_cost_ex_vat") or 0.0,
-                    total=result["total_inc_everything"],
-                    status="pending_approval",
+                # v26 — dedupe: DeepSeek often re-calls the pricing tool
+                # multiple times in the same conversation (after the
+                # customer uploads, after they say yes to "want full
+                # quote?", etc) with IDENTICAL specs. Without dedupe
+                # Justin sees 2-3 phantom rows in the dashboard for one
+                # customer order. If a pending Quote already exists on
+                # this conversation with the same product_key + specs,
+                # reuse it (and just update the artwork_cost / total in
+                # case the customer flipped between have-artwork and
+                # design-service mid-conversation).
+                _product_key = args.get("product_key") or (
+                    f"booklet_{args.get('format')}_{args.get('binding')}"
+                    if tc.function.name == "quote_booklet" else None
                 )
-                db.add(q)
-                db.flush()  # get the ID
-                last_quote_id = q.id
+                existing_match = (
+                    db.query(Quote)
+                    .filter_by(
+                        conversation_id=conversation.id,
+                        organization_slug=organization_slug,
+                        product_key=_product_key,
+                        status="pending_approval",
+                    )
+                    .all()
+                )
+                # Match on the spec subset that actually drives the
+                # price (product, qty, sides, finish). needs_artwork is
+                # NOT part of the match key — if the customer flipped,
+                # the existing row is updated with the new artwork_cost.
+                _spec_keys = ("product_key", "quantity", "double_sided", "finish",
+                              "format", "binding", "pages", "cover_type")
+                _match_sig = tuple(args.get(k) for k in _spec_keys)
+                reused = None
+                for cand in existing_match:
+                    cand_sig = tuple((cand.specs or {}).get(k) for k in _spec_keys)
+                    if cand_sig == _match_sig:
+                        reused = cand
+                        break
+
+                if reused is not None:
+                    # Update the price fields in case anything changed
+                    # (artwork_cost flip, surcharge tweak, etc.) and
+                    # preserve the artwork_files / shipping that may
+                    # already be on the row.
+                    reused.specs = args
+                    reused.base_price = result["base_price"]
+                    reused.surcharges = result["surcharges_applied"]
+                    reused.final_price_ex_vat = result["final_price_ex_vat"]
+                    reused.vat_amount = result["vat_amount"]
+                    reused.final_price_inc_vat = result["final_price_inc_vat"]
+                    reused.artwork_cost = result.get("artwork_cost_ex_vat") or 0.0
+                    reused.total = result["total_inc_everything"]
+                    db.flush()
+                    last_quote_id = reused.id
+                    print(
+                        f"[craig] DEDUPE: reused existing pending Quote "
+                        f"id={reused.id} on conv {conversation.id} "
+                        f"instead of creating a duplicate row.",
+                        flush=True,
+                    )
+                else:
+                    q = Quote(
+                        organization_slug=organization_slug,
+                        conversation_id=conversation.id,
+                        product_key=_product_key,
+                        specs=args,
+                        base_price=result["base_price"],
+                        surcharges=result["surcharges_applied"],
+                        final_price_ex_vat=result["final_price_ex_vat"],
+                        vat_amount=result["vat_amount"],
+                        final_price_inc_vat=result["final_price_inc_vat"],
+                        artwork_cost=result.get("artwork_cost_ex_vat") or 0.0,
+                        total=result["total_inc_everything"],
+                        status="pending_approval",
+                    )
+                    db.add(q)
+                    db.flush()  # get the ID
+                    last_quote_id = q.id
 
             messages.append({
                 "role": "tool",
