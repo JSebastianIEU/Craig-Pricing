@@ -436,7 +436,7 @@ def _public_artwork_entry(entry: dict, *, quote_id: int, idx: int) -> dict:
 
 @router.post(
     "/conversations/{cid}/upload-artwork",
-    dependencies=[Depends(rate_limit("widget_upload", 5))],
+    dependencies=[Depends(rate_limit("widget_upload", 20))],
 )
 async def upload_artwork(
     cid: int,
@@ -547,7 +547,7 @@ async def upload_artwork(
 
 @router.delete(
     "/conversations/{cid}/upload-artwork/{idx}",
-    dependencies=[Depends(rate_limit("widget_upload", 5))],
+    dependencies=[Depends(rate_limit("widget_upload", 20))],
 )
 def delete_artwork_file(
     cid: int,
