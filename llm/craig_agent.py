@@ -1658,6 +1658,17 @@ def chat_with_craig(
         if m.get("role") == "assistant"
     )
 
+    # Helper used by multiple gates below — returns True iff the
+    # most-recent quote on this conversation has any artwork files
+    # uploaded yet (either the array shape or the legacy singular cols).
+    def _quote_has_artwork_check() -> bool:
+        if last_quote_id is None:
+            return False
+        q = db.query(Quote).filter_by(id=last_quote_id).first()
+        if q is None:
+            return False
+        return bool((q.artwork_files or []) or (q.artwork_file_url or "").strip())
+
     # Phase F refined — when LLM emits [QUOTE_READY] but prerequisites
     # aren't met, strip the marker, KEEP the verbal price the LLM wrote,
     # and append the right next-step. Three states:
@@ -1682,12 +1693,27 @@ def chat_with_craig(
             flush=True,
         )
         kept = final_reply.replace("[QUOTE_READY]", "").strip()
+        # v25 — figure out if the customer still needs to upload artwork
+        # before the form. If they said "I have artwork" but haven't
+        # uploaded any files yet, surface the upload button INSTEAD of
+        # the customer-info form. The form goes out only after artwork
+        # is in (or the customer chose the design service).
+        _needs_upload_for_premature = (
+            conversation.customer_has_own_artwork is True
+            and last_quote_id is not None
+            and not _quote_has_artwork_check()
+        )
         if conversation.customer_has_own_artwork is None:
             tail = (
                 "Quick question before I put the full quote together: do "
                 "you have print-ready artwork, or would you like our "
                 "design service? It's a flat €65 ex VAT (€79.95 inc VAT) "
                 "one-time fee per order."
+            )
+        elif _needs_upload_for_premature:
+            tail = (
+                "Send your print-ready artwork over and I'll wrap up the "
+                "full quote \U0001f447\n\n[ARTWORK_UPLOAD]"
             )
         elif _form_already_shown_earlier:
             tail = (
@@ -1811,14 +1837,6 @@ def chat_with_craig(
         and (tc.get("result") or {}).get("success") is True
         for tc in tool_calls_audit
     )
-    def _quote_has_artwork_check() -> bool:
-        if last_quote_id is None:
-            return False
-        q = db.query(Quote).filter_by(id=last_quote_id).first()
-        if q is None:
-            return False
-        return bool((q.artwork_files or []) or (q.artwork_file_url or "").strip())
-
     _quote_has_artwork = _quote_has_artwork_check()
     _upload_marker_already = "[ARTWORK_UPLOAD]" in final_reply
     _upload_marker_earlier = any(
@@ -1865,15 +1883,27 @@ def chat_with_craig(
     ) and len(_last_user_msg) < 80  # short affirmatives only
     _form_marker_in_reply = "[CUSTOMER_FORM]" in final_reply
     _artwork_answered = conversation.customer_has_own_artwork is not None
+    # v25 — if the customer has own artwork but hasn't uploaded yet, the
+    # upload step MUST come before the customer-info form. Otherwise we
+    # collect delivery/email before the artwork is in, and Justin won't
+    # be able to send a draft with the artwork attached. Suppress the
+    # CUSTOMER_FORM auto-emit in that case — the ARTWORK_UPLOAD gate
+    # above (which already fired) will show the upload card, and the
+    # widget's post-upload synthetic chat turn will move things along.
+    _needs_upload_first = (
+        conversation.customer_has_own_artwork is True
+        and not _quote_has_artwork
+    )
     if (
         _channel_needs_gate
         and (_had_prior_quote or last_quote_id is not None)
         and not _funnel_complete
-        and _artwork_answered                  # NEW: gate requires explicit artwork answer
+        and _artwork_answered                  # gate requires explicit artwork answer
         and _looks_affirmative
         and not _form_marker_in_reply
         and not _form_already_shown_earlier
         and not order_confirmed
+        and not _needs_upload_first            # v25: upload before form
     ):
         print(
             f"[craig] AUTO-EMIT [CUSTOMER_FORM] — user accepted full "
@@ -1887,6 +1917,27 @@ def chat_with_craig(
         final_reply = (
             "Just need a few more details before I send the full quote 👇\n\n"
             "[CUSTOMER_FORM]"
+        )
+    elif (
+        _channel_needs_gate
+        and _needs_upload_first
+        and (_had_prior_quote or last_quote_id is not None)
+        and _looks_affirmative
+        and "[ARTWORK_UPLOAD]" not in final_reply
+        and not _upload_marker_earlier
+    ):
+        # The user said "yes" expecting to move forward but their artwork
+        # isn't uploaded yet. Replace the LLM's reply with a clean nudge
+        # that surfaces the upload button, no [CUSTOMER_FORM].
+        print(
+            f"[craig] AUTO-EMIT [ARTWORK_UPLOAD] (upload-first override) "
+            f"— user said yes but no artwork uploaded yet on conv "
+            f"{conversation.id}. channel={channel!r}",
+            flush=True,
+        )
+        final_reply = (
+            "Send your print-ready artwork over and I'll wrap up the "
+            "full quote 👇\n\n[ARTWORK_UPLOAD]"
         )
 
     # Always echo back the most recent quote_id so the widget can render
