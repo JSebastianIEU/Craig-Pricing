@@ -229,16 +229,45 @@ _ARTWORK_QUESTION_PATTERNS = (
     "do you have", "or would you like us to", "or need",
 )
 _ARTWORK_HAVE_AFFIRMATIVE = (
-    "i have", "i've got", "ive got", "got it", "got my own",
-    "have my own", "my own", "yes i have", "yeah i have",
-    "have artwork", "have the artwork", "have a design", "have one",
-    "yes have", "got artwork", "ready", "print-ready",
+    # All patterns MUST clearly reference artwork/design/print-readiness so
+    # they don't fire on generic phrases like "I have one question" or
+    # "ready to order". Tightened May 2026 after a sniff false-positive
+    # ("hey i need 100 business cards" matched "i need" -> stamped flag
+    # False -> bypassed the artwork-question guard, conv 97).
+    "i have artwork", "i have the artwork", "i have my own artwork",
+    "i've got artwork", "i've got my own artwork",
+    "ive got artwork", "ive got my own artwork",
+    "have my own artwork", "got my own artwork", "got the artwork",
+    "have artwork", "have the artwork", "got artwork",
+    "yes i have artwork", "yeah i have artwork",
+    "i have a design", "have a design ready", "have the design",
+    "i have the design",
+    "print-ready", "print ready", "ready to print", "ready-to-print",
+    "i'll send", "ill send", "i'll upload", "ill upload",
+    "i'll provide", "ill provide", "i can provide the artwork",
+    "i'll send the artwork", "ill send the artwork",
+    "i'll send the design", "ill send the design",
+    "i'll send the file", "ill send the file",
+    "i have the file", "ive got the file", "i've got the file",
+    "i have the files", "ive got the files", "i've got the files",
 )
 _ARTWORK_NEED_DESIGN = (
-    "need design", "need help", "design service", "design please",
-    "no i don", "no, design", "design it", "make one", "create one",
-    "i need", "no artwork", "don't have", "dont have",
-    "no, i need", "can you design", "can you make",
+    # All patterns MUST clearly reference design service (or explicitly
+    # disclaim having artwork) — never bare "i need" or "need help".
+    "need design", "need the design",
+    "need help with the design", "need help designing",
+    "need help with design", "need design help",
+    "design service", "want design", "want the design",
+    "design it for me", "design this for me", "design that for me",
+    "design the artwork", "design the file",
+    "you design", "you guys design", "you can design",
+    "i need it designed", "need it designed",
+    "no artwork", "don't have artwork", "dont have artwork",
+    "no design", "don't have a design", "dont have a design",
+    "don't have the artwork", "dont have the artwork",
+    "don't have the design", "dont have the design",
+    "can you design", "can you make me", "can you create the design",
+    "use your design", "your design service",
 )
 
 
