@@ -122,10 +122,10 @@
 
         /* Defensive reset for buttons inside the widget. Many host
            sites (especially WordPress themes) declare aggressive
-           `button { font-size: 28px; padding: 24px; ... }` rules that
-           cascade into our buttons. Reasserting these values inside
-           the widget scope keeps our explicit font-sizes (12-13px) in
-           charge instead of inheriting the host's. */
+           button-level font-size / padding overrides at the global
+           level. Reasserting inheritance here keeps our explicit
+           per-button font-sizes (12-13px) in charge instead of
+           inheriting the host site's. */
         .jp-widget button {
             font-family: inherit;
             font-size: inherit;
