@@ -94,6 +94,65 @@ async def get_message(message_id: str, token: str) -> dict[str, Any]:
         return r.json()
 
 
+def extract_attachments_from_message(msg_dict: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Pull a normalized list of attachment metadata out of a Missive message
+    dict (either the webhook payload's `message` block or the response
+    from `get_message`). Each entry has:
+        {
+            "id": <missive attachment id>,
+            "filename": <original filename, may be ""> ,
+            "media_type": <mime type, may be ""> ,
+            "size": <int bytes, may be 0>,
+            "url": <signed download URL or "">,
+        }
+
+    Defensive: never raises. Missing fields default to safe blanks.
+    """
+    out: list[dict[str, Any]] = []
+    raw_atts = msg_dict.get("attachments") if isinstance(msg_dict, dict) else None
+    if not isinstance(raw_atts, list):
+        return out
+    for a in raw_atts:
+        if not isinstance(a, dict):
+            continue
+        out.append({
+            "id": str(a.get("id") or ""),
+            "filename": str(a.get("filename") or a.get("name") or ""),
+            "media_type": str(a.get("media_type") or a.get("content_type") or ""),
+            "size": int(a.get("size") or 0),
+            # Missive's attachments come back with a signed URL on the
+            # message payload. Older docs use `url`; some shapes use
+            # `signed_url`. Accept either.
+            "url": str(a.get("url") or a.get("signed_url") or ""),
+        })
+    return out
+
+
+async def download_attachment_bytes(att: dict[str, Any], token: str) -> bytes:
+    """
+    Download an attachment's bytes given the dict shape returned by
+    `extract_attachments_from_message`. Tries the signed URL first
+    (no auth needed; cheaper) and falls back to the authenticated
+    `/v1/attachments/{id}` endpoint if the URL is missing.
+    """
+    url = (att.get("url") or "").strip()
+    att_id = (att.get("id") or "").strip()
+    async with httpx.AsyncClient(timeout=_REST_TIMEOUT) as client:
+        if url:
+            r = await client.get(url)
+            r.raise_for_status()
+            return r.content
+        if att_id:
+            r = await client.get(
+                f"{MISSIVE_BASE}/attachments/{att_id}",
+                headers=_auth_headers(token),
+            )
+            r.raise_for_status()
+            return r.content
+        raise ValueError("attachment dict has neither url nor id — cannot download")
+
+
 async def create_new_thread_draft(
     *,
     html_body: str,

@@ -440,6 +440,9 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "- \"Hey!\" / \"Hi there!\" / any exclamation-heavy greeting\n"
         "- Any emoji. Zero emojis. None. At all. Ever. Not even one.\n"
         "- \"[QUOTE_READY]\" as visible text to the user (it is a machine marker)\n"
+        "- \"[ARTWORK_CHOICE]\", \"[ARTWORK_UPLOAD]\", \"[CUSTOMER_FORM]\" — these\n"
+        "  are widget-only machine markers. Email customers will see them\n"
+        "  as literal text. Never emit any of them in an email reply.\n"
         "\n"
         "## Required structure of the reply\n"
         "1. One-line greeting: \"Hi <FirstName>,\" (from the sender envelope)\n"
@@ -515,6 +518,81 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "Best,\n"
         "Justin\n"
         "Just Print\n"
+        "\n"
+        "## Funnel collection (after the customer confirms they want to proceed)\n"
+        "AFTER the customer says \"yes / proceed / go ahead\" on a quote, AND\n"
+        "the conversation does NOT yet have all of: delivery_method,\n"
+        "delivery_address (if delivery), is_company, is_returning_customer\n"
+        " \u2014 your VERY NEXT email asks for the missing fields in ONE compact\n"
+        "paragraph. Do NOT ask one at a time across multiple emails. Do NOT\n"
+        "emit [QUOTE_READY] until you have the answers AND have called\n"
+        "save_customer_info.\n"
+        "\n"
+        "Example funnel-collection email (use bullets for clarity):\n"
+        "  Hi <Name>,\n"
+        "  Perfect \u2014 to lock in the order, can you confirm a few things:\n"
+        "    \u2022 Delivery (\u20ac15 inc VAT, free over \u20ac100 ex VAT) or collection\n"
+        "      from our Ballymount shop?\n"
+        "    \u2022 If delivery, the full address + Eircode.\n"
+        "    \u2022 Are you ordering as a company or individual? (for invoicing)\n"
+        "    \u2022 Have you ordered with Just Print before? If yes, what email\n"
+        "      did you use last time?\n"
+        "  Once I have these I'll finalise the quote and we'll get it moving.\n"
+        "  Best,\n"
+        "  Justin\n"
+        "  Just Print\n"
+        "\n"
+        "When the customer answers \u2014 even partially \u2014 CALL save_customer_info\n"
+        "with EVERYTHING they've told you:\n"
+        "  - name (from the envelope or the email body if they signed off)\n"
+        "  - email (already known from envelope; no need to ask)\n"
+        "  - is_company: true|false\n"
+        "  - is_returning_customer: true|false\n"
+        "  - past_customer_email: only when is_returning_customer=true\n"
+        "  - delivery_method: \"delivery\" | \"collect\"\n"
+        "  - delivery_address: {address1, address2?, address3?, address4?, postcode}\n"
+        "    (only when delivery_method=\"delivery\"; pass the bits they gave\n"
+        "    you, e.g. address1=\"1 Pearse Street\", postcode=\"D02 X123\")\n"
+        "Then reply briefly: confirm what you captured + add [QUOTE_READY] on\n"
+        "its own final line so the PDF re-renders with the shipping line.\n"
+        "\n"
+        "## Example \u2014 specs missing (no price possible yet)\n"
+        "Input: \"Hi, can you do 500 cards?\"\n"
+        "Good reply (NO pricing tool call, NO [QUOTE_READY], NO PDF mention):\n"
+        "Hi Juan,\n"
+        "\n"
+        "Thanks for getting in touch. Sure thing \u2014 to price it for you,\n"
+        "I just need a couple of details: single-sided or double-sided,\n"
+        "and any finish preference (matte, gloss, soft-touch, or standard)?\n"
+        "\n"
+        "Best,\n"
+        "Justin\n"
+        "Just Print\n"
+        "\n"
+        "## Example \u2014 multi-turn after artwork-attached email\n"
+        "(The server already ingested the customer's PDF/AI/etc. attachments\n"
+        "into the Quote BEFORE this turn ran. customer_has_own_artwork is\n"
+        "True. Pricing tool will be called with needs_artwork=false.)\n"
+        "Input: \"I've attached the artwork. Please proceed.\"\n"
+        "Good reply (call pricing, attach updated PDF, ask for funnel info):\n"
+        "Hi Juan,\n"
+        "\n"
+        "Got the artwork \u2014 thanks. The total stands at \u20ac<final_price_inc_vat>\n"
+        "including VAT for the 500 soft-touch double-sided business cards,\n"
+        "with the updated PDF attached.\n"
+        "\n"
+        "To finalise the order, can you confirm:\n"
+        "  \u2022 Delivery (\u20ac15 inc VAT, free over \u20ac100 ex VAT) or collection\n"
+        "    from our Ballymount shop?\n"
+        "  \u2022 If delivery, the address + Eircode.\n"
+        "  \u2022 Company or individual?\n"
+        "  \u2022 New customer or have you ordered with us before?\n"
+        "\n"
+        "Best,\n"
+        "Justin\n"
+        "Just Print\n"
+        "\n"
+        "[QUOTE_READY]\n"
         "############################################################\n"
     ),
     "web": (
@@ -1043,6 +1121,46 @@ def _exec_tool(
                             if (addr.get(k) or "").strip()
                         }
                     db.flush()
+
+                    # v29 — apply shipping to the latest pending Quote on
+                    # this conversation when delivery_method is now set.
+                    # Mirrors what widget_api.submit_customer_info does
+                    # for the form-based flow. Without this, an
+                    # email-channel customer who opted for delivery
+                    # would still see €0 shipping on the PDF.
+                    if (conv.delivery_method or "").strip() in ("delivery", "collect"):
+                        try:
+                            from pricing_engine import apply_shipping_to_quote
+                            pending = (
+                                db.query(Quote)
+                                .filter_by(
+                                    conversation_id=conv.id,
+                                    status="pending_approval",
+                                )
+                                .order_by(Quote.created_at.desc())
+                                .first()
+                            )
+                            if pending is not None:
+                                apply_shipping_to_quote(
+                                    db, pending,
+                                    conv.delivery_method,
+                                    organization_slug=conv.organization_slug,
+                                )
+                                db.flush()
+                                print(
+                                    f"[craig] save_customer_info: applied "
+                                    f"shipping to quote {pending.id} "
+                                    f"(method={conv.delivery_method})",
+                                    flush=True,
+                                )
+                        except Exception as ship_err:
+                            print(
+                                f"[craig] save_customer_info: shipping "
+                                f"application failed (non-fatal): "
+                                f"{ship_err!r}",
+                                flush=True,
+                            )
+
             return {
                 "saved": True,
                 "name": args.get("name"),

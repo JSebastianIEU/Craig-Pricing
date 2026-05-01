@@ -36,6 +36,13 @@ from llm.craig_agent import chat_with_craig
 from llm.inbound_classifier import classify_inbound_email, obvious_junk
 from admin_api import router as admin_router
 from widget_api import router as widget_router
+from widget_api import (
+    ALLOWED_EXTENSIONS as _ART_ALLOWED_EXTENSIONS,
+    ALLOWED_CONTENT_TYPES as _ART_ALLOWED_CONTENT_TYPES,
+    MAX_ARTWORK_FILES_PER_QUOTE as _ART_MAX_FILES,
+    _store_file as _store_artwork_file,
+)
+from db import parse_artwork_files
 
 
 app = FastAPI(
@@ -462,6 +469,67 @@ class _MissiveLogger:
 _mlog = _MissiveLogger()
 
 
+# ─── Inbound idempotency (in-memory) ────────────────────────────────
+# Missive retries failed webhooks up to 5x over ~8 minutes. If the
+# first delivery's background task is still running when the retry
+# arrives, both would draft a reply. We track every message_id we've
+# already drafted-for keyed by (org_slug, message_id). Cleared on
+# container restart — that's fine because Missive's retry window is
+# minutes and Cloud Run instances live longer than that for a warm
+# service. Capped at 1024 entries with FIFO eviction so memory stays
+# bounded even on a heavy day.
+_DRAFTED_FOR_MESSAGES: set[tuple[str, str]] = set()
+_DRAFTED_FOR_MESSAGES_ORDER: list[tuple[str, str]] = []
+_DRAFTED_FOR_MESSAGES_CAP = 1024
+
+
+def _mark_drafted(org_slug: str, message_id: str) -> bool:
+    """Returns True if this is the FIRST draft for (org, message) — i.e.
+    we should proceed with the work. Returns False on a duplicate
+    webhook delivery."""
+    key = (org_slug, message_id)
+    if key in _DRAFTED_FOR_MESSAGES:
+        return False
+    _DRAFTED_FOR_MESSAGES.add(key)
+    _DRAFTED_FOR_MESSAGES_ORDER.append(key)
+    while len(_DRAFTED_FOR_MESSAGES_ORDER) > _DRAFTED_FOR_MESSAGES_CAP:
+        old = _DRAFTED_FOR_MESSAGES_ORDER.pop(0)
+        _DRAFTED_FOR_MESSAGES.discard(old)
+    return True
+
+
+# ─── Inbound HTML quote-block stripping ─────────────────────────────
+# When a customer replies, Outlook/Gmail/Apple Mail prepend a
+# cascading quote of the prior thread ("On Mon X wrote: > > >"). We
+# already have the prior turns persisted in Conversation.messages, so
+# the quoted block adds nothing but noise + token cost. Strip the
+# first matching splitter and keep what came before.
+_QUOTE_THREAD_SPLITTERS = (
+    _re.compile(r"\n\s*On .+(?:wrote|escribi[oó]):.*", _re.IGNORECASE | _re.DOTALL),
+    _re.compile(r"\n\s*El .+(?:escribi[oó]).*", _re.IGNORECASE | _re.DOTALL),
+    _re.compile(r"\n\s*From: .+\s*\n", _re.IGNORECASE),
+    _re.compile(r"\n\s*De: .+\s*\n", _re.IGNORECASE),
+    _re.compile(r"\n-----Original Message-----.*", _re.DOTALL),
+    _re.compile(r"\n_{5,}\s*\n.*", _re.DOTALL),
+    _re.compile(r"\n\s*Sent from my .+", _re.IGNORECASE),  # "Sent from my iPhone"
+)
+
+
+def _strip_quoted_thread(body_text: str) -> str:
+    """Remove the cascading quoted-thread block that Outlook/Gmail
+    prepend onto replies. Keeps the customer's actual new text."""
+    if not body_text:
+        return body_text
+    earliest = len(body_text)
+    for splitter in _QUOTE_THREAD_SPLITTERS:
+        m = splitter.search(body_text)
+        if m and m.start() < earliest:
+            earliest = m.start()
+    if earliest < len(body_text):
+        return body_text[:earliest].rstrip()
+    return body_text
+
+
 def _handle_missive_event(org_slug: str, payload: dict) -> None:
     """
     Background task for an incoming Missive webhook.
@@ -504,6 +572,17 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
                 _msg.get("type"),
                 (payload.get("conversation") or {}).get("id"),
                 _msg.get("id"),
+            )
+            return
+
+        # ── v29: idempotency. Missive retries failed webhooks; if the
+        # first delivery's background task is still running, the retry
+        # would draft a duplicate reply. Skip if we've already processed
+        # this exact message_id.
+        if not _mark_drafted(org_slug, evt["message_id"]):
+            _mlog.info(
+                "%s: DUPLICATE webhook for message_id=%s — already drafted, skipping",
+                org_slug, evt["message_id"],
             )
             return
 
@@ -580,6 +659,28 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             body_text = _html_decode.unescape(body_text).strip()
             _mlog.info("%s: stripped HTML, body_len=%d", org_slug, len(body_text))
 
+        # v29 — strip the cascading quoted-thread block Outlook/Gmail
+        # prepend onto replies. We already have prior turns in
+        # Conversation.messages, so the quoted history is just noise.
+        _before_strip_len = len(body_text)
+        body_text = _strip_quoted_thread(body_text)
+        if len(body_text) < _before_strip_len:
+            _mlog.info(
+                "%s: stripped quoted thread, %d -> %d chars",
+                org_slug, _before_strip_len, len(body_text),
+            )
+
+        if not body_text.strip():
+            # Edge case: the body was 100% quoted thread (e.g. customer
+            # hit reply but didn't type anything). Fall back to the
+            # preview snippet so we have SOMETHING for the LLM, but log
+            # it — usually a customer error.
+            body_text = (evt.get("preview") or "").strip()
+            _mlog.info(
+                "%s: post-strip body was empty, falling back to preview",
+                org_slug,
+            )
+
         # find-or-create the Conversation. external_id keeps threading tidy:
         # every future email in the same Missive thread maps back to this
         # single Craig Conversation row. Resolved here (before the spam
@@ -640,10 +741,85 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             return
         # ── end v28 spam filter ───────────────────────────────────────
 
-        # `existing` and `conversation_id` were already resolved above
-        # (we needed them for the is_thread_reply signal). No-op here
-        # — kept as a comment so the original control flow comment
-        # stays anchored.
+        # ── v29: ingest customer-attached artwork files ──────────────
+        # If the inbound email has artwork attached (PDF, AI, INDD, JPG,
+        # PNG, etc.), pull the bytes from Missive and stash in the same
+        # GCS bucket the widget upload uses. We persist them onto the
+        # latest Quote on this conversation AFTER chat_with_craig runs
+        # (so the dedupe in pricing_tool sees a fresh quote and the LLM
+        # can include them in its reply).
+        inbound_attachments_to_store: list[dict] = []
+        try:
+            raw_atts = missive.extract_attachments_from_message(msg_obj)
+            for att in raw_atts:
+                fname = (att.get("filename") or "").strip()
+                ext = os.path.splitext(fname)[1].lower() if fname else ""
+                mt = (att.get("media_type") or "").lower()
+                # Allow either a whitelisted extension OR a whitelisted
+                # MIME type — different mail clients label things
+                # differently (e.g. .ai shows as application/postscript
+                # sometimes, application/illustrator other times).
+                if ext not in _ART_ALLOWED_EXTENSIONS and mt not in _ART_ALLOWED_CONTENT_TYPES:
+                    _mlog.info(
+                        "%s: skipping non-artwork attachment filename=%r media_type=%r",
+                        org_slug, fname, mt,
+                    )
+                    continue
+                # Cap on per-quote files mirrors widget upload.
+                if len(inbound_attachments_to_store) >= _ART_MAX_FILES:
+                    _mlog.warning(
+                        "%s: hit per-quote attachment cap, skipping rest",
+                        org_slug,
+                    )
+                    break
+                try:
+                    blob = asyncio.run(
+                        missive.download_attachment_bytes(att, token)
+                    )
+                except Exception as dl_err:
+                    _mlog.warning(
+                        "%s: attachment download failed (filename=%r): %s",
+                        org_slug, fname, dl_err,
+                    )
+                    continue
+                # Store under the same naming convention as widget upload
+                import uuid as _uuid
+                safe_name = (
+                    f"{evt['conversation_id']}-{_uuid.uuid4().hex[:12]}{ext or '.bin'}"
+                )
+                stored_url = _store_artwork_file(
+                    safe_name, blob, mt or "application/octet-stream",
+                )
+                import datetime as _dt
+                inbound_attachments_to_store.append({
+                    "url": stored_url,
+                    "filename": fname or "artwork",
+                    "size": len(blob),
+                    "content_type": mt or "application/octet-stream",
+                    "uploaded_at": _dt.datetime.utcnow().isoformat(timespec="seconds"),
+                })
+                _mlog.info(
+                    "%s: ingested attachment filename=%r size=%d -> %s",
+                    org_slug, fname, len(blob), stored_url,
+                )
+        except Exception as att_err:
+            _mlog.warning(
+                "%s: attachment ingestion failed (continuing): %s",
+                org_slug, att_err,
+            )
+
+        # If we got any artwork files, set the conversation flag to
+        # True so the pricing-tool guard recognizes the customer brought
+        # their own. Persist BEFORE chat_with_craig so the system prompt
+        # can see the right state.
+        if inbound_attachments_to_store and existing:
+            if existing.customer_has_own_artwork is not True:
+                existing.customer_has_own_artwork = True
+                db.flush()
+                _mlog.info(
+                    "%s: flipped customer_has_own_artwork=True (email had attachments)",
+                    org_slug,
+                )
 
         # If this is the first turn, stash the sender's email on the row so
         # [QUOTE_READY] gate opens automatically (Missive is inherently a
@@ -689,10 +865,55 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
                     conv.customer_name = evt["from_name"]
                 db.commit()
 
+        # ── v29: persist inbound artwork attachments onto the Quote ──
+        # We staged them in `inbound_attachments_to_store` BEFORE the
+        # LLM call (so `customer_has_own_artwork=True` was visible to
+        # the prompt). Now that the LLM may have created a fresh Quote
+        # row, append the files to it.
+        if inbound_attachments_to_store and result.get("quote_id"):
+            try:
+                quote_row = db.query(Quote).filter_by(id=result["quote_id"]).first()
+                if quote_row is not None:
+                    existing_files = parse_artwork_files(quote_row.artwork_files)
+                    new_files = existing_files + inbound_attachments_to_store
+                    # Cap at MAX
+                    new_files = new_files[:_ART_MAX_FILES]
+                    quote_row.artwork_files = new_files
+                    if new_files:
+                        first = new_files[0]
+                        quote_row.artwork_file_url = first.get("url")
+                        quote_row.artwork_file_name = first.get("filename") or "artwork"
+                        quote_row.artwork_file_size = int(first.get("size") or 0)
+                    db.commit()
+                    _mlog.info(
+                        "%s: persisted %d inbound attachment(s) on quote %s",
+                        org_slug, len(inbound_attachments_to_store), quote_row.id,
+                    )
+            except Exception as persist_err:
+                _mlog.warning(
+                    "%s: failed to persist inbound attachments on quote: %s",
+                    org_slug, persist_err,
+                )
+
         reply_text = (result.get("reply") or "").strip()
         if not reply_text:
             _mlog.info("%s: empty reply, not drafting", org_slug)
             return
+
+        # ── v29: defensive marker strip ───────────────────────────────
+        # The email system prompt forbids these widget-only markers, but
+        # DeepSeek occasionally drifts. Catch the 1% that slips through
+        # so the customer never sees literal "[ARTWORK_CHOICE]" in their
+        # inbox. ([QUOTE_READY] is handled separately below — it's a
+        # signal we care about, not just noise.)
+        for _stray_marker in ("[ARTWORK_CHOICE]", "[ARTWORK_UPLOAD]", "[CUSTOMER_FORM]"):
+            if _stray_marker in reply_text:
+                _mlog.warning(
+                    "%s: stripped stray marker %r from email reply",
+                    org_slug, _stray_marker,
+                )
+                reply_text = reply_text.replace(_stray_marker, "")
+        reply_text = reply_text.strip()
 
         # If a quote was generated this turn, attach the PDF to the draft
         # so the customer gets the full branded quote without a separate
