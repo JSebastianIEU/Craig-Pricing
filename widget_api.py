@@ -529,6 +529,23 @@ async def upload_artwork(
     pending_quote.artwork_file_url = new_list[0]["url"]
     pending_quote.artwork_file_name = new_list[0]["filename"]
     pending_quote.artwork_file_size = new_list[0]["size"]
+
+    # Phase G refined — uploading a file IS the answer to "do you have
+    # your own artwork?". Treat it as an implicit "yes I have artwork"
+    # and flip the conversation flag so Craig stops pestering the
+    # customer about it on the next turn. We also overwrite a previous
+    # False (e.g. customer first asked for the design service, then
+    # changed their mind and uploaded). The truth is what's in the file
+    # list — if files exist, they have artwork.
+    flag_was = conv.customer_has_own_artwork
+    conv.customer_has_own_artwork = True
+    if flag_was is not True:
+        print(
+            f"[widget_upload] conv={conv.id} customer_has_own_artwork "
+            f"{flag_was!r} -> True (flipped by upload)",
+            flush=True,
+        )
+
     db.commit()
 
     # Return the public-shape list so the widget can render it (proxy
@@ -542,6 +559,10 @@ async def upload_artwork(
             )
             for i, e in enumerate(new_list)
         ],
+        # Tells the widget "this upload counted as the customer's
+        # answer to the artwork question — you may auto-advance the
+        # chat (synthetic user turn) on the FIRST upload only".
+        "first_upload": (flag_was is not True),
     }
 
 

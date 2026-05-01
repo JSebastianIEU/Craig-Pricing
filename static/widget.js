@@ -1554,6 +1554,34 @@
                 const result = await resp.json();
                 uploadedFiles = result.files || [];
                 _renderArtworkCard(wrap);
+
+                // Phase G refined — uploading IS the answer to "do you
+                // have your own artwork?". On the FIRST successful upload
+                // (server tells us via first_upload=true), fire a
+                // synthetic chat turn so Craig acknowledges + auto-advances
+                // (re-prices with needs_artwork=false, asks "want full
+                // quote?", etc). This is the user's explicit ask:
+                // "subir los docs es el equivalente de que el usuario
+                // hubiese respondido en el chat".
+                if (result.first_upload && !_uploadAdvanceTriggered) {
+                    _uploadAdvanceTriggered = true;
+                    if (statusEl) {
+                        statusEl.classList.remove('err');
+                        statusEl.classList.add('ok');
+                        statusEl.style.display = 'block';
+                        statusEl.textContent = 'Got it — your artwork is in. One sec…';
+                    }
+                    // Synthetic user turn — no user bubble. Phrased like a
+                    // natural user message so the server-side artwork
+                    // sniffer (_ARTWORK_HAVE_AFFIRMATIVE) catches it and
+                    // stamps customer_has_own_artwork=True. Craig's next
+                    // turn will then re-price w/ needs_artwork=False (or
+                    // skip straight to "want full quote?") instead of
+                    // re-asking the artwork question.
+                    sendMessage(
+                        "I've uploaded my artwork."
+                    );
+                }
             } catch (e) {
                 if (statusEl) {
                     statusEl.textContent = 'Network error: ' + e.message;
@@ -1562,6 +1590,12 @@
                 }
             }
         }
+
+        // Tracks whether we've already fired the post-upload synthetic
+        // chat turn for this conversation. We only fire it once — the
+        // FIRST successful upload — so adding/removing more files
+        // doesn't keep poking Craig.
+        let _uploadAdvanceTriggered = false;
 
         async function _removeArtwork(idx, wrap) {
             try {

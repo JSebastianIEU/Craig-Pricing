@@ -1361,26 +1361,37 @@ def chat_with_craig(
     if sniffed_email or sniffed_phone:
         db.flush()
 
-    # Phase F refined — sniff the customer's answer to the artwork
-    # question if they're answering it. Only sets the field if the
-    # signal is unambiguous. The result is also surfaced as a soft
-    # system hint to the LLM below so it picks the right needs_artwork
-    # value when it next calls a pricing tool.
-    if conversation.customer_has_own_artwork is None:
-        last_asst = next(
-            (m.get("content") for m in reversed(prior_messages)
-             if m.get("role") == "assistant"),
-            None,
+    # Phase F refined / G — sniff the customer's answer to the artwork
+    # question. Phase G change: sniff runs EVERY turn (not just when
+    # the field is None) so the customer can REVERSE their answer
+    # ("wait, I have artwork" after previously saying "I need design").
+    # Only definitive direct phrases ("have my own", "need design") can
+    # override an existing value; bare yes/no requires an unanswered
+    # state to fire (avoids reading "yes confirm specs" as artwork yes).
+    last_asst = next(
+        (m.get("content") for m in reversed(prior_messages)
+         if m.get("role") == "assistant"),
+        None,
+    )
+    sniffed_art = _sniff_artwork_answer(last_asst, user_message)
+    if sniffed_art is not None:
+        # Distinguish definitive (direct phrase) vs ambiguous (bare yes/no)
+        # — only definitive signals can reverse a previously-set value.
+        user_lower = (user_message or "").lower().strip()
+        is_definitive = (
+            any(p in user_lower for p in _ARTWORK_HAVE_AFFIRMATIVE)
+            or any(p in user_lower for p in _ARTWORK_NEED_DESIGN)
         )
-        sniffed_art = _sniff_artwork_answer(last_asst, user_message)
-        if sniffed_art is not None:
-            conversation.customer_has_own_artwork = sniffed_art
-            db.flush()
-            print(
-                f"[craig] artwork sniff: conv={conversation.id} "
-                f"customer_has_own_artwork={sniffed_art}",
-                flush=True,
-            )
+        if conversation.customer_has_own_artwork is None or is_definitive:
+            previous = conversation.customer_has_own_artwork
+            if previous != sniffed_art:
+                conversation.customer_has_own_artwork = sniffed_art
+                db.flush()
+                print(
+                    f"[craig] artwork sniff: conv={conversation.id} "
+                    f"customer_has_own_artwork={previous!r} -> {sniffed_art}",
+                    flush=True,
+                )
 
     # Inject artwork status as a developer-side hint so the LLM picks the
     # right needs_artwork on its next pricing tool call. Soft instruction
@@ -1754,11 +1765,16 @@ def chat_with_craig(
         final_reply += "\n[QUOTE_READY]"
 
     # ── Phase F: auto-emit [ARTWORK_UPLOAD] when LLM forgets ──────────
-    # Tightened in v24 — we ONLY fire this when the customer EXPLICITLY
-    # said they have own artwork (server-side sniff stamped
-    # customer_has_own_artwork=True). The previous gate fired on the
-    # default needs_artwork=False, which made the upload button appear
-    # on every quote even when the customer hadn't been asked.
+    # v25 — we fire this when customer_has_own_artwork is NOT False (i.e.
+    # True OR None). Rationale: if the field is None it means the LLM
+    # priced without ever properly asking the artwork question (the
+    # pricing-tool guard SHOULD prevent this, but bypasses happen — old
+    # conversations, prior-quote re-routes, etc). In that case showing
+    # the upload button is the safer fallback: the customer can upload
+    # if they have artwork (which auto-flips the flag to True via the
+    # upload endpoint), or ignore the button and just answer "I want
+    # design service" in chat (which sniffs to False). When the flag is
+    # explicitly False (design service), we never show the upload button.
     _pricing_called_this_turn = any(
         (tc.get("tool") or "").lower() in (
             "quote_small_format", "quote_large_format", "quote_booklet",
@@ -1766,16 +1782,15 @@ def chat_with_craig(
         and (tc.get("result") or {}).get("success") is True
         for tc in tool_calls_audit
     )
-    _quote_has_artwork = bool(
-        last_quote_id is not None
-        and (
-            db.query(Quote)
-            .filter_by(id=last_quote_id)
-            .first()
-            .artwork_file_url
-            if last_quote_id is not None else False
-        )
-    ) if last_quote_id is not None else False
+    def _quote_has_artwork_check() -> bool:
+        if last_quote_id is None:
+            return False
+        q = db.query(Quote).filter_by(id=last_quote_id).first()
+        if q is None:
+            return False
+        return bool((q.artwork_files or []) or (q.artwork_file_url or "").strip())
+
+    _quote_has_artwork = _quote_has_artwork_check()
     _upload_marker_already = "[ARTWORK_UPLOAD]" in final_reply
     _upload_marker_earlier = any(
         "[ARTWORK_UPLOAD]" in (m.get("content") or "")
@@ -1784,7 +1799,7 @@ def chat_with_craig(
     )
     if (
         _channel_needs_gate
-        and conversation.customer_has_own_artwork is True   # explicit signal
+        and conversation.customer_has_own_artwork is not False  # True or None
         and _pricing_called_this_turn                       # quote just generated
         and not _quote_has_artwork                          # not uploaded yet
         and not _upload_marker_already

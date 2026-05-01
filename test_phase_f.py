@@ -319,6 +319,63 @@ def test_upload_persists_url_on_quote():
         assert q.artwork_file_size == len(fake_pdf)
 
 
+def test_upload_flips_customer_has_own_artwork_to_true():
+    """Phase G refined — uploading a file IS the answer to the artwork
+    question. The upload endpoint flips customer_has_own_artwork to True
+    even if it was previously None or False."""
+    cid, eid = _seed_conv_and_quote()
+    # Pre-condition: flag is None
+    with db_session() as db:
+        conv = db.query(Conversation).filter_by(id=cid).first()
+        assert conv.customer_has_own_artwork is None
+
+    r = client.post(
+        f"/widget/conversations/{cid}/upload-artwork",
+        data={"external_id": eid},
+        files={"file": ("art.pdf", io.BytesIO(b"%PDF-1.4\n"), "application/pdf")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["first_upload"] is True
+
+    with db_session() as db:
+        conv = db.query(Conversation).filter_by(id=cid).first()
+        assert conv.customer_has_own_artwork is True
+
+    # Second upload should NOT mark as first_upload again
+    _rl_reset()
+    r2 = client.post(
+        f"/widget/conversations/{cid}/upload-artwork",
+        data={"external_id": eid},
+        files={"file": ("back.pdf", io.BytesIO(b"%PDF-1.4\n"), "application/pdf")},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["first_upload"] is False
+
+
+def test_upload_overrides_previous_false_artwork_flag():
+    """If the customer first asked for the design service then changed
+    their mind and uploaded, the upload should still flip the flag to
+    True (truth = what's in the file list)."""
+    cid, eid = _seed_conv_and_quote()
+    with db_session() as db:
+        conv = db.query(Conversation).filter_by(id=cid).first()
+        conv.customer_has_own_artwork = False  # design service path
+        db.commit()
+
+    r = client.post(
+        f"/widget/conversations/{cid}/upload-artwork",
+        data={"external_id": eid},
+        files={"file": ("changed-mind.pdf", io.BytesIO(b"x"), "application/pdf")},
+    )
+    assert r.status_code == 200
+    assert r.json()["first_upload"] is True
+
+    with db_session() as db:
+        conv = db.query(Conversation).filter_by(id=cid).first()
+        assert conv.customer_has_own_artwork is True
+
+
 def test_upload_appends_multiple_files():
     """Phase G — successive uploads APPEND to the list, not replace."""
     cid, eid = _seed_conv_and_quote()
