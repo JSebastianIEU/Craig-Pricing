@@ -111,11 +111,27 @@
             right: 0;
             z-index: 999999;
             font-family: 'Poppins', 'Roboto', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            font-size: 14px;
+            line-height: 1.4;
             color: #040f2a;
         }
 
         .jp-widget *, .jp-widget *::before, .jp-widget *::after {
             box-sizing: border-box;
+        }
+
+        /* Defensive reset for buttons inside the widget. Many host
+           sites (especially WordPress themes) declare aggressive
+           `button { font-size: 28px; padding: 24px; ... }` rules that
+           cascade into our buttons. Reasserting these values inside
+           the widget scope keeps our explicit font-sizes (12-13px) in
+           charge instead of inheriting the host's. */
+        .jp-widget button {
+            font-family: inherit;
+            font-size: inherit;
+            line-height: inherit;
+            letter-spacing: normal;
+            text-transform: none;
         }
 
         /* ===== Floating bubble (closed state) ===== */
@@ -1005,6 +1021,8 @@
             padding: 12px 16px;
             text-align: left;
             font-family: inherit;
+            font-size: 13px;
+            line-height: 1.4;
             cursor: pointer;
             transition: all 0.15s ease;
         }

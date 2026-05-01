@@ -33,6 +33,7 @@ from pricing_engine import (
     quote_small_format, quote_large_format, quote_booklet, list_products,
 )
 from llm.craig_agent import chat_with_craig
+from llm.inbound_classifier import classify_inbound_email, obvious_junk
 from admin_api import router as admin_router
 from widget_api import router as widget_router
 
@@ -581,7 +582,8 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
 
         # find-or-create the Conversation. external_id keeps threading tidy:
         # every future email in the same Missive thread maps back to this
-        # single Craig Conversation row.
+        # single Craig Conversation row. Resolved here (before the spam
+        # filter) so we can decide is_thread_reply for the LLM gate.
         existing = (
             db.query(Conversation)
             .filter_by(
@@ -592,6 +594,56 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             .first()
         )
         conversation_id = existing.id if existing else None
+
+        # ── v28: spam / non-quote filter ──────────────────────────────
+        # 1. Hard-reject prefilter (no-reply senders, bouncebacks,
+        #    auto-replies, mailing-list headers). Runs before the LLM
+        #    so we don't burn tokens on obvious junk.
+        # 2. LLM classifier (DeepSeek) decides whether the email is a
+        #    real quote inquiry. Replies to threads where Craig already
+        #    drafted are auto-passed (no LLM call).
+        # 3. Both filters fail-OPEN — any error defaults to passing the
+        #    email through. Better to draft a draft Justin can throw
+        #    away than to silently swallow a real lead.
+        msg_headers = msg_obj.get("headers") if isinstance(msg_obj, dict) else None
+        junk_reason = obvious_junk(
+            from_address=evt["from_address"],
+            subject=evt["subject"],
+            headers=msg_headers if isinstance(msg_headers, dict) else None,
+        )
+        if junk_reason:
+            _mlog.info(
+                "%s: HARD-REJECT inbound (conv_id=%s): %s",
+                org_slug, conversation_id, junk_reason,
+            )
+            return
+
+        prior_assistant_msgs = 0
+        if existing:
+            prior_assistant_msgs = sum(
+                1 for m in (existing.messages or [])
+                if m.get("role") == "assistant"
+            )
+        is_thread_reply = prior_assistant_msgs > 0
+
+        verdict = classify_inbound_email(
+            from_address=evt["from_address"],
+            subject=evt["subject"],
+            body_preview=body_text[:800],
+            is_thread_reply=is_thread_reply,
+        )
+        if not verdict.get("is_quote_inquiry", True):
+            _mlog.info(
+                "%s: LLM-REJECT inbound (conv_id=%s) reason=%r",
+                org_slug, conversation_id, verdict.get("reason"),
+            )
+            return
+        # ── end v28 spam filter ───────────────────────────────────────
+
+        # `existing` and `conversation_id` were already resolved above
+        # (we needed them for the is_thread_reply signal). No-op here
+        # — kept as a comment so the original control flow comment
+        # stays anchored.
 
         # If this is the first turn, stash the sender's email on the row so
         # [QUOTE_READY] gate opens automatically (Missive is inherently a
