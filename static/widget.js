@@ -966,6 +966,49 @@
         .jp-upload-status.ok { background: #f0fdf4; color: #166534; }
         .jp-upload-status.err { background: #fef2f2; color: #991b1b; }
 
+        /* ===== Phase G v26 — Artwork-choice buttons ===== */
+        .jp-choice-card {
+            align-self: flex-start;
+            max-width: 92%;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin: 4px 0 6px;
+            animation: jp-msg-in 0.35s ease-out;
+        }
+        .jp-choice-btn {
+            background: #fff;
+            border: 1.5px solid #e1e6f0;
+            border-radius: 12px;
+            padding: 12px 16px;
+            text-align: left;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .jp-choice-btn:hover:not(:disabled) {
+            border-color: #040f2a;
+            background: #f6f8fc;
+        }
+        .jp-choice-btn:disabled { cursor: default; }
+        .jp-choice-btn-selected {
+            background: #040f2a !important;
+            border-color: #040f2a !important;
+        }
+        .jp-choice-btn-selected .jp-choice-title,
+        .jp-choice-btn-selected .jp-choice-sub { color: #fefefe; }
+        .jp-choice-btn-faded { opacity: 0.4; }
+        .jp-choice-title {
+            font-weight: 600;
+            font-size: 13px;
+            color: #040f2a;
+        }
+        .jp-choice-sub {
+            font-size: 11px;
+            color: #6b7a99;
+            margin-top: 2px;
+        }
+
         /* Phase G — multi-file artwork list */
         .jp-upload-list {
             margin-top: 10px;
@@ -1681,6 +1724,57 @@
             messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
+        // ─────────────────────────────────────────────────────────────
+        // Phase G v26 — artwork-choice buttons
+        //
+        // Free-text "do you have artwork or want design?" was a UX
+        // dead-end: customers typed "yes I have mine" / "I have it" /
+        // "yeah" — all of which the server-side sniffer had to
+        // pattern-match. With the explicit two-button choice the
+        // answer is unambiguous and the conversation moves forward
+        // without typos / clarification rounds.
+        // ─────────────────────────────────────────────────────────────
+        function showArtworkChoiceButtons() {
+            if (document.getElementById('jpArtworkChoice')) return;
+            const wrap = document.createElement('div');
+            wrap.className = 'jp-choice-card';
+            wrap.id = 'jpArtworkChoice';
+            wrap.innerHTML = (
+                '<button type="button" class="jp-choice-btn" data-choice="have">'
+                + '  <div class="jp-choice-title">I have my own artwork</div>'
+                + '  <div class="jp-choice-sub">PDF, AI, INDD, JPG, PNG…</div>'
+                + '</button>'
+                + '<button type="button" class="jp-choice-btn" data-choice="design">'
+                + '  <div class="jp-choice-title">I need your design service</div>'
+                + '  <div class="jp-choice-sub">Flat €65 ex VAT (€79.95 inc)</div>'
+                + '</button>'
+            );
+            messagesEl.appendChild(wrap);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+
+            wrap.querySelectorAll('.jp-choice-btn').forEach((btn) => {
+                btn.addEventListener('click', () => {
+                    const choice = btn.getAttribute('data-choice');
+                    // Disable both buttons so the customer can't
+                    // double-click. Visual feedback happens via the
+                    // synthetic chat reply below.
+                    wrap.querySelectorAll('.jp-choice-btn').forEach((b) => {
+                        b.disabled = true;
+                        if (b === btn) b.classList.add('jp-choice-btn-selected');
+                        else b.classList.add('jp-choice-btn-faded');
+                    });
+                    // Show the choice as a user bubble for transcript
+                    // clarity, then fire it as a chat turn so the
+                    // server-side sniffer stamps the flag.
+                    const phrase = choice === 'have'
+                        ? "I have my own artwork"
+                        : "I need your design service";
+                    addMsg(phrase, 'user');
+                    sendMessage(phrase);
+                });
+            });
+        }
+
         function _legacy_unused_showArtworkUploadButton() {
             const wrap = document.createElement('div');
             wrap.className = 'jp-upload-card';
@@ -1816,6 +1910,7 @@
         // repeats them in subsequent turns.
         let formAlreadyShown = false;
         let uploadAlreadyShown = false;
+        let artworkChoiceShown = false;
         let uploadedArtwork = null;  // { url, filename, size }
 
         async function sendMessage(messageOverride) {
@@ -1852,15 +1947,22 @@
             const rawReply = data.reply || '';
             const wantsForm = rawReply.indexOf('[CUSTOMER_FORM]') !== -1;
             const wantsUpload = rawReply.indexOf('[ARTWORK_UPLOAD]') !== -1;
+            const wantsArtworkChoice = rawReply.indexOf('[ARTWORK_CHOICE]') !== -1;
             // Strip ALL machine markers from what the customer sees.
             const cleanReply = rawReply
                 .replace(/\[QUOTE_READY\]/g, '')
                 .replace(/\[CUSTOMER_FORM\]/g, '')
                 .replace(/\[ARTWORK_UPLOAD\]/g, '')
+                .replace(/\[ARTWORK_CHOICE\]/g, '')
                 .trim();
             const wantsQuote = rawReply.indexOf('[QUOTE_READY]') !== -1 && lastQuoteId;
 
             if (cleanReply) addMsg(cleanReply, 'assistant');
+
+            if (wantsArtworkChoice && !artworkChoiceShown) {
+                artworkChoiceShown = true;
+                showArtworkChoiceButtons();
+            }
 
             if (wantsUpload && !uploadAlreadyShown) {
                 uploadAlreadyShown = true;

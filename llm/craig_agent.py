@@ -1603,6 +1603,28 @@ def chat_with_craig(
                 )
                 final_reply = kept[0]
 
+        # v26 — Replace Craig's free-text artwork question with our own
+        # canned copy and the [ARTWORK_CHOICE] marker. The widget renders
+        # two buttons (have-artwork / need-design) in place of the free
+        # text — removes ambiguity ("yes I have one" / "yeah" / etc.)
+        # and makes the next step a single click. Only emit if the marker
+        # isn't already there (idempotent), and only on the WEB channel
+        # (email/SMS can't render buttons).
+        if (
+            (channel or "").lower() in ("web", "")
+            and "[ARTWORK_CHOICE]" not in final_reply
+        ):
+            final_reply = (
+                "Quick question before I price it 👇 Do you have your "
+                "own print-ready artwork, or would you like our design "
+                "service?\n\n[ARTWORK_CHOICE]"
+            )
+            print(
+                f"[craig] EMITTED [ARTWORK_CHOICE] on conv "
+                f"{conversation.id}.",
+                flush=True,
+            )
+
     # Hallucinated-quote gate.
     #
     # If the LLM emitted [QUOTE_READY] without any real Quote row existing
@@ -1845,7 +1867,31 @@ def chat_with_craig(
         for m in (conversation.messages or [])
         if m.get("role") == "assistant"
     )
-    if (
+    # v26 — when pricing JUST ran AND the customer has their own artwork
+    # AND no files uploaded yet, REPLACE Craig's verbal price with a
+    # clean "send your artwork" prompt + the upload button. The price
+    # comes AFTER the customer uploads (they get a synthetic chat turn
+    # from the widget that triggers Craig's natural "perfect — that'll
+    # be €X" reply). User explicit ask: the upload step should come
+    # BEFORE the price, not bundled with it.
+    _upload_first_replace = (
+        _channel_needs_gate
+        and conversation.customer_has_own_artwork is True
+        and _pricing_called_this_turn
+        and not _quote_has_artwork
+    )
+    if _upload_first_replace:
+        print(
+            f"[craig] UPLOAD-FIRST: replacing verbal price with upload "
+            f"prompt on conv {conversation.id}. The price will surface "
+            f"after the customer uploads their artwork.",
+            flush=True,
+        )
+        final_reply = (
+            "Got it 👍 send your print-ready artwork over and I'll "
+            "wrap up the price 👇\n\n[ARTWORK_UPLOAD]"
+        )
+    elif (
         _channel_needs_gate
         and conversation.customer_has_own_artwork is not False  # True or None
         and _pricing_called_this_turn                       # quote just generated
