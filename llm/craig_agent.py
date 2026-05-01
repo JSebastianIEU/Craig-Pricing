@@ -251,6 +251,10 @@ _ARTWORK_HAVE_AFFIRMATIVE = (
     "i'll send the file", "ill send the file",
     "i have the file", "ive got the file", "i've got the file",
     "i have the files", "ive got the files", "i've got the files",
+    # Synthetic phrases the widget fires after a successful upload
+    "i've uploaded", "ive uploaded", "uploaded my artwork",
+    "uploaded the artwork", "uploaded my files", "uploaded the files",
+    "uploaded my design",
 )
 _ARTWORK_NEED_DESIGN = (
     # All patterns MUST clearly reference design service (or explicitly
@@ -1681,16 +1685,28 @@ def chat_with_craig(
         if m.get("role") == "assistant"
     )
 
-    # Helper used by multiple gates below — returns True iff the
-    # most-recent quote on this conversation has any artwork files
-    # uploaded yet (either the array shape or the legacy singular cols).
+    # Helper used by multiple gates below — returns True iff ANY quote
+    # on this conversation has artwork files uploaded yet (array shape
+    # OR legacy singular cols). v26 — broadened from "last quote only"
+    # to "any quote": when DeepSeek calls the pricing tool a SECOND time
+    # in the conversation (e.g. customer typed something new after
+    # uploading), a fresh Quote row is created with no files. The
+    # previous "last quote only" check then thought no artwork existed
+    # and re-emitted the upload prompt, asking the customer to upload
+    # again. By scanning all quotes on the conv we catch the upload
+    # that landed on the FIRST quote and skip the duplicate prompt.
     def _quote_has_artwork_check() -> bool:
-        if last_quote_id is None:
-            return False
-        q = db.query(Quote).filter_by(id=last_quote_id).first()
-        if q is None:
-            return False
-        return bool(parse_artwork_files(q.artwork_files) or (q.artwork_file_url or "").strip())
+        rows = (
+            db.query(Quote)
+            .filter_by(conversation_id=conversation.id)
+            .all()
+        )
+        for q in rows:
+            if parse_artwork_files(q.artwork_files):
+                return True
+            if (q.artwork_file_url or "").strip():
+                return True
+        return False
 
     # Phase F refined — when LLM emits [QUOTE_READY] but prerequisites
     # aren't met, strip the marker, KEEP the verbal price the LLM wrote,

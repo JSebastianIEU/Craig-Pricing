@@ -955,6 +955,28 @@
         }
         .jp-upload-btn:hover { opacity: 0.9; }
         .jp-upload-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .jp-upload-btn-secondary {
+            background: #fff;
+            color: #040f2a;
+            border: 1.5px solid #e1e6f0;
+        }
+        .jp-upload-btn-secondary:hover { background: #f6f8fc; }
+        .jp-upload-submit {
+            margin-top: 10px;
+            width: 100%;
+            background: #040f2a;
+            color: #fefefe;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.15s ease;
+        }
+        .jp-upload-submit:hover:not(:disabled) { opacity: 0.92; }
+        .jp-upload-submit:disabled { opacity: 0.5; cursor: not-allowed; }
         .jp-upload-status {
             margin-top: 8px;
             font-size: 12px;
@@ -1596,35 +1618,16 @@
                 }
                 const result = await resp.json();
                 uploadedFiles = result.files || [];
-                _renderArtworkCard(wrap);
-
-                // Phase G refined — uploading IS the answer to "do you
-                // have your own artwork?". On the FIRST successful upload
-                // (server tells us via first_upload=true), fire a
-                // synthetic chat turn so Craig acknowledges + auto-advances
-                // (re-prices with needs_artwork=false, asks "want full
-                // quote?", etc). This is the user's explicit ask:
-                // "subir los docs es el equivalente de que el usuario
-                // hubiese respondido en el chat".
-                if (result.first_upload && !_uploadAdvanceTriggered) {
-                    _uploadAdvanceTriggered = true;
-                    if (statusEl) {
-                        statusEl.classList.remove('err');
-                        statusEl.classList.add('ok');
-                        statusEl.style.display = 'block';
-                        statusEl.textContent = 'Got it — your artwork is in. One sec…';
-                    }
-                    // Synthetic user turn — no user bubble. Phrased like a
-                    // natural user message so the server-side artwork
-                    // sniffer (_ARTWORK_HAVE_AFFIRMATIVE) catches it and
-                    // stamps customer_has_own_artwork=True. Craig's next
-                    // turn will then re-price w/ needs_artwork=False (or
-                    // skip straight to "want full quote?") instead of
-                    // re-asking the artwork question.
-                    sendMessage(
-                        "I've uploaded my artwork."
-                    );
+                if (statusEl && result.files && result.files.length) {
+                    statusEl.classList.remove('err');
+                    statusEl.classList.add('ok');
+                    statusEl.style.display = 'block';
+                    statusEl.textContent = 'Uploaded ✓ Add another file or click Submit to continue.';
                 }
+                _renderArtworkCard(wrap);
+                // Note: post-upload advance no longer auto-fires. The
+                // Submit button on the upload card is the explicit
+                // confirmation. See _submitArtwork() below.
             } catch (e) {
                 if (statusEl) {
                     statusEl.textContent = 'Network error: ' + e.message;
@@ -1634,11 +1637,32 @@
             }
         }
 
-        // Tracks whether we've already fired the post-upload synthetic
-        // chat turn for this conversation. We only fire it once — the
-        // FIRST successful upload — so adding/removing more files
-        // doesn't keep poking Craig.
-        let _uploadAdvanceTriggered = false;
+        // Tracks whether the customer has already clicked Submit on
+        // the upload card. Once submitted, the button hides and the
+        // synthetic chat turn fires once — repeated clicks no-op.
+        let _uploadSubmitted = false;
+
+        function _submitArtwork(wrap) {
+            if (_uploadSubmitted) return;
+            if (!uploadedFiles.length) return;
+            _uploadSubmitted = true;
+            // Visually lock the card so the customer can't keep
+            // adding/removing after they've committed.
+            wrap.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+            const statusEl = document.getElementById('jpUploadStatus');
+            if (statusEl) {
+                statusEl.classList.remove('err');
+                statusEl.classList.add('ok');
+                statusEl.style.display = 'block';
+                statusEl.textContent = uploadedFiles.length === 1
+                    ? 'Submitted ✓ One sec…'
+                    : 'Submitted ✓ ' + uploadedFiles.length + ' files. One sec…';
+            }
+            // Synthetic user turn — no user bubble. Phrased so the
+            // server-side artwork sniffer matches and Craig's next
+            // turn gives the price + 'want full quote?'.
+            sendMessage("I've uploaded my artwork.");
+        }
 
         async function _removeArtwork(idx, wrap) {
             try {
@@ -1672,6 +1696,7 @@
                 : '';
             const canAddMore = uploadedFiles.length < ARTWORK_MAX_FILES;
             const btnLabel = uploadedFiles.length ? 'Add another' : 'Choose files';
+            const hasFiles = uploadedFiles.length > 0;
             wrap.innerHTML = (
                 '<div class="jp-upload-row">'
                 + '  <div class="jp-upload-icon">📎</div>'
@@ -1683,7 +1708,7 @@
                 + '    </div>'
                 + '  </div>'
                 + (canAddMore
-                    ? '  <button type="button" class="jp-upload-btn" id="jpUploadBtn">' + btnLabel + '</button>'
+                    ? '  <button type="button" class="jp-upload-btn jp-upload-btn-secondary" id="jpUploadBtn">' + btnLabel + '</button>'
                       + '  <input type="file" id="jpUploadInput" multiple '
                       + 'accept=".pdf,.ai,.indd,.jpg,.jpeg,.png,.eps,.tiff,.tif,.psd,.svg" '
                       + 'style="display:none;">'
@@ -1691,6 +1716,10 @@
                 )
                 + '</div>'
                 + filesHtml
+                + (hasFiles
+                    ? '<button type="button" class="jp-upload-submit" id="jpUploadSubmit">Submit & continue →</button>'
+                    : ''
+                )
                 + '<div class="jp-upload-status" id="jpUploadStatus" style="display:none;"></div>'
             );
             const btn = document.getElementById('jpUploadBtn');
@@ -1704,6 +1733,10 @@
                     }
                     fileInput.value = '';
                 });
+            }
+            const submitBtn = document.getElementById('jpUploadSubmit');
+            if (submitBtn) {
+                submitBtn.addEventListener('click', () => _submitArtwork(wrap));
             }
             wrap.querySelectorAll('.jp-upload-file-remove').forEach((b) => {
                 b.addEventListener('click', async () => {
