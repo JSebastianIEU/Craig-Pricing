@@ -622,6 +622,11 @@ def _long_item_detail(quote, double_sided: bool, conv=None) -> str:
             else:
                 lines.append("Delivery:    delivery (address pending)")
 
+    # v30 — flag pending artwork on the workshop jobsheet so the
+    # production team doesn't start the run before files arrive.
+    if conv is not None and bool(getattr(conv, "artwork_will_send_later", False)):
+        lines.append("Artwork:     PENDING — customer will send separately")
+
     if getattr(quote, "id", None):
         lines.append(f"Quote:       Craig qid={quote.id}")
 

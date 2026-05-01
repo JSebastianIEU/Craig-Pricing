@@ -839,6 +839,43 @@
                 right: 16px;
                 bottom: 16px;
             }
+            /* v30 — bigger, more visible close button on mobile.
+               28×28px was below Apple HIG min tap target on full-screen
+               panels and customers were reporting they couldn't find
+               or tap it. 40×40 with brighter background fixes that. */
+            .jp-close {
+                width: 40px;
+                height: 40px;
+                top: 12px;
+                right: 12px;
+                font-size: 26px;
+                background: rgba(255,255,255,0.22);
+            }
+            .jp-close:hover, .jp-close:active {
+                background: rgba(255,255,255,0.35);
+            }
+            .jp-header {
+                padding-right: 60px;
+            }
+            /* v30 — drag handle pill at the top of the header, signals
+               "this panel can be dismissed". Tied to a touchstart/move
+               listener that closes the panel on a 80px+ downward drag. */
+            .jp-drag-handle {
+                position: absolute;
+                top: 6px;
+                left: 50%;
+                transform: translateX(-50%);
+                width: 36px;
+                height: 4px;
+                border-radius: 2px;
+                background: rgba(255,255,255,0.4);
+                pointer-events: none;
+            }
+        }
+        /* On desktop, the drag handle is hidden — desktop has the
+           obvious bubble re-collapse and the close button in the corner. */
+        @media (min-width: 481px) {
+            .jp-drag-handle { display: none; }
         }
 
         /* ===== Phase F — Customer info form ===== */
@@ -1106,7 +1143,8 @@
         </button>
 
         <div class="jp-panel jp-hidden" id="jpPanel" role="dialog" aria-label="Just-Print quote assistant">
-            <div class="jp-header">
+            <div class="jp-header" id="jpHeader">
+                <div class="jp-drag-handle" aria-hidden="true"></div>
                 <div class="jp-logo">
                     <img src="https://just-print.ie/wp-content/themes/just-print/assets/img/tiger_760.png" alt="logo">
                 </div>
@@ -1257,6 +1295,31 @@
 
         bubble.addEventListener('click', openPanel);
         closeBtn.addEventListener('click', closePanel);
+
+        // v30 — mobile swipe-down-to-close on the panel header. iOS/
+        // Android sheet UX: drag the header strip down >80px to dismiss.
+        // Desktop unaffected (these events don't fire). The bigger ✕
+        // button is still the primary close affordance — this is just
+        // a secondary gesture for users who never see the corner X.
+        const _header = $('jpHeader');
+        if (_header) {
+            let _dragStartY = null;
+            _header.addEventListener('touchstart', (e) => {
+                if (!e.touches || e.touches.length !== 1) return;
+                _dragStartY = e.touches[0].clientY;
+            }, { passive: true });
+            _header.addEventListener('touchmove', (e) => {
+                if (_dragStartY == null) return;
+                if (!e.touches || e.touches.length !== 1) return;
+                const dy = e.touches[0].clientY - _dragStartY;
+                if (dy > 80) {
+                    _dragStartY = null;
+                    closePanel();
+                }
+            }, { passive: true });
+            _header.addEventListener('touchend', () => { _dragStartY = null; });
+            _header.addEventListener('touchcancel', () => { _dragStartY = null; });
+        }
 
         // --- Chat ---
         const messagesEl = $('jpMessages');
@@ -1795,6 +1858,10 @@
                 + '  <div class="jp-choice-title">I have my own artwork</div>'
                 + '  <div class="jp-choice-sub">PDF, AI, INDD, JPG, PNG…</div>'
                 + '</button>'
+                + '<button type="button" class="jp-choice-btn" data-choice="later">'
+                + '  <div class="jp-choice-title">I\'ll send my artwork later</div>'
+                + '  <div class="jp-choice-sub">Get the price now, send the files when ready</div>'
+                + '</button>'
                 + '<button type="button" class="jp-choice-btn" data-choice="design">'
                 + '  <div class="jp-choice-title">I need your design service</div>'
                 + '  <div class="jp-choice-sub">€65 ex VAT for one hour of design (€79.95 inc)</div>'
@@ -1806,7 +1873,7 @@
             wrap.querySelectorAll('.jp-choice-btn').forEach((btn) => {
                 btn.addEventListener('click', () => {
                     const choice = btn.getAttribute('data-choice');
-                    // Disable both buttons so the customer can't
+                    // Disable all buttons so the customer can't
                     // double-click. Visual feedback happens via the
                     // synthetic chat reply below.
                     wrap.querySelectorAll('.jp-choice-btn').forEach((b) => {
@@ -1817,9 +1884,14 @@
                     // Show the choice as a user bubble for transcript
                     // clarity, then fire it as a chat turn so the
                     // server-side sniffer stamps the flag.
-                    const phrase = choice === 'have'
-                        ? "I have my own artwork"
-                        : "I need your design service";
+                    let phrase;
+                    if (choice === 'have') {
+                        phrase = "I have my own artwork";
+                    } else if (choice === 'later') {
+                        phrase = "I'll send my artwork later — please price it now.";
+                    } else {
+                        phrase = "I need your design service";
+                    }
                     addMsg(phrase, 'user');
                     sendMessage(phrase);
                 });

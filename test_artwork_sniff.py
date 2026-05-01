@@ -18,7 +18,10 @@ import os
 
 os.environ.setdefault("STRATEGOS_JWT_SECRET", "test-secret-32b-pad-enough-now")
 
-from llm.craig_agent import _sniff_artwork_answer  # noqa: E402
+from llm.craig_agent import (  # noqa: E402
+    _sniff_artwork_answer,
+    _sniff_artwork_pending_later,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -144,3 +147,68 @@ class TestSniffBareYesNoNeedsContext:
     def test_yes_after_specs_confirmation_does_not_fire(self):
         last = "Got it — 100 business cards, soft-touch, double-sided?"
         assert _sniff_artwork_answer(last, "yes") is None
+
+
+# ---------------------------------------------------------------------------
+# v30 — pending-later sniffer (the third artwork-choice option)
+# ---------------------------------------------------------------------------
+
+
+class TestSniffPendingLater:
+    """The customer says 'I'll send my artwork later' / 'just need a
+    price' / 'not finalised yet'. _sniff_artwork_answer returns True
+    (so pricing unblocks) AND _sniff_artwork_pending_later returns True
+    (so the upload-first replace gate skips)."""
+
+    def test_ill_send_my_artwork_later(self):
+        msg = "I'll send my artwork later — please price it now."
+        assert _sniff_artwork_answer(None, msg) is True
+        assert _sniff_artwork_pending_later(msg) is True
+
+    def test_just_need_a_price(self):
+        msg = "i just need a price"
+        # Justin's reported regression: this used to leave flag at None
+        # and the upload-first gate kept looping. Now it stamps both
+        # have_own=True AND pending_later=True so the price flows through.
+        assert _sniff_artwork_pending_later(msg) is True
+        # And _sniff_artwork_answer also returns True (so pricing tool
+        # guard unblocks).
+        assert _sniff_artwork_answer(None, msg) is True
+
+    def test_not_finalised_yet(self):
+        msg = "its not finalised yet"
+        assert _sniff_artwork_pending_later(msg) is True
+        assert _sniff_artwork_answer(None, msg) is True
+
+    def test_havent_finalised(self):
+        msg = "haven't finalised the design yet"
+        assert _sniff_artwork_pending_later(msg) is True
+
+    def test_still_working_on(self):
+        msg = "still working on the artwork, can you price first?"
+        assert _sniff_artwork_pending_later(msg) is True
+
+    def test_ill_upload_later(self):
+        msg = "i'll upload it tomorrow"
+        # "i'll upload" is a pending-later pattern
+        assert _sniff_artwork_pending_later(msg) is True
+
+    def test_have_artwork_ready_is_NOT_pending_later(self):
+        """Customer who unambiguously has artwork now should NOT be
+        flagged as pending-later (they get the upload card normally)."""
+        msg = "i have my own artwork"
+        assert _sniff_artwork_pending_later(msg) is False
+
+    def test_design_service_is_NOT_pending_later(self):
+        msg = "i need your design service"
+        assert _sniff_artwork_pending_later(msg) is False
+
+    def test_first_message_with_specs_is_NOT_pending_later(self):
+        """The conv-97 false-positive: 'hey i need 500 cards' should
+        not match anything — least of all pending-later."""
+        msg = "hey i need 500 business cards double sided soft"
+        assert _sniff_artwork_pending_later(msg) is False
+
+    def test_empty_message_is_NOT_pending_later(self):
+        assert _sniff_artwork_pending_later("") is False
+        assert _sniff_artwork_pending_later(None) is False  # type: ignore[arg-type]

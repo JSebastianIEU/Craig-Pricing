@@ -2270,6 +2270,12 @@ def _conv_summary(c: Conversation) -> dict[str, Any]:
         "past_customer_email": getattr(c, "past_customer_email", None),
         "delivery_method": getattr(c, "delivery_method", None),
         "delivery_address": getattr(c, "delivery_address", None),
+        # v30 — artwork question state. Three values matter:
+        #   has_own=True,  pending_later=False -> customer has artwork ready
+        #   has_own=True,  pending_later=True  -> "I'll send it later" (badge)
+        #   has_own=False                      -> design service
+        "customer_has_own_artwork": getattr(c, "customer_has_own_artwork", None),
+        "artwork_will_send_later": bool(getattr(c, "artwork_will_send_later", False)),
     }
 
 

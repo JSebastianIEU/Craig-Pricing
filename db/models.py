@@ -257,6 +257,19 @@ class Conversation(Base):
     # null  = the artwork question hasn't been answered yet
     customer_has_own_artwork = Column(Boolean, nullable=True)
 
+    # Phase G v30 — set when the customer chose "I'll send my artwork
+    # later" (the third artwork-choice button) or said something
+    # equivalent ("I haven't finalised it yet", "just need a price").
+    # When True, treat as customer_has_own_artwork=True for pricing
+    # purposes (no design line item) BUT skip the upload-first replace
+    # gate and the [ARTWORK_UPLOAD] auto-emit so Craig doesn't loop on
+    # "send your artwork over". The dashboard renders an "Artwork
+    # pending" badge so Justin knows the order is incomplete; the
+    # PrintLogic jobsheet says "Artwork: PENDING".
+    artwork_will_send_later = Column(
+        Boolean, nullable=False, default=False, server_default="0",
+    )
+
     quotes = relationship("Quote", back_populates="conversation", cascade="all, delete-orphan")
 
     __table_args__ = (

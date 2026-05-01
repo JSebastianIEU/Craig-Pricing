@@ -235,6 +235,12 @@ _ARTWORK_HAVE_AFFIRMATIVE = (
     # "ready to order". Tightened May 2026 after a sniff false-positive
     # ("hey i need 100 business cards" matched "i need" -> stamped flag
     # False -> bypassed the artwork-question guard, conv 97).
+    #
+    # v30 — REMOVED ambiguous phrases that conflate "I have artwork now"
+    # with "I'll send artwork later". Patterns like "i'll send", "ill
+    # send", "i'll provide" now live in _ARTWORK_PENDING_LATER below
+    # (they set artwork_will_send_later=True so the upload-first gate
+    # doesn't loop).
     "i have artwork", "i have the artwork", "i have my own artwork",
     "i've got artwork", "i've got my own artwork",
     "ive got artwork", "ive got my own artwork",
@@ -244,17 +250,41 @@ _ARTWORK_HAVE_AFFIRMATIVE = (
     "i have a design", "have a design ready", "have the design",
     "i have the design",
     "print-ready", "print ready", "ready to print", "ready-to-print",
-    "i'll send", "ill send", "i'll upload", "ill upload",
-    "i'll provide", "ill provide", "i can provide the artwork",
-    "i'll send the artwork", "ill send the artwork",
-    "i'll send the design", "ill send the design",
-    "i'll send the file", "ill send the file",
+    "i can provide the artwork",
     "i have the file", "ive got the file", "i've got the file",
     "i have the files", "ive got the files", "i've got the files",
     # Synthetic phrases the widget fires after a successful upload
     "i've uploaded", "ive uploaded", "uploaded my artwork",
     "uploaded the artwork", "uploaded my files", "uploaded the files",
     "uploaded my design",
+)
+# v30 — phrases that say "I do have / will have artwork, but I'm not
+# sending it through the widget right now". Distinct from the
+# affirmative list above so we can stamp BOTH customer_has_own_artwork
+# and the new artwork_will_send_later flag — letting Craig give the
+# price + funnel without looping on "send your artwork over".
+_ARTWORK_PENDING_LATER = (
+    # Clear "I'll send it later" intent
+    "i'll send", "ill send",
+    "i'll upload", "ill upload",
+    "i'll provide", "ill provide",
+    "i'll send the artwork", "ill send the artwork",
+    "i'll send the design", "ill send the design",
+    "i'll send the file", "ill send the file",
+    "i'll send the files", "ill send the files",
+    "send it later", "send them later", "upload later", "provide later",
+    "later when", "when it's ready", "when its ready",
+    # "Not finalised yet"
+    "not finalised", "not finalized",
+    "haven't finalised", "havent finalised",
+    "haven't finalized", "havent finalized",
+    "not yet ready", "still working on", "still finalising",
+    "still finalizing", "not ready yet", "isn't ready yet",
+    "isnt ready yet",
+    # "Just give me a price first"
+    "just need a price", "just need the price", "just want a price",
+    "just want the price", "skip the artwork", "price first",
+    "just price",
 )
 _ARTWORK_NEED_DESIGN = (
     # All patterns MUST clearly reference design service (or explicitly
@@ -291,6 +321,12 @@ def _sniff_artwork_answer(
       2. Bare "yes" / "yeah" — only when Craig's previous message was
          actually asking the artwork question (avoids reading
          "yes confirm specs" as "yes I have artwork").
+
+    v30 — pending-later patterns ("I'll send my artwork later") also
+    return True here, because for pricing-tool-guard purposes the
+    customer DOES have/will-have artwork (no design line item). The
+    `_sniff_artwork_pending_later()` helper distinguishes the
+    pending-later intent so the upload-first replace gate can skip.
     """
     if not user_message:
         return None
@@ -301,6 +337,12 @@ def _sniff_artwork_answer(
     if any(p in user for p in _ARTWORK_NEED_DESIGN):
         return False
     if any(p in user for p in _ARTWORK_HAVE_AFFIRMATIVE):
+        return True
+    # v30 — pending-later phrases also count as "have own artwork"
+    # for the pricing-tool guard. The pending-later distinction is
+    # made by _sniff_artwork_pending_later() and stamped on a
+    # separate flag.
+    if any(p in user for p in _ARTWORK_PENDING_LATER):
         return True
 
     # ── Strategy 2: bare yes/no when Craig was asking artwork ────────
@@ -315,6 +357,21 @@ def _sniff_artwork_answer(
             return False
 
     return None
+
+
+def _sniff_artwork_pending_later(user_message: str) -> bool:
+    """
+    Returns True if the customer's message says they HAVE/WILL HAVE
+    their own artwork but want to send it later (not via the upload
+    button right now). When True, the caller should stamp BOTH
+    customer_has_own_artwork=True AND artwork_will_send_later=True so
+    Craig gives the verbal price + funnel without looping on the
+    upload prompt.
+    """
+    if not user_message:
+        return False
+    user = user_message.lower().strip()
+    return any(p in user for p in _ARTWORK_PENDING_LATER)
 
 
 def _humanize_reply(text: str) -> str:
@@ -443,6 +500,16 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "- \"[ARTWORK_CHOICE]\", \"[ARTWORK_UPLOAD]\", \"[CUSTOMER_FORM]\" — these\n"
         "  are widget-only machine markers. Email customers will see them\n"
         "  as literal text. Never emit any of them in an email reply.\n"
+        "\n"
+        "## Artwork pending-later (v30)\n"
+        "If the customer says any of: \"I'll send the artwork later\",\n"
+        "\"I haven't finalised the artwork\", \"not finalised yet\",\n"
+        "\"I just need a price\", \"I'll attach it shortly\", \"still\n"
+        "working on the design\" — proceed to price as usual and (if not\n"
+        "yet collected) ask the funnel-collection paragraph. Do NOT keep\n"
+        "telling them to send the artwork. The server has already set\n"
+        "artwork_will_send_later=True on the conversation and Justin\n"
+        "will see the \"Artwork pending\" badge on the quote.\n"
         "\n"
         "## Required structure of the reply\n"
         "1. One-line greeting: \"Hi <FirstName>,\" (from the sender envelope)\n"
@@ -600,6 +667,16 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "Replies render in a floating chat widget. Keep them short (2-3\n"
         "sentences). Emojis are fine and expected. Follow the personality\n"
         "tone above.\n"
+        "\n"
+        "## Artwork pending-later (v30)\n"
+        "If the customer says any of: \"I'll send the artwork later\",\n"
+        "\"I haven't finalised the artwork\", \"not finalised yet\",\n"
+        "\"I just need a price\", \"still working on the design\", or\n"
+        "they click the [I'll send my artwork later] button — proceed\n"
+        "to price as usual and ask for the funnel info. Do NOT push the\n"
+        "upload card. Do NOT keep saying \"send your artwork over\". The\n"
+        "server will set artwork_will_send_later=True on the conversation\n"
+        "and Justin will see an \"Artwork pending\" badge on the quote.\n"
     ),
 }
 
@@ -1534,6 +1611,7 @@ def chat_with_craig(
         is_definitive = (
             any(p in user_lower for p in _ARTWORK_HAVE_AFFIRMATIVE)
             or any(p in user_lower for p in _ARTWORK_NEED_DESIGN)
+            or any(p in user_lower for p in _ARTWORK_PENDING_LATER)
         )
         if conversation.customer_has_own_artwork is None or is_definitive:
             previous = conversation.customer_has_own_artwork
@@ -1545,6 +1623,22 @@ def chat_with_craig(
                     f"customer_has_own_artwork={previous!r} -> {sniffed_art}",
                     flush=True,
                 )
+
+    # v30 — separately detect "I'll send it later" / "I haven't
+    # finalised the artwork" / "I just need a price". These set the
+    # artwork_will_send_later flag so the upload-first replace gate
+    # and the [ARTWORK_UPLOAD] auto-emit gate skip — Craig gives the
+    # verbal price + funnel like normal instead of looping on
+    # "send your artwork over".
+    if _sniff_artwork_pending_later(user_message):
+        if not getattr(conversation, "artwork_will_send_later", False):
+            conversation.artwork_will_send_later = True
+            db.flush()
+            print(
+                f"[craig] artwork pending-later sniff: conv="
+                f"{conversation.id} artwork_will_send_later -> True",
+                flush=True,
+            )
 
     # Inject artwork status as a developer-side hint so the LLM picks the
     # right needs_artwork on its next pricing tool call. Soft instruction
@@ -1918,6 +2012,8 @@ def chat_with_craig(
             conversation.customer_has_own_artwork is True
             and last_quote_id is not None
             and not _quote_has_artwork_check()
+            # v30 — customer chose "I'll send artwork later"; respect that
+            and not bool(getattr(conversation, "artwork_will_send_later", False))
         )
         if conversation.customer_has_own_artwork is None:
             tail = (
@@ -2067,11 +2163,17 @@ def chat_with_craig(
     # from the widget that triggers Craig's natural "perfect — that'll
     # be €X" reply). User explicit ask: the upload step should come
     # BEFORE the price, not bundled with it.
+    # v30 — read the pending-later flag once. When True, Craig should
+    # NOT push the upload card / replace the verbal price. Customer
+    # explicitly opted to send artwork later; respect that choice.
+    _artwork_pending_later = bool(getattr(conversation, "artwork_will_send_later", False))
+
     _upload_first_replace = (
         _channel_needs_gate
         and conversation.customer_has_own_artwork is True
         and _pricing_called_this_turn
         and not _quote_has_artwork
+        and not _artwork_pending_later  # v30
     )
     if _upload_first_replace:
         print(
@@ -2091,6 +2193,7 @@ def chat_with_craig(
         and not _quote_has_artwork                          # not uploaded yet
         and not _upload_marker_already
         and not _upload_marker_earlier
+        and not _artwork_pending_later  # v30 — customer chose "later"
     ):
         print(
             f"[craig] AUTO-EMIT [ARTWORK_UPLOAD] — pricing ran with "
@@ -2133,6 +2236,7 @@ def chat_with_craig(
     _needs_upload_first = (
         conversation.customer_has_own_artwork is True
         and not _quote_has_artwork
+        and not _artwork_pending_later  # v30 — customer chose "later"
     )
     if (
         _channel_needs_gate

@@ -276,6 +276,12 @@ def submit_customer_info(
         promised_artwork = (
             float(pending_quote.artwork_cost or 0) == 0.0
             and not has_any_files
+            # v30 — if the customer explicitly chose "I'll send my
+            # artwork later" via the third choice button (or said
+            # "just need a price", "not finalised yet" etc.), don't
+            # block the form submit. They get the PDF now, send the
+            # files later out-of-band.
+            and not bool(getattr(conv, "artwork_will_send_later", False))
         )
         if promised_artwork:
             # Inspect conversation messages for an explicit "I have artwork"
