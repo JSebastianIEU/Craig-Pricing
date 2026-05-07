@@ -300,16 +300,20 @@ def send_quote_ready_for_approval(
         }
         result = resend.Emails.send(params)
         msg_id = (result or {}).get("id") if isinstance(result, dict) else None
-        _log.info(
-            "notifications: sent quote-ready email org=%s quote=%s to=%s id=%s",
-            org_slug, quote.id, to_addr, msg_id,
+        # Use print() to match the rest of the codebase — Python's
+        # logging module isn't configured under uvicorn here and INFO
+        # records get dropped. print() is captured by Cloud Run.
+        print(
+            f"[notifications] sent quote-ready email org={org_slug} "
+            f"quote={quote.id} to={to_addr} id={msg_id}",
+            flush=True,
         )
         return {"ok": True, "message_id": msg_id, "error": None}
     except Exception as e:
         msg = f"resend_error: {type(e).__name__}: {str(e)[:200]}"
-        _log.warning(
-            "notifications: send failed org=%s quote=%s err=%s",
-            org_slug, quote.id, msg,
+        print(
+            f"[notifications] send FAILED org={org_slug} quote={quote.id} err={msg}",
+            flush=True,
         )
         return {"ok": False, "message_id": None, "error": msg}
 
@@ -334,17 +338,42 @@ def trigger_approval_notification(
     """
     quote = db.query(Quote).filter_by(id=quote_id).first()
     if quote is None:
+        print(f"[notifications] trigger: quote_not_found id={quote_id} org={org_slug}", flush=True)
         return {"ok": False, "skipped": False, "error": "quote_not_found"}
 
     if getattr(quote, "notification_sent_at", None) is not None:
+        print(
+            f"[notifications] trigger: already sent (idempotent skip) "
+            f"quote={quote.id} org={org_slug}",
+            flush=True,
+        )
         return {"ok": True, "skipped": True, "error": None}
 
+    print(f"[notifications] trigger: firing for quote={quote.id} org={org_slug}", flush=True)
     result = send_quote_ready_for_approval(db, quote, org_slug)
     if result.get("ok"):
-        quote.notification_sent_at = _dt.datetime.utcnow()
-        quote.notification_message_id = result.get("message_id")
-        quote.notification_last_error = None
-        db.commit()
+        # Persist the timestamp so the dashboard's StageTracker fills
+        # in 'awaiting_approval'. Use a defensive try/except — if the
+        # commit fails we still want to log it; the email already went
+        # out so the operator was notified, but the audit field is
+        # missing.
+        try:
+            quote.notification_sent_at = _dt.datetime.utcnow()
+            quote.notification_message_id = result.get("message_id")
+            quote.notification_last_error = None
+            db.commit()
+            print(
+                f"[notifications] persisted notification_sent_at "
+                f"quote={quote.id} msg_id={result.get('message_id')}",
+                flush=True,
+            )
+        except Exception as e:
+            db.rollback()
+            print(
+                f"[notifications] commit FAILED after send "
+                f"quote={quote.id} err={type(e).__name__}: {e}",
+                flush=True,
+            )
         return {"ok": True, "skipped": False, "error": None}
     else:
         # Persist the error so the dashboard can surface it. Don't
