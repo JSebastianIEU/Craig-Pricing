@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
+from sqlalchemy import func as _sa_func
 from sqlalchemy.orm import Session
 import asyncio
 import json as _json_std
@@ -530,6 +531,61 @@ def _strip_quoted_thread(body_text: str) -> str:
     return body_text
 
 
+def _detect_returning_customer(
+    db: Session,
+    org_slug: str,
+    email: str | None,
+    current_conv_id: int | None = None,
+) -> dict:
+    """
+    Returns whether the sender is a returning customer based on the
+    org's conversation + quote history under the EXACT same email
+    address (case-insensitive). v32.2 — used by the Missive handler
+    to inject [CUSTOMER STATUS] context into the LLM prompt so Craig
+    doesn't ask 'have you ordered with us before?' when we already
+    know the answer.
+
+    Returns:
+        {
+            "is_returning":          bool,
+            "prior_conversations":   int,
+            "prior_quote_count":     int,
+        }
+
+    Empty / None email returns is_returning=False (we won't guess).
+    """
+    if not email:
+        return {"is_returning": False, "prior_conversations": 0, "prior_quote_count": 0}
+    eq_email = email.strip().lower()
+    if not eq_email:
+        return {"is_returning": False, "prior_conversations": 0, "prior_quote_count": 0}
+
+    convs_q = (
+        db.query(Conversation)
+        .filter(Conversation.organization_slug == org_slug)
+        .filter(_sa_func.lower(Conversation.customer_email) == eq_email)
+    )
+    if current_conv_id is not None:
+        convs_q = convs_q.filter(Conversation.id != current_conv_id)
+    prior_convs = convs_q.count()
+
+    quotes_q = (
+        db.query(Quote)
+        .join(Conversation, Quote.conversation_id == Conversation.id)
+        .filter(Conversation.organization_slug == org_slug)
+        .filter(_sa_func.lower(Conversation.customer_email) == eq_email)
+    )
+    if current_conv_id is not None:
+        quotes_q = quotes_q.filter(Conversation.id != current_conv_id)
+    prior_quotes = quotes_q.count()
+
+    return {
+        "is_returning": prior_convs > 0,
+        "prior_conversations": prior_convs,
+        "prior_quote_count": prior_quotes,
+    }
+
+
 def _handle_missive_event(org_slug: str, payload: dict) -> None:
     """
     Background task for an incoming Missive webhook.
@@ -828,6 +884,80 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             # We'll let chat_with_craig() create the row, then patch it below.
             pass
 
+        # v32.2 — patch sender's display name + email onto the conv row
+        # BEFORE the LLM runs, so the prompt can read the real values
+        # rather than getting placeholder phrases hallucinated. This
+        # used to happen AFTER the LLM call and was too late.
+        sender_name = (evt.get("from_name") or "").strip()
+        sender_email = (evt.get("from_address") or "").strip()
+        if existing:
+            if sender_email and not (existing.customer_email or "").strip():
+                existing.customer_email = sender_email
+            if sender_name and not (existing.customer_name or "").strip():
+                existing.customer_name = sender_name
+            db.flush()
+
+        # v32.2 — server-detected returning-customer status. We compute
+        # it from prior conversations under the same email and inject
+        # the result as a system message into the LLM prompt so Craig
+        # doesn't ask 'have you ordered with us before?' when we
+        # already know the answer.
+        returning_status = _detect_returning_customer(
+            db, org_slug, sender_email, current_conv_id=conversation_id,
+        )
+        _mlog.info(
+            "%s: returning-customer lookup conv_id=%s email=%s -> "
+            "is_returning=%s prior_convs=%d prior_quotes=%d",
+            org_slug, conversation_id, sender_email,
+            returning_status["is_returning"],
+            returning_status["prior_conversations"],
+            returning_status["prior_quote_count"],
+        )
+
+        extra_ctx: list[dict] = []
+        sender_block = (
+            "[SENDER METADATA — extracted from the email envelope]\n"
+            f"Email: {sender_email or '(unknown)'}\n"
+            f"Display name: {sender_name or '(empty — not in envelope)'}\n"
+            "When you call save_customer_info(name=...), use the EXACT "
+            "display name above. If the display name is empty, use what "
+            "the customer signed the email with (\"Cheers, <Name>\"). If "
+            "neither is available, ask 'And could I get your name for "
+            "the invoice?' in your STEP 3 funnel-collection email. "
+            "NEVER pass placeholder phrases like \"the customer's name "
+            "from the conversation\" — that is a hallucination and the "
+            "server will reject it."
+        )
+        extra_ctx.append({"role": "system", "content": sender_block})
+
+        if returning_status["is_returning"]:
+            customer_block = (
+                "[CUSTOMER STATUS — server-detected]\n"
+                f"This email ({sender_email}) has had "
+                f"{returning_status['prior_conversations']} prior "
+                f"conversation(s) and "
+                f"{returning_status['prior_quote_count']} prior quote(s) "
+                "with us. Treat them as a RETURNING customer.\n"
+                " - When you call save_customer_info, pass "
+                "is_returning_customer=true AND past_customer_email=<the "
+                "sender's current email above>. Don't ask 'have you "
+                "ordered with us before?' — we already know they have.\n"
+                " - In your STEP 3 funnel-collection email, replace the "
+                "'have you ordered with us before?' bullet with a brief "
+                "'welcome back' acknowledgement in the opening line."
+            )
+        else:
+            customer_block = (
+                "[CUSTOMER STATUS — server-detected]\n"
+                f"This email ({sender_email or '(unknown)'}) has no prior "
+                "conversations with us. Treat them as a NEW customer. "
+                "When you call save_customer_info, pass "
+                "is_returning_customer=false. The 'have you ordered with "
+                "us before?' question can be omitted from STEP 3 — we "
+                "already know they're new."
+            )
+        extra_ctx.append({"role": "system", "content": customer_block})
+
         _mlog.info(
             "%s: calling chat_with_craig (conversation_id=%s, body preview=%r)",
             org_slug, conversation_id, body_text[:120],
@@ -839,6 +969,7 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             external_id=evt["conversation_id"],
             channel="missive",
             organization_slug=org_slug,
+            extra_system_messages=extra_ctx,
         )
         _mlog.info(
             "%s: chat_with_craig returned (quote_generated=%s, quote_id=%s, reply_len=%d)",

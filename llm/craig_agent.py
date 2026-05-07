@@ -533,6 +533,21 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "  are widget-only machine markers. Email customers will see them\n"
         "  as literal text. Never emit any of them in an email reply.\n"
         "\n"
+        "## Sender + customer-status context (v32.2)\n"
+        "Two server-injected system messages will appear above the\n"
+        "customer's first turn:\n"
+        "  • [SENDER METADATA] — the customer's email address and\n"
+        "    display name from the envelope. Use the EXACT display name\n"
+        "    when you call save_customer_info(name=...). NEVER pass a\n"
+        "    placeholder phrase. If the display name is empty, fall\n"
+        "    back to whatever the customer signed the email with.\n"
+        "  • [CUSTOMER STATUS] — server-detected returning vs new based\n"
+        "    on prior conversations under the same email. Trust this\n"
+        "    block: do NOT re-ask 'have you ordered with us before?' if\n"
+        "    it already says returning OR new. In STEP 3, drop the\n"
+        "    returning-customer bullet entirely. If returning, open\n"
+        "    your reply with a brief 'welcome back' acknowledgement.\n"
+        "\n"
         "## Never re-ask the artwork question once it's answered (v32.1)\n"
         "If customer_has_own_artwork is set on the conversation (True or\n"
         "False) — the customer already told us. NEVER re-ask the artwork\n"
@@ -590,16 +605,17 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "    pending-later) AND any of these is missing on the conv:\n"
         "    delivery_method, delivery_address (if delivery), is_company,\n"
         "    is_returning_customer.\n"
-        "    Reply: ONE compact email asking for ALL the missing funnel\n"
-        "    fields in bullets:\n"
+        "    Reply: ONE compact email asking for the missing funnel\n"
+        "    fields in bullets. SKIP the 'have you ordered with us\n"
+        "    before?' bullet \u2014 the [CUSTOMER STATUS] block already\n"
+        "    answered it for you. If the customer is RETURNING, open\n"
+        "    with 'welcome back' instead of 'thanks':\n"
         "      Hi <Name>,\n"
         "      Thanks. Just a few details and I'll send over the full quote:\n"
         "        \u2022 Delivery (\u20ac15 inc VAT, free over \u20ac100 ex VAT) or\n"
         "          collection from our Ballymount shop?\n"
         "        \u2022 If delivery, the address + Eircode.\n"
         "        \u2022 Are you ordering as a company or individual? (for invoicing)\n"
-        "        \u2022 Have you ordered with us before? If yes, what email did\n"
-        "          you use last time?\n"
         "      Cheers,\n"
         "      Craig\n"
         "      Just Print\n"
@@ -1287,11 +1303,37 @@ def _exec_tool(
             # LLMs routinely call this tool with a partial update (e.g. just
             # the new field they just collected) and would otherwise nuke
             # data we stored on the previous turn.
+            #
+            # v32.2 — sanity guard: reject placeholder phrases the LLM
+            # sometimes copy-pastes from the prompt's meta-instruction
+            # text instead of extracting a real value (conv 126 saved
+            # name=\"the customer's name from the conversation\"). Drop
+            # those before they hit the DB.
+            _PLACEHOLDER_RX = re.compile(
+                r"(customer'?s\s+name|name\s+from\s+the|name\s+from\s+envelope|"
+                r"customer'?s\s+email|email\s+from\s+the|<\s*name\s*>|<\s*email\s*>|"
+                r"placeholder|\[NAME\]|\[EMAIL\]|TBD|UNKNOWN)",
+                re.IGNORECASE,
+            )
+            def _is_placeholder(v: object) -> bool:
+                if not isinstance(v, str):
+                    return False
+                return bool(_PLACEHOLDER_RX.search(v))
+
             if conversation_id:
                 conv = db.query(Conversation).filter_by(id=conversation_id).first()
                 if conv:
-                    if (args.get("name") or "").strip():
-                        conv.customer_name = args["name"].strip()
+                    raw_name = (args.get("name") or "").strip()
+                    if raw_name and _is_placeholder(raw_name):
+                        print(
+                            f"[craig] save_customer_info: REJECTED "
+                            f"placeholder name={raw_name!r} on conv "
+                            f"{conversation_id} (LLM hallucinated meta-"
+                            f"instruction text)", flush=True,
+                        )
+                        raw_name = ""
+                    if raw_name:
+                        conv.customer_name = raw_name
                     if (args.get("email") or "").strip():
                         conv.customer_email = args["email"].strip()
                     if (args.get("phone") or "").strip():
@@ -1303,8 +1345,16 @@ def _exec_tool(
                         conv.is_company = bool(args["is_company"])
                     if "is_returning_customer" in args and args["is_returning_customer"] is not None:
                         conv.is_returning_customer = bool(args["is_returning_customer"])
-                    if (args.get("past_customer_email") or "").strip():
-                        conv.past_customer_email = args["past_customer_email"].strip()
+                    raw_past = (args.get("past_customer_email") or "").strip()
+                    if raw_past and _is_placeholder(raw_past):
+                        print(
+                            f"[craig] save_customer_info: REJECTED "
+                            f"placeholder past_customer_email={raw_past!r} "
+                            f"on conv {conversation_id}", flush=True,
+                        )
+                        raw_past = ""
+                    if raw_past:
+                        conv.past_customer_email = raw_past
                     method = (args.get("delivery_method") or "").strip().lower()
                     if method in ("delivery", "collect"):
                         conv.delivery_method = method
@@ -1540,6 +1590,7 @@ def chat_with_craig(
     external_id: Optional[str] = None,
     channel: str = "web",
     organization_slug: str = "just-print",
+    extra_system_messages: Optional[list[dict]] = None,
 ) -> dict:
     """
     Main entry point. Handles one turn of conversation.
@@ -1650,6 +1701,15 @@ def chat_with_craig(
 
     # Build message history for the LLM
     messages = [{"role": "system", "content": system_prompt}]
+
+    # v32.2 — server-injected context (e.g. [SENDER METADATA] +
+    # [CUSTOMER STATUS] from the Missive handler). These appear BEFORE
+    # the prior conversation history so the LLM can read them when
+    # deciding what to call save_customer_info with.
+    if extra_system_messages:
+        for m in extra_system_messages:
+            if isinstance(m, dict) and m.get("role") == "system" and m.get("content"):
+                messages.append({"role": "system", "content": str(m["content"])})
 
     # If this is the very first turn of a fresh conversation, inject the
     # widget greeting as a prior assistant message. The widget shows this
