@@ -2596,3 +2596,116 @@ def get_metrics(
             for day, cnt, val in by_day_rows
         ],
     }
+
+
+# ============================================================================
+# TEMPORARY — one-off test-data cleanup
+# ----------------------------------------------------------------------------
+# Confirmed by JS on May 7 2026. To be removed in the follow-up commit
+# once the dry run is verified + the apply run executes successfully.
+# ============================================================================
+
+
+_CLEANUP_TEST_EMAILS = {
+    "sebastian@strategos-ai.com",
+    "jpenad.ieu2023@student.ie.edu",
+    "juansebastianpenadonneys@gmail.com",
+    "partygames2000@gmail.com",
+}
+_CLEANUP_ID_CUTOFF = 38
+_CLEANUP_PRESERVE_QUOTE_IDS = {85, 86}
+
+
+@router.post("/orgs/{org_slug}/admin/cleanup-test-quotes")
+def cleanup_test_quotes(
+    org_slug: str,
+    apply: bool = Query(False, description="When true, actually delete. Default = dry run."),
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    One-off cleanup endpoint. Removes:
+      - quotes whose conversation customer_email is in the test list
+      - quotes with id < 38
+
+    Hard-preserves quote ids 85, 86 (real clients).
+
+    Conversations whose every quote is deleted are dropped too.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    all_quotes = (
+        _scope(db.query(Quote), Quote, claims, org_slug)
+        .all()
+    )
+    all_convs_q = (
+        _scope(db.query(Conversation), Conversation, claims, org_slug)
+        .all()
+    )
+    all_convs = {c.id: c for c in all_convs_q}
+
+    deleted_quotes: list[dict[str, Any]] = []
+    delete_quote_ids: set[int] = set()
+    for q in all_quotes:
+        if q.id in _CLEANUP_PRESERVE_QUOTE_IDS:
+            continue
+        conv = all_convs.get(q.conversation_id) if q.conversation_id else None
+        email = ((conv.customer_email if conv else None) or "").strip().lower()
+
+        reason: Optional[str] = None
+        if q.id < _CLEANUP_ID_CUTOFF:
+            reason = f"id<{_CLEANUP_ID_CUTOFF}"
+        elif email in _CLEANUP_TEST_EMAILS:
+            reason = f"email={email}"
+
+        if reason:
+            delete_quote_ids.add(q.id)
+            deleted_quotes.append({
+                "id": q.id,
+                "conversation_id": q.conversation_id,
+                "product_key": q.product_key,
+                "email": email or None,
+                "reason": reason,
+            })
+
+    # Conversations to delete = those with ALL their quotes flagged
+    convs_to_delete: list[dict[str, Any]] = []
+    convs_keep: list[dict[str, Any]] = []
+    by_conv: dict[int, list[int]] = {}
+    for q in all_quotes:
+        if q.conversation_id is None:
+            continue
+        by_conv.setdefault(q.conversation_id, []).append(q.id)
+
+    affected_conv_ids = {q["conversation_id"] for q in deleted_quotes if q["conversation_id"]}
+    for cid in affected_conv_ids:
+        survivors = [qid for qid in by_conv.get(cid, []) if qid not in delete_quote_ids]
+        conv = all_convs.get(cid)
+        if not survivors:
+            convs_to_delete.append({
+                "id": cid,
+                "email": ((conv.customer_email if conv else None) or "").strip().lower() or None,
+                "channel": conv.channel if conv else None,
+            })
+        else:
+            convs_keep.append({"id": cid, "survivors": survivors})
+
+    if apply:
+        for q in all_quotes:
+            if q.id in delete_quote_ids:
+                db.delete(q)
+        db.flush()
+        for c in all_convs_q:
+            if any(c.id == row["id"] for row in convs_to_delete):
+                db.delete(c)
+        db.commit()
+
+    return {
+        "applied": apply,
+        "quotes_deleted": deleted_quotes,
+        "conversations_deleted": convs_to_delete,
+        "conversations_kept_with_survivors": convs_keep,
+        "quote_count": len(deleted_quotes),
+        "conversation_count": len(convs_to_delete),
+    }
