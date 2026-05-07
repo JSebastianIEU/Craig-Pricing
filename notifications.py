@@ -81,11 +81,12 @@ def _build_subject(quote: Quote) -> str:
 
 
 def _build_dashboard_link(base: str, org_slug: str, quote_id: int) -> str:
+    """Build the deep link straight to this quote in the dashboard.
+    Matches the Strategos route shape: `/c/<clientSlug>/a/<agentSlug>/<section>`.
+    `?focus_quote=N` is read by QuotesModule on mount and auto-opens
+    the matching row's sidebar."""
     base = (base or _DEFAULT_DASHBOARD_BASE).rstrip("/")
-    return (
-        f"{base}/dashboard?agent=craig&client={org_slug}"
-        f"&module=quotes&focus_quote={quote_id}"
-    )
+    return f"{base}/c/{org_slug}/a/craig/quotes?focus_quote={quote_id}"
 
 
 def _last_n_messages(conv: Optional[Conversation], n: int = 3) -> list[dict]:
