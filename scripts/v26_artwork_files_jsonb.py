@@ -115,34 +115,66 @@ def _repair_data_pass() -> None:
     """For every quote with a non-empty artwork_files array, mirror the
     first entry into the singular columns. Also clears array entries
     that aren't dicts (defensive) so downstream code never trips on a
-    char/str."""
+    char/str.
+
+    v33 fix — uses RAW SQL with explicit columns instead of ORM. The
+    ORM model would otherwise SELECT every column on Quote, including
+    columns added by later migrations (e.g. approved_at from v33),
+    which fail with 'column does not exist' on a fresh deploy where
+    the later migration hasn't run yet."""
+    import json as _json
     repaired = 0
     cleared = 0
-    with db_session() as db:
-        rows = db.query(Quote).filter(Quote.artwork_files.isnot(None)).all()
-        for q in rows:
-            files = parse_artwork_files(q.artwork_files)
-            # Drop any non-dict entries (e.g. left over from the TEXT
-            # bug where some rows might have ended up as scalar strings)
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            "SELECT id, artwork_files FROM quotes WHERE artwork_files IS NOT NULL"
+        )).fetchall()
+        for row in rows:
+            qid, raw = row
+            # JSONB columns return dicts/lists already; TEXT returns str.
+            if isinstance(raw, str):
+                files = parse_artwork_files(raw)
+            elif isinstance(raw, list):
+                files = raw
+            else:
+                files = parse_artwork_files(raw)
             cleaned = [e for e in files if isinstance(e, dict) and (e.get("url") or "").strip()]
             if not cleaned:
-                # Whole array was junk — reset both the array and the
-                # singular cols so reads aren't misled.
-                if q.artwork_files is not None:
-                    q.artwork_files = None
-                    q.artwork_file_url = None
-                    q.artwork_file_name = None
-                    q.artwork_file_size = None
-                    cleared += 1
+                conn.execute(
+                    text(
+                        "UPDATE quotes SET artwork_files = NULL, "
+                        "artwork_file_url = NULL, "
+                        "artwork_file_name = NULL, "
+                        "artwork_file_size = NULL "
+                        "WHERE id = :id"
+                    ),
+                    {"id": qid},
+                )
+                cleared += 1
                 continue
             if cleaned != files:
-                q.artwork_files = cleaned
+                conn.execute(
+                    text("UPDATE quotes SET artwork_files = :v WHERE id = :id"),
+                    {"v": _json.dumps(cleaned, ensure_ascii=False), "id": qid},
+                )
                 repaired += 1
             # Mirror first entry into singular cols
             first = cleaned[0]
-            q.artwork_file_url = first.get("url")
-            q.artwork_file_name = first.get("filename") or "artwork"
-            q.artwork_file_size = int(first.get("size") or 0)
+            conn.execute(
+                text(
+                    "UPDATE quotes SET "
+                    "artwork_file_url = :u, "
+                    "artwork_file_name = :n, "
+                    "artwork_file_size = :s "
+                    "WHERE id = :id"
+                ),
+                {
+                    "u": first.get("url"),
+                    "n": first.get("filename") or "artwork",
+                    "s": int(first.get("size") or 0),
+                    "id": qid,
+                },
+            )
         if repaired:
             print(f"  + repaired {repaired} artwork_files row(s) (dropped non-dict entries)")
         if cleared:

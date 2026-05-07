@@ -163,30 +163,39 @@ def migrate() -> None:
     # ── 2. Backfill: turn singular cols into a 1-element array on
     #               existing quotes that have an artwork_file_url but
     #               no artwork_files JSON yet.
+    #
+    # v33 fix — use RAW SQL with explicit columns instead of ORM. v25
+    # used to load `db.query(Quote).all()` which selects every column
+    # on the model, including columns added by LATER migrations
+    # (approved_at from v33). On a fresh deploy where v33's DDL hasn't
+    # run yet but the ORM model already references approved_at, the
+    # ORM query fails with "column quotes.approved_at does not exist".
+    # Raw SQL with explicit columns avoids that coupling.
     backfilled = 0
-    with db_session() as db:
-        # Note: we used to also filter `Quote.artwork_files == ""` (for
-        # a TEXT column that held an empty string). After v26 the column
-        # is JSONB on Postgres, where `== ""` raises a type error. Just
-        # filter on IS NULL — empty arrays are not None, so they still
-        # get correctly skipped.
-        rows = (
-            db.query(Quote)
-            .filter(Quote.artwork_file_url.isnot(None))
-            .filter(Quote.artwork_files.is_(None))
-            .all()
-        )
-        for q in rows:
-            q.artwork_files = [{
-                "url": q.artwork_file_url,
-                "filename": q.artwork_file_name or "artwork",
-                "size": q.artwork_file_size or 0,
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            "SELECT id, artwork_file_url, artwork_file_name, artwork_file_size "
+            "FROM quotes "
+            "WHERE artwork_file_url IS NOT NULL AND artwork_files IS NULL"
+        )).fetchall()
+        for row in rows:
+            qid, url, name, size = row
+            entry = json.dumps([{
+                "url": url,
+                "filename": name or "artwork",
+                "size": int(size) if size else 0,
                 "content_type": "application/octet-stream",
                 "uploaded_at": None,
-            }]
+            }], ensure_ascii=False)
+            conn.execute(
+                text("UPDATE quotes SET artwork_files = :v WHERE id = :id"),
+                {"v": entry, "id": qid},
+            )
             backfilled += 1
         if backfilled:
             print(f"  + backfilled {backfilled} quote(s) into artwork_files array")
+
+    with db_session() as db:
 
         # ── 3. Force-reseed business_rules ──────────────────────────
         rules_json = json.dumps(BUSINESS_RULES_V25, ensure_ascii=False)
