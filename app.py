@@ -900,28 +900,33 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             _mlog.info("%s: empty reply, not drafting", org_slug)
             return
 
-        # ── v29: defensive marker strip ───────────────────────────────
-        # The email system prompt forbids these widget-only markers, but
-        # DeepSeek occasionally drifts. Catch the 1% that slips through
-        # so the customer never sees literal "[ARTWORK_CHOICE]" in their
-        # inbox. ([QUOTE_READY] is handled separately below — it's a
-        # signal we care about, not just noise.)
-        for _stray_marker in ("[ARTWORK_CHOICE]", "[ARTWORK_UPLOAD]", "[CUSTOMER_FORM]"):
-            if _stray_marker in reply_text:
-                _mlog.warning(
-                    "%s: stripped stray marker %r from email reply",
-                    org_slug, _stray_marker,
-                )
-                reply_text = reply_text.replace(_stray_marker, "")
-        reply_text = reply_text.strip()
+        # ── v32.1 — defensive marker strip (handles LLM drift) ───────
+        # DeepSeek occasionally writes the markers without the underscore
+        # ([QUOTEREADY], [ARTWORKUPLOAD]) or with a space ([QUOTE READY]).
+        # The pre-v32.1 strip only caught the canonical form and let the
+        # variants through into the customer's inbox. Now we kill any
+        # bracket-wrapped marker token that LOOKS like ours, regardless
+        # of separator (underscore / space / nothing). Detect first so
+        # we can still flag had_quote_marker.
+        had_quote_marker = bool(_re.search(
+            r"\[\s*QUOTE[_\s]*READY\s*\]", reply_text, flags=_re.IGNORECASE,
+        ))
+        # Strip every [QUOTE READY] / [QUOTE_READY] / [QUOTEREADY] / [ARTWORK_*]
+        # / [CUSTOMER_FORM] variation, regardless of underscore / space.
+        reply_text = _re.sub(
+            r"\[\s*(QUOTE[_\s]*READY|ARTWORK[_\s]*UPLOAD|ARTWORK[_\s]*CHOICE|CUSTOMER[_\s]*FORM)\s*\]",
+            "",
+            reply_text,
+            flags=_re.IGNORECASE,
+        )
+        # Collapse the blank lines those markers may have left behind.
+        reply_text = _re.sub(r"\n{3,}", "\n\n", reply_text).strip()
 
         # If a quote was generated this turn, attach the PDF to the draft
         # so the customer gets the full branded quote without a separate
-        # "click this link" step. Strip the [QUOTE_READY] marker from the
-        # visible body — it's only meaningful to the web widget.
+        # "click this link" step. (Markers already stripped above.)
         attachments = None
-        had_quote_marker = "[QUOTE_READY]" in reply_text
-        reply_text_clean = reply_text.replace("[QUOTE_READY]", "").strip()
+        reply_text_clean = reply_text
 
         if result.get("quote_generated") and result.get("quote_id"):
             try:
@@ -998,7 +1003,14 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             organization_slug=org_slug,
         ) or "true").lower() == "true"
 
-        is_binding_quote = bool(had_quote_marker and attachments)
+        # v32.1 — bind on `quote_generated` (server-verified: the
+        # pricing tool actually ran and returned a price this turn) plus
+        # `attachments` (the PDF was generated). Don't rely on the
+        # marker text — DeepSeek occasionally writes [QUOTEREADY] (no
+        # underscore) or omits it altogether, and we'd auto-send the
+        # binding price email by mistake.
+        quote_generated_this_turn = bool(result.get("quote_generated"))
+        is_binding_quote = bool((quote_generated_this_turn or had_quote_marker) and attachments)
         is_escalation = bool(result.get("escalated"))
 
         draft_only = (not auto_send_enabled) or is_binding_quote or is_escalation
@@ -1012,9 +1024,9 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
         )
         _mlog.info(
             "%s: missive reply gating: should_send=%s reason=%s "
-            "had_quote=%s has_attachment=%s escalated=%s",
+            "had_quote_marker=%s quote_generated=%s has_attachment=%s escalated=%s",
             org_slug, should_send, gating_reason, had_quote_marker,
-            bool(attachments), is_escalation,
+            quote_generated_this_turn, bool(attachments), is_escalation,
         )
 
         try:
