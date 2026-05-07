@@ -79,3 +79,107 @@ def test_extract_inbound_email_skips_non_email():
 def test_extract_inbound_email_missing_ids_returns_none():
     assert missive.extract_inbound_email({}) is None
     assert missive.extract_inbound_email({"conversation": {}}) is None
+
+
+# ---------------------------------------------------------------------------
+# v32 — auto-send vs draft (the new `send` parameter on create_draft)
+# ---------------------------------------------------------------------------
+
+
+def test_create_draft_default_keeps_draft_state():
+    """Default behaviour (no `send` arg) must still produce send=false
+    in the payload. Locks in backwards compatibility."""
+    import asyncio
+    import json
+    import httpx
+    import respx
+
+    with respx.mock() as mock:
+        route = mock.post("https://public.missiveapp.com/v1/drafts").mock(
+            return_value=httpx.Response(200, json={"drafts": {"id": "draft-1"}})
+        )
+        asyncio.run(missive.create_draft(
+            conversation_id="conv-1",
+            html_body="<p>hi</p>",
+            from_address="info@just-print.ie",
+            from_name="Justin",
+            to_fields=[{"address": "c@example.com", "name": "C"}],
+            token="fake-token",
+        ))
+        body = json.loads(route.calls[0].request.read().decode())
+    assert body["drafts"]["send"] is False
+
+
+def test_create_draft_send_true_marks_payload_send_true():
+    """v32 — passing `send=True` must produce send=true in the payload
+    so Missive sends the message immediately on draft creation."""
+    import asyncio
+    import json
+    import httpx
+    import respx
+
+    with respx.mock() as mock:
+        route = mock.post("https://public.missiveapp.com/v1/drafts").mock(
+            return_value=httpx.Response(200, json={"drafts": {"id": "draft-2"}})
+        )
+        asyncio.run(missive.create_draft(
+            conversation_id="conv-2",
+            html_body="<p>STEP 1: please clarify the finish</p>",
+            from_address="info@just-print.ie",
+            from_name="Justin",
+            to_fields=[{"address": "c@example.com", "name": "C"}],
+            token="fake-token",
+            send=True,
+        ))
+        body = json.loads(route.calls[0].request.read().decode())
+    assert body["drafts"]["send"] is True
+    # And nothing else should change about the payload shape.
+    assert body["drafts"]["body"] == "<p>STEP 1: please clarify the finish</p>"
+    assert body["drafts"]["conversation"] == "conv-2"
+
+
+def test_create_draft_send_false_explicit_marks_payload_send_false():
+    """Explicit send=False must round-trip the same as the default."""
+    import asyncio
+    import json
+    import httpx
+    import respx
+
+    with respx.mock() as mock:
+        route = mock.post("https://public.missiveapp.com/v1/drafts").mock(
+            return_value=httpx.Response(200, json={"drafts": {"id": "draft-3"}})
+        )
+        asyncio.run(missive.create_draft(
+            conversation_id="conv-3",
+            html_body="<p>STEP 4: binding quote with PDF</p>",
+            from_address="info@just-print.ie",
+            from_name="Justin",
+            to_fields=[{"address": "c@example.com", "name": "C"}],
+            token="fake-token",
+            send=False,
+        ))
+        body = json.loads(route.calls[0].request.read().decode())
+    assert body["drafts"]["send"] is False
+
+
+def test_create_new_thread_draft_default_send_false():
+    """Outbound-from-web flow keeps the pre-v32 default: always drafts."""
+    import asyncio
+    import json
+    import httpx
+    import respx
+
+    with respx.mock() as mock:
+        route = mock.post("https://public.missiveapp.com/v1/drafts").mock(
+            return_value=httpx.Response(200, json={"drafts": {"id": "draft-4"}})
+        )
+        asyncio.run(missive.create_new_thread_draft(
+            html_body="<p>quote</p>",
+            from_address="info@just-print.ie",
+            from_name="Justin",
+            to_fields=[{"address": "c@example.com", "name": "C"}],
+            token="fake-token",
+            subject="Your quote from Just Print",
+        ))
+        body = json.loads(route.calls[0].request.read().decode())
+    assert body["drafts"]["send"] is False

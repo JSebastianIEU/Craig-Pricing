@@ -981,6 +981,42 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
         else:
             reply_subject = "Re: Your quote from Just Print"
 
+        # ── v32: auto-send vs draft gate ─────────────────────────────
+        # Default posture: auto-send the clarifying chatter (asking
+        # specs / artwork / funnel info / order-confirm acks) so Justin
+        # doesn't have to click Send 4 times per quote. Drafts ONLY
+        # when one of these fires:
+        #   1. The reply carries the binding price + PDF (had_quote_marker
+        #      AND attachments is non-empty). The customer must not see a
+        #      hallucinated total — Justin reviews and clicks Send.
+        #   2. Craig escalated (escalate_to_justin tool fired). Means
+        #      Craig couldn't handle the request — needs human judgement.
+        #   3. The org disabled auto-send via settings (emergency rollback
+        #      back to fully-human-reviewed).
+        auto_send_enabled = (_get_setting(
+            db, "missive_auto_send_enabled", "true",
+            organization_slug=org_slug,
+        ) or "true").lower() == "true"
+
+        is_binding_quote = bool(had_quote_marker and attachments)
+        is_escalation = bool(result.get("escalated"))
+
+        draft_only = (not auto_send_enabled) or is_binding_quote or is_escalation
+        should_send = not draft_only
+
+        gating_reason = (
+            "auto_send_disabled" if not auto_send_enabled
+            else "binding_quote_pdf" if is_binding_quote
+            else "escalation" if is_escalation
+            else "auto_send"
+        )
+        _mlog.info(
+            "%s: missive reply gating: should_send=%s reason=%s "
+            "had_quote=%s has_attachment=%s escalated=%s",
+            org_slug, should_send, gating_reason, had_quote_marker,
+            bool(attachments), is_escalation,
+        )
+
         try:
             asyncio.run(missive.create_draft(
                 conversation_id=evt["conversation_id"],
@@ -991,10 +1027,13 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
                 token=token,
                 subject=reply_subject,
                 attachments=attachments,
+                send=should_send,
             ))
             _mlog.info(
-                "%s: draft posted on conv %s (subject=%s, had_quote=%s)",
-                org_slug, evt["conversation_id"], reply_subject, had_quote_marker,
+                "%s: missive reply %s on conv %s (subject=%s, reason=%s)",
+                org_slug,
+                "sent" if should_send else "drafted",
+                evt["conversation_id"], reply_subject, gating_reason,
             )
         except Exception as draft_err:
             _mlog.error(

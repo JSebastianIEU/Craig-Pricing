@@ -162,6 +162,7 @@ async def create_new_thread_draft(
     token: str,
     subject: str,
     attachments: list[dict[str, str]] | None = None,
+    send: bool = False,
 ) -> dict[str, Any]:
     """
     Create a draft in a BRAND-NEW Missive conversation (thread).
@@ -171,9 +172,12 @@ async def create_new_thread_draft(
     them an email confirmation with the quote PDF + payment link.
 
     Per Missive's API, omitting `conversation` from the payload creates
-    a new thread keyed off `to_fields` + `from_field`. `send=False` keeps
-    it as a draft for Justin to review in his Missive inbox before
-    actually firing it to the customer.
+    a new thread keyed off `to_fields` + `from_field`. `send=False`
+    (default) keeps it as a draft for Justin to review in his Missive
+    inbox before actually firing it to the customer. `send=True` posts
+    the message immediately — currently unused by callers (web→email
+    outbound is always human-gated upstream by the dashboard Approve
+    button), but the parameter exists for API symmetry with create_draft.
 
     Returns the draft object Missive returns (we persist `drafts.id` on
     the Quote so we don't double-create on a retry).
@@ -184,7 +188,7 @@ async def create_new_thread_draft(
             "body": html_body,
             "from_field": {"address": from_address, "name": from_name},
             "to_fields": to_fields,
-            "send": False,
+            "send": bool(send),
         }
     }
     if attachments:
@@ -214,13 +218,19 @@ async def create_draft(
     token: str,
     subject: str | None = None,
     attachments: list[dict[str, str]] | None = None,
+    send: bool = False,
 ) -> dict[str, Any]:
     """
-    Create a DRAFT reply on an existing Missive conversation.
+    Create a reply on an existing Missive conversation.
 
-    `send` defaults to `false` server-side — the draft appears in the thread
-    for a human to review and send manually. That's exactly the human-in-the-
-    loop flow we want for v1.
+    `send=False` (default) — the message appears as a draft in the thread
+    for a human to review and send manually. Existing behaviour, kept for
+    backwards compat.
+
+    `send=True` (v32) — Missive sends the message immediately on draft
+    creation. Used by the auto-send path for clarifying replies (asking
+    specs, artwork question, funnel info, order-confirm acks). The
+    binding-quote-PDF email always stays as a draft.
 
     `attachments`, if passed, should be a list of
         {"filename": "...", "base64_data": "<b64>", "content_type": "application/pdf"}
@@ -232,7 +242,7 @@ async def create_draft(
             "body": html_body,
             "from_field": {"address": from_address, "name": from_name},
             "to_fields": to_fields,
-            "send": False,
+            "send": bool(send),
         }
     }
     if subject:
