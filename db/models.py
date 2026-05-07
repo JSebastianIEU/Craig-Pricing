@@ -294,6 +294,10 @@ class Quote(Base):
     total = Column(Float)
     status = Column(String(30), default="pending_approval")
     approved_by = Column(String(100))
+    # v33 — when Justin approved (dashboard click). Drives the lifecycle
+    # tracker on the dashboard. `approved_by` already exists (the user
+    # who clicked); `approved_at` is the matching timestamp.
+    approved_at = Column(DateTime, nullable=True)
     notes = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
@@ -351,6 +355,18 @@ class Quote(Base):
     # an accurate VAT breakdown without re-derivation.
     shipping_cost_ex_vat = Column(Float, nullable=False, default=0.0, server_default="0")
     shipping_cost_inc_vat = Column(Float, nullable=False, default=0.0, server_default="0")
+
+    # v33 — operator notification (Resend). Set when the
+    # 'quote ready for approval' email is sent to Justin. Idempotent:
+    # non-null means we've already pinged him for this quote and the
+    # second trigger should bail. `notification_message_id` is the
+    # Resend message id for audit; `notification_last_error` records
+    # the failure mode if the send 4xx'd / network'd / Resend was
+    # disabled in settings. The dashboard surfaces the error so Justin
+    # can retry.
+    notification_sent_at = Column(DateTime, nullable=True)
+    notification_message_id = Column(String(128), nullable=True)
+    notification_last_error = Column(Text, nullable=True)
 
     # Phase F — customer-uploaded artwork file. Cloud Storage URL +
     # original filename + size. (Singular columns kept for backwards

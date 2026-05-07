@@ -343,6 +343,21 @@ def submit_customer_info(
     db.commit()
     db.refresh(conv)
 
+    # ── v33: notify Justin that a new web-widget quote needs approval ─
+    # Form submission IS the customer's commitment signal on the web
+    # channel (analogous to "yes confirm" on email). Trigger the same
+    # idempotent helper used by the email channel handler. Catches its
+    # own errors so a Resend hiccup doesn't 500 the customer's form.
+    if quote_id_for_widget is not None:
+        try:
+            from notifications import trigger_approval_notification
+            trigger_approval_notification(
+                db, conv.organization_slug, quote_id_for_widget,
+            )
+        except Exception:
+            # Logged inside the helper; never block the customer.
+            pass
+
     return {
         "ok": True,
         "conversation_id": conv.id,

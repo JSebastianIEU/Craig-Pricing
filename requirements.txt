@@ -21,3 +21,7 @@ python-multipart>=0.0.9
 # Cloud Storage client for production artwork uploads. Falls back to
 # local disk in dev when CRAIG_ARTWORK_BUCKET is unset.
 google-cloud-storage>=2.14.0
+# Transactional email for ops notifications (v33). Used by notifications.py
+# to email Justin when a quote enters pending_approval. The Resend API key
+# is mounted from Cloud Run Secret Manager via the RESEND_API_KEY env var.
+resend>=2.0.0

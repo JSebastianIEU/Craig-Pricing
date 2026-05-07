@@ -82,6 +82,7 @@ def main() -> None:
     from scripts.v27_one_hour_design_status import migrate as v27_migrate
     from scripts.v30_artwork_will_send_later import migrate as v30_migrate
     from scripts.v31_missive_auto_send import migrate as v31_migrate
+    from scripts.v33_auto_send_and_notifications import migrate as v33_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -111,6 +112,7 @@ def main() -> None:
     _run("v27 one-hour design copy + In Progress order_status", v27_migrate)
     _run("v30 artwork_will_send_later flag on conversations", v30_migrate)
     _run("v31 missive auto-send setting (clarifying replies auto-send, PDF drafts)", v31_migrate)
+    _run("v33 dashboard approval + operator notifications + lifecycle UI", v33_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

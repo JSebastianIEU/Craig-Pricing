@@ -1083,6 +1083,11 @@ def update_quote(
     q.status = body.status
     if body.status in ("approved", "rejected"):
         q.approved_by = claims.email
+        # v33 — record the timestamp so the dashboard's lifecycle
+        # tracker can show "Approved by JS at HH:MM" on hover.
+        if body.status == "approved" and q.approved_at is None:
+            import datetime as _dt
+            q.approved_at = _dt.datetime.utcnow()
     if body.notes is not None:
         q.notes = body.notes
 
@@ -1108,15 +1113,39 @@ def update_quote(
             "error": sp.get("error"),
         }
 
-        # Missive outbound draft. Reads the just-persisted payment link
-        # off the quote row.
+        # v33 — Missive outbound, channel-aware:
+        #   • email-channel quote → reply in the existing customer
+        #     thread with `send=True` (no draft)
+        #   • web-channel quote   → start a NEW thread to the address
+        #     the customer entered in the widget form, also send=True
+        # Looks up the parent Conversation so we know which channel
+        # this quote came in on and (for email channel) which Missive
+        # thread to reply to.
+        parent_conv = (
+            db.query(Conversation)
+            .filter_by(id=q.conversation_id)
+            .first()
+            if q.conversation_id else None
+        )
+        target_thread = None
+        if (
+            parent_conv is not None
+            and (parent_conv.channel or "").strip().lower() == "missive"
+            and (parent_conv.external_id or "").strip()
+        ):
+            target_thread = parent_conv.external_id.strip()
+
         md: dict[str, Any] = {"ok": False, "skipped": True,
                               "skip_reason": "not_attempted",
                               "draft_id": None, "error": None}
         try:
             db.flush()
             from missive_outbound import send_quote_draft
-            md = send_quote_draft(db, q, org_slug)
+            md = send_quote_draft(
+                db, q, org_slug,
+                target_conversation_id=target_thread,
+                send_immediately=True,  # v33 — always auto-send the payment-link email
+            )
         except Exception as e:
             md = {"ok": False, "skipped": False, "skip_reason": None,
                   "draft_id": None, "error": f"missive_crashed:{type(e).__name__}"}
@@ -1126,6 +1155,10 @@ def update_quote(
             "skipped": bool(md.get("skipped")),
             "skip_reason": md.get("skip_reason"),
             "error": md.get("error"),
+            # v33 — surface which path was taken so the dashboard can
+            # show a more accurate toast ("Replied to <email>'s thread"
+            # vs "Sent new email to <address>").
+            "mode": "reply" if target_thread else "new_thread",
         }
 
     db.commit()

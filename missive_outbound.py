@@ -243,9 +243,29 @@ def _build_attachments(quote: Quote) -> list[dict[str, str]] | None:
     return attachments or None
 
 
-def send_quote_draft(db, quote: Quote, organization_slug: str) -> dict[str, Any]:
+def send_quote_draft(
+    db,
+    quote: Quote,
+    organization_slug: str,
+    *,
+    target_conversation_id: str | None = None,
+    send_immediately: bool = False,
+) -> dict[str, Any]:
     """
-    Create a brand-new Missive draft email to the customer for `quote`.
+    Create a Missive draft email to the customer for `quote`.
+
+    Two modes (controlled by `target_conversation_id`):
+      * `target_conversation_id=None` (default) — create a brand-new
+        Missive thread to the customer's email. Used for web-widget
+        quotes where the customer never had an email thread before.
+      * `target_conversation_id="<missive-conv-id>"` — REPLY in that
+        existing thread. Used for email-channel quotes (the customer
+        already has a thread with the PDF + price; the payment-link
+        email is a natural continuation).
+
+    `send_immediately=True` posts with `send=true` so Missive sends
+    the message right away. `send_immediately=False` (default) keeps
+    the message as a draft (the pre-v33 behaviour).
 
     See module docstring for the full contract. Short-circuits cleanly
     on every "shouldn't fire" condition rather than half-creating the
@@ -293,25 +313,45 @@ def send_quote_draft(db, quote: Quote, organization_slug: str) -> dict[str, Any]
     attachments = _build_attachments(quote)
 
     # ── 5. Fire ──────────────────────────────────────────────────────
+    # v33 — branch by target_conversation_id:
+    #   - reply-in-thread (email-channel approve)  → missive.create_draft
+    #   - new thread (web-channel approve)         → missive.create_new_thread_draft
+    # Both honor `send_immediately` to flip the payload's send flag.
     try:
-        result = asyncio.run(missive.create_new_thread_draft(
-            html_body=html_body,
-            from_address=from_addr,
-            from_name=from_name,
-            to_fields=[{"address": customer_email, "name": customer_name}],
-            token=token,
-            subject=subject,
-            attachments=attachments,
-        ))
+        if target_conversation_id:
+            result = asyncio.run(missive.create_draft(
+                conversation_id=str(target_conversation_id),
+                html_body=html_body,
+                from_address=from_addr,
+                from_name=from_name,
+                to_fields=[{"address": customer_email, "name": customer_name}],
+                token=token,
+                subject=subject,
+                attachments=attachments,
+                send=bool(send_immediately),
+            ))
+        else:
+            result = asyncio.run(missive.create_new_thread_draft(
+                html_body=html_body,
+                from_address=from_addr,
+                from_name=from_name,
+                to_fields=[{"address": customer_email, "name": customer_name}],
+                token=token,
+                subject=subject,
+                attachments=attachments,
+                send=bool(send_immediately),
+            ))
     except Exception as e:
         err = f"{type(e).__name__}: {str(e)[:200]}"
         quote.missive_last_error = err
         db.flush()
         # Audit log so Cloud Run logs surface the failure even when the
         # confirm_order reply itself succeeds (Missive is best-effort).
+        mode = "reply-in-thread" if target_conversation_id else "new-thread"
         print(
-            f"[missive_outbound] create_new_thread_draft FAILED for quote "
-            f"{quote.id} (org={organization_slug}): {err}",
+            f"[missive_outbound] {mode} FAILED for quote "
+            f"{quote.id} (org={organization_slug}, send_immediately="
+            f"{send_immediately}): {err}",
             flush=True,
         )
         return {"ok": False, "skipped": False, "skip_reason": None,

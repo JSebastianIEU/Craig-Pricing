@@ -986,6 +986,27 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             (result.get("reply") or "")[:1000],
         )
 
+        # ── v33: notify Justin when the customer commits ───────────
+        # Email channel commit signal: `confirm_order` tool fired this
+        # turn. Idempotent — bails if `notification_sent_at` is set.
+        # Catches its own errors so the customer flow continues even
+        # if Resend is down.
+        if result.get("order_confirmed") and result.get("quote_id"):
+            try:
+                from notifications import trigger_approval_notification
+                trigger_approval_notification(
+                    db, org_slug, int(result["quote_id"]),
+                )
+                _mlog.info(
+                    "%s: triggered approval notification (confirm_order) quote=%s",
+                    org_slug, result["quote_id"],
+                )
+            except Exception as notif_err:
+                _mlog.warning(
+                    "%s: notification trigger failed (non-fatal): %s",
+                    org_slug, notif_err,
+                )
+
         # Patch the sender's email onto the conversation row so downstream
         # turns + the dashboard know who's on the other side.
         if evt["from_address"]:
@@ -1134,22 +1155,24 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             organization_slug=org_slug,
         ) or "true").lower() == "true"
 
-        # v32.1 — bind on `quote_generated` (server-verified: the
-        # pricing tool actually ran and returned a price this turn) plus
-        # `attachments` (the PDF was generated). Don't rely on the
-        # marker text — DeepSeek occasionally writes [QUOTEREADY] (no
-        # underscore) or omits it altogether, and we'd auto-send the
-        # binding price email by mistake.
+        # v33 — ALL Missive replies auto-send, including the binding
+        # quote PDF. Justin's approval moment moved from "Missive draft
+        # Send button" to "dashboard Approve button". The PDF + price
+        # still go to the customer auto-magically; Justin only steps in
+        # AFTER the customer says "yes I want to order" (confirm_order
+        # tool fires → operator notification → dashboard Approve →
+        # payment-link email).
+        #
+        # The only remaining draft case is `escalation` — Craig couldn't
+        # handle the request and needs Justin's own words.
         quote_generated_this_turn = bool(result.get("quote_generated"))
-        is_binding_quote = bool((quote_generated_this_turn or had_quote_marker) and attachments)
         is_escalation = bool(result.get("escalated"))
 
-        draft_only = (not auto_send_enabled) or is_binding_quote or is_escalation
+        draft_only = (not auto_send_enabled) or is_escalation
         should_send = not draft_only
 
         gating_reason = (
             "auto_send_disabled" if not auto_send_enabled
-            else "binding_quote_pdf" if is_binding_quote
             else "escalation" if is_escalation
             else "auto_send"
         )
