@@ -41,6 +41,16 @@ def main() -> None:
 
     _run("init_db (create tables)", init_db)
 
+    # v34 — run the v34 DDL FIRST, before any ORM query against
+    # Product/Quote/SurchargeRule. Reason: db/models.py declares the
+    # v34 columns, so any `db.query(Product)` SELECT * fails on a
+    # Postgres that hasn't run v34 yet. Idempotent — re-running v34
+    # at the end is a no-op for column adds.
+    from scripts.v34_manual_review_and_product_surcharges import (
+        migrate_ddl_only as v34_ddl_only,
+    )
+    _run("v34 pre-DDL (columns must exist before any ORM query)", v34_ddl_only)
+
     # Only bootstrap pricing data if the DB is empty — otherwise this wipes
     # everything the user has edited since first deploy (system_prompt,
     # business_rules, catalog edits, etc.).
@@ -83,18 +93,7 @@ def main() -> None:
     from scripts.v30_artwork_will_send_later import migrate as v30_migrate
     from scripts.v31_missive_auto_send import migrate as v31_migrate
     from scripts.v33_auto_send_and_notifications import migrate as v33_migrate
-    from scripts.v34_manual_review_and_product_surcharges import (
-        migrate as v34_migrate,
-        migrate_ddl_only as v34_ddl_only,
-    )
-
-    # v34 DDL must run BEFORE any older migration that uses ORM queries
-    # against Product/Quote/SurchargeRule — those models now declare the
-    # v34 columns, so a `db.query(Product).all()` against an unmigrated
-    # Postgres errors with 'column products.manual_review_required does
-    # not exist'. Idempotent — re-running v34_migrate at the end re-checks
-    # and is a no-op for column adds.
-    _run("v34 pre-DDL (columns must exist before v2 ORM queries)", v34_ddl_only)
+    from scripts.v34_manual_review_and_product_surcharges import migrate as v34_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
