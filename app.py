@@ -124,6 +124,12 @@ class QuoteLargeFormatRequest(BaseModel):
     quantity: int
     needs_artwork: bool = False
     artwork_hours: float = 0.0
+    # v36 — dimensions for per-sq/m + per-sheet products. Optional;
+    # required only when the product's pricing_strategy is per_sqm or
+    # per_sheet (engine escalates with manual_review=True if missing).
+    width_mm: int | None = None
+    height_mm: int | None = None
+    area_sqm: float | None = None
 
 
 class QuoteBookletRequest(BaseModel):
@@ -269,9 +275,15 @@ def api_small_format(req: QuoteSmallFormatRequest, db: Session = Depends(get_db)
 
 @app.post("/quote/large-format", tags=["Quoting"])
 def api_large_format(req: QuoteLargeFormatRequest, db: Session = Depends(get_db)):
+    # v36 — pass dimensions through so per_sqm + per_sheet strategies
+    # actually compute prices instead of escalating.
     result = quote_large_format(
         db, req.product_key, req.quantity,
-        req.needs_artwork, req.artwork_hours,
+        needs_artwork=req.needs_artwork,
+        artwork_hours=req.artwork_hours,
+        width_mm=req.width_mm,
+        height_mm=req.height_mm,
+        area_sqm=req.area_sqm,
     )
     return result.to_dict()
 
