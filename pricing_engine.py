@@ -54,6 +54,18 @@ class EscalationResult:
     product_name: Optional[str] = None
     message: str = "This needs to be quoted by Justin directly."
 
+    # v34 — distinguishes "engine refused to price BY POLICY" (a per-sq/m
+    # or POA product is configured manual_review_required=True on the
+    # Product row) from "engine couldn't find a tier for this qty"
+    # (the legacy escalation path). The LLM shell handles them
+    # differently:
+    #   - manual_review=True → auto-create a Quote(status='needs_revision'),
+    #     fire the operator notification, ask the customer for the missing
+    #     detail (dimensions, etc.) without ever quoting a number.
+    #   - manual_review=False → the LLM may either retry with a known qty
+    #     OR call escalate_to_justin (legacy path).
+    manual_review: bool = False
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -158,11 +170,16 @@ def _get_surcharge_rule(
     organization_slug: str = DEFAULT_ORG_SLUG,
 ) -> tuple[float, str]:
     """
-    Return `(amount, kind)` for a named surcharge. Kind is either
-    'multiplier' (fraction, e.g. 0.20 for +20%) or 'additive' (flat
-    euro amount added once per job, e.g. 15.0 for +€15). Returns
-    `(0.0, 'multiplier')` when the rule isn't configured for this tenant
-    — i.e. applying a zero multiplier is a no-op.
+    Return `(amount, kind)` for a named surcharge — backwards-compatible
+    helper used by call sites that don't have a Product handy (e.g.
+    artwork hours). Does NOT honor scope filtering. Prefer
+    `_resolve_surcharge_for_product` for product-aware pricing.
+
+    Kind is either 'multiplier' (fraction, e.g. 0.20 for +20%) or
+    'additive' (flat euro amount added once per job, e.g. 15.0 for
+    +€15). Returns `(0.0, 'multiplier')` when the rule isn't
+    configured for this tenant — applying a zero multiplier is a
+    no-op.
     """
     rule = (
         db.query(SurchargeRule)
@@ -171,6 +188,70 @@ def _get_surcharge_rule(
     )
     if not rule:
         return (0.0, "multiplier")
+    kind = (rule.kind or "multiplier").strip().lower()
+    if kind not in ("multiplier", "additive"):
+        kind = "multiplier"
+    return (float(rule.multiplier or 0.0), kind)
+
+
+def _resolve_surcharge_for_product(
+    db: Session,
+    name: str,
+    product: Product,
+    organization_slug: str = DEFAULT_ORG_SLUG,
+) -> tuple[float, str]:
+    """
+    v34 — resolve a surcharge with product-aware scope. Most-specific
+    scope wins:
+
+      1. `applies_to_product_keys` non-empty → applies only when
+         product.key is in the list.
+      2. `applies_to_category` non-null → applies only when
+         product.category matches.
+      3. Both null → global, applies to everyone.
+
+    Returns `(0.0, 'multiplier')` when the rule isn't configured OR
+    when the configured scope doesn't include this product. Same
+    return shape as `_get_surcharge_rule` so call sites can swap
+    them with no other changes.
+
+    NOTE: A surcharge with product_keys but the current product
+    isn't in the list returns zeros — the surcharge is intentionally
+    OFF for that product. This is what fixes the v32-era bug where
+    e.g. soft_touch was nominally scoped to small_format but actually
+    fired on every product because applies_to_category was ignored.
+    """
+    rule = (
+        db.query(SurchargeRule)
+        .filter_by(organization_slug=organization_slug, name=name)
+        .first()
+    )
+    if not rule:
+        return (0.0, "multiplier")
+
+    # Most specific scope: applies_to_product_keys
+    keys = rule.applies_to_product_keys
+    if keys:
+        # JSON column comes back as list on Postgres, may be a JSON-
+        # encoded string on a fresh SQLite row depending on driver
+        # behavior — normalize.
+        if isinstance(keys, str):
+            try:
+                keys = json.loads(keys)
+            except json.JSONDecodeError:
+                keys = []
+        if isinstance(keys, list) and len(keys) > 0:
+            if product.key not in keys:
+                return (0.0, "multiplier")
+            # else: fall through to amount/kind read below
+
+    # Next: applies_to_category (only if no product-key list narrowed scope)
+    elif rule.applies_to_category:
+        if product.category != rule.applies_to_category:
+            return (0.0, "multiplier")
+
+    # Else: global — no narrowing, all products receive it.
+
     kind = (rule.kind or "multiplier").strip().lower()
     if kind not in ("multiplier", "additive"):
         kind = "multiplier"
@@ -349,6 +430,23 @@ def quote_small_format(
             product_name=product_key,
         )
 
+    # v34 — manual-review escalation. Some products are flagged as
+    # "always escalate" (per-sq/m, POA, custom-cut). Refuse to price
+    # them at runtime regardless of whether a tier exists; the LLM
+    # shell creates a Quote(status='needs_revision') and notifies
+    # Justin so he prices manually from the dashboard.
+    if product.manual_review_required:
+        return EscalationResult(
+            reason=product.manual_review_reason or "manual review required",
+            product_name=product.name,
+            manual_review=True,
+            message=(
+                "This product needs Justin's eyes — engine refused to "
+                "auto-quote. Customer should be told 'let me check' and "
+                "asked for the missing detail (dimensions in mm, etc.)."
+            ),
+        )
+
     tier = db.query(PriceTier).filter_by(
         product_id=product.id, spec_key="", quantity=quantity,
     ).first()
@@ -375,9 +473,15 @@ def quote_small_format(
     def _apply(name: str, label_pct: str, label_flat: str) -> None:
         """Look up a surcharge by name and fold it into the right accumulator
         based on its kind. Centralised so every surcharge (double_sided,
-        soft_touch, triplicate, ...) shares the same branch logic."""
+        soft_touch, triplicate, ...) shares the same branch logic.
+
+        v34 — uses `_resolve_surcharge_for_product` so per-product
+        and per-category scoping are honored. Surcharges that don't
+        target this product return zeros and are silently skipped."""
         nonlocal multiplier, additive
-        amount, kind = _get_surcharge_rule(db, name, organization_slug=organization_slug)
+        amount, kind = _resolve_surcharge_for_product(
+            db, name, product, organization_slug=organization_slug,
+        )
         if amount == 0.0:
             return
         if kind == "additive":
@@ -507,6 +611,12 @@ def quote_large_format(
     needs_artwork: bool = False,
     artwork_hours: float = 0.0,
     organization_slug: str = DEFAULT_ORG_SLUG,
+    # v34 — optional dimensions. Stamped onto the quote's `specs` so
+    # Justin sees them when manually pricing a per-sq/m product. NOT
+    # used to compute a price in v34 (the engine still escalates).
+    width_mm: Optional[int] = None,
+    height_mm: Optional[int] = None,
+    area_sqm: Optional[float] = None,
 ) -> QuoteResult | EscalationResult:
     """Look up a large-format price (scoped per tenant). Applies unit or bulk pricing based on quantity."""
 
@@ -523,6 +633,23 @@ def quote_large_format(
         return EscalationResult(
             reason=f"Product '{product_key}' not found in large-format catalog.",
             product_name=product_key,
+        )
+
+    # v34 — manual-review escalation. Per-sq/m + POA products are
+    # configured manual_review_required=True; refuse to auto-price them
+    # so a 500-qty vinyl-labels request never produces another €24,600
+    # quote like JP-0086. The LLM shell creates a Quote with
+    # status='needs_revision' and notifies Justin so he prices manually.
+    if product.manual_review_required:
+        return EscalationResult(
+            reason=product.manual_review_reason or "manual review required",
+            product_name=product.name,
+            manual_review=True,
+            message=(
+                "This product needs Justin's eyes — engine refused to "
+                "auto-quote. Customer should be told 'let me check' and "
+                "asked for the missing detail (dimensions in mm, etc.)."
+            ),
         )
 
     if quantity < (product.min_qty or 1):
@@ -617,6 +744,22 @@ def quote_booklet(
     if product is None:
         return EscalationResult(
             reason=f"Booklet type '{format.upper()} {binding.replace('_', ' ')}' not found.",
+        )
+
+    # v34 — manual-review escalation (parity with small/large format).
+    # Booklets aren't currently flagged manual_review_required in the
+    # catalog, but the guard keeps the three pricing entry points
+    # symmetric so a future POA booklet category lands cleanly.
+    if product.manual_review_required:
+        return EscalationResult(
+            reason=product.manual_review_reason or "manual review required",
+            product_name=product.name,
+            manual_review=True,
+            message=(
+                "This product needs Justin's eyes — engine refused to "
+                "auto-quote. Customer should be told 'let me check' and "
+                "asked for the missing detail."
+            ),
         )
 
     spec_key = f"{pages}pp|{cover_type}"

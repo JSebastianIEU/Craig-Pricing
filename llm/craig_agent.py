@@ -59,6 +59,7 @@ from sqlalchemy.orm import Session
 
 from pricing_engine import (
     quote_small_format, quote_large_format, quote_booklet, list_products,
+    EscalationResult,
 )
 from db import parse_artwork_files
 from db.models import Conversation, Quote
@@ -973,7 +974,10 @@ TOOLS = [
             "name": "quote_large_format",
             "description": (
                 "Get a price for a large-format product (banners, boards, signage, vehicle magnetics, "
-                "vinyl labels). Applies unit or bulk pricing based on quantity."
+                "vinyl labels). Applies unit or bulk pricing based on quantity. NOTE: per-sq/m "
+                "products (vinyl_labels, pvc_banners, window_graphics, floor_graphics, "
+                "mesh_banners, fabric_displays) will return manual_review=true — pass "
+                "width_mm/height_mm if the customer told you so Justin can manually price."
             ),
             "parameters": {
                 "type": "object",
@@ -988,7 +992,19 @@ TOOLS = [
                     },
                     "quantity": {
                         "type": "integer",
-                        "description": "Number of units or square metres (for per-sq/m products).",
+                        "description": "Number of units. For per-sq/m products this is the count of items the customer wants, NOT the area.",
+                    },
+                    "width_mm": {
+                        "type": "integer",
+                        "description": "Width per unit in millimetres. Pass this for per-sq/m products (vinyl labels, banners, graphics) when the customer has told you the size.",
+                    },
+                    "height_mm": {
+                        "type": "integer",
+                        "description": "Height per unit in millimetres. Pass alongside width_mm.",
+                    },
+                    "area_sqm": {
+                        "type": "number",
+                        "description": "Total area in square metres if the customer gave it directly (e.g. '10 m² of vinyl').",
                     },
                     "needs_artwork": {"type": "boolean"},
                     "artwork_hours": {"type": "number"},
@@ -1218,6 +1234,116 @@ TOOLS = [
 # =============================================================================
 
 
+def _handle_manual_review_escalation(
+    *,
+    db: Session,
+    args: dict,
+    result: EscalationResult,
+    conversation_id: int | None,
+    organization_slug: str,
+) -> dict:
+    """
+    v34 — handle a pricing tool that returned manual_review=True.
+
+    Auto-creates a Quote with status='needs_revision', no price, and
+    whatever specs the LLM passed (qty, dimensions, sides, finish).
+    Triggers the manual-review notification email to Justin and
+    returns a guidance dict the LLM uses to compose its reply.
+
+    The LLM is told NOT to invent a price; instead it should
+    acknowledge "let me check with Justin" and ask for the missing
+    detail (typically dimensions in mm).
+    """
+    # Best-effort: stamp the quote with the captured specs. The LLM
+    # may or may not have passed dimensions; either way, what's
+    # captured here is what Justin sees in the manual-pricing form.
+    specs: dict = {}
+    for key in (
+        "quantity", "double_sided", "finish",
+        "width_mm", "height_mm", "area_sqm",
+        "format", "binding", "pages", "cover_type",
+        "needs_artwork", "artwork_hours",
+    ):
+        v = args.get(key)
+        if v is not None:
+            specs[key] = v
+
+    quote_id: Optional[int] = None
+    try:
+        quote = Quote(
+            organization_slug=organization_slug,
+            conversation_id=conversation_id,
+            product_key=args.get("product_key") or specs.get("format") or None,
+            specs=specs,
+            base_price=None,
+            surcharges=[],
+            final_price_ex_vat=None,
+            vat_amount=None,
+            final_price_inc_vat=None,
+            artwork_cost=0.0,
+            total=None,
+            status="needs_revision",
+            manual_review_reason=result.reason,
+            notes=None,
+        )
+        db.add(quote)
+        db.flush()
+        quote_id = quote.id
+        db.commit()
+        print(
+            f"[craig] manual_review: created Quote JP-{quote.id:04d} "
+            f"product={quote.product_key} reason={result.reason!r} "
+            f"specs={specs!r}",
+            flush=True,
+        )
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        print(
+            f"[craig] manual_review: FAILED to create needs_revision "
+            f"quote err={type(e).__name__}: {e}",
+            flush=True,
+        )
+        # Fall through — even without a Quote row, return guidance to
+        # the LLM so the customer gets a coherent reply.
+
+    # Fire operator notification (idempotent on notification_sent_at).
+    if quote_id is not None:
+        try:
+            from notifications import trigger_manual_review_notification
+            trigger_manual_review_notification(db, organization_slug, quote_id)
+        except Exception as ne:
+            print(
+                f"[craig] manual_review: notification failed (non-fatal) "
+                f"err={type(ne).__name__}: {ne}",
+                flush=True,
+            )
+
+    # Return guidance dict — the LLM sees this as the tool's output.
+    return {
+        "success": False,
+        "escalate": True,
+        "manual_review": True,
+        "needs_revision_quote_id": quote_id,
+        "reason": result.reason,
+        "message": (
+            "ACKNOWLEDGE to the customer that Justin will check + come "
+            "back to them, and ASK FOR DIMENSIONS (width × height per "
+            "unit in mm) if you haven't already. NEVER invent a price. "
+            "NEVER use 'around', 'roughly', 'about', 'approximately'. "
+            "Then call save_customer_info if you don't have name+email "
+            "yet, and stop. Do NOT call any other quote tool on this "
+            "turn.\n\n"
+            "Recommended wording: 'Let me check that with Justin and "
+            "get back to you 👍 Quick question first — what size is "
+            "each label (width × height in mm)?' (adapt the noun "
+            "'label' to whatever the customer asked about)."
+        ),
+    }
+
+
 def _exec_tool(
     db: Session,
     name: str,
@@ -1272,9 +1398,25 @@ def _exec_tool(
                 artwork_hours=float(args.get("artwork_hours", 0.0)),
                 organization_slug=organization_slug,
             )
+            if isinstance(result, EscalationResult) and result.manual_review:
+                return _handle_manual_review_escalation(
+                    db=db,
+                    args=args,
+                    result=result,
+                    conversation_id=conversation_id,
+                    organization_slug=organization_slug,
+                )
             return result.to_dict()
 
         if name == "quote_large_format":
+            # v34 — accept dimensions from the LLM. Even though the
+            # engine still escalates per-sq/m products by policy,
+            # capturing the dimensions here means they're stamped onto
+            # the needs_revision Quote's specs so Justin can manually
+            # price it without emailing the customer back.
+            _w = args.get("width_mm")
+            _h = args.get("height_mm")
+            _a = args.get("area_sqm")
             result = quote_large_format(
                 db,
                 product_key=args["product_key"],
@@ -1282,7 +1424,21 @@ def _exec_tool(
                 needs_artwork=bool(args.get("needs_artwork", False)),
                 artwork_hours=float(args.get("artwork_hours", 0.0)),
                 organization_slug=organization_slug,
+                width_mm=int(_w) if _w is not None else None,
+                height_mm=int(_h) if _h is not None else None,
+                area_sqm=float(_a) if _a is not None else None,
             )
+            # If the engine refused by manual-review policy, hand off to
+            # the v34 escalation handler — auto-create a Quote with
+            # status='needs_revision', notify Justin, return guidance.
+            if isinstance(result, EscalationResult) and result.manual_review:
+                return _handle_manual_review_escalation(
+                    db=db,
+                    args=args,
+                    result=result,
+                    conversation_id=conversation_id,
+                    organization_slug=organization_slug,
+                )
             return result.to_dict()
 
         if name == "quote_booklet":
@@ -1297,6 +1453,14 @@ def _exec_tool(
                 artwork_hours=float(args.get("artwork_hours", 0.0)),
                 organization_slug=organization_slug,
             )
+            if isinstance(result, EscalationResult) and result.manual_review:
+                return _handle_manual_review_escalation(
+                    db=db,
+                    args=args,
+                    result=result,
+                    conversation_id=conversation_id,
+                    organization_slug=organization_slug,
+                )
             return result.to_dict()
 
         if name == "list_products":

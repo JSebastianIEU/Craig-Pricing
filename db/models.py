@@ -69,6 +69,21 @@ class Product(Base):
     pricing_unit = Column(String(60))
     min_qty = Column(Integer, default=1)
 
+    # v34 — manual-review escalation flag. When True, Craig refuses to
+    # auto-quote this product and instead creates a Quote with
+    # status='needs_revision' so Justin prices it manually from the
+    # dashboard. Auto-set for the six per-sq/m products in v34
+    # migration; can also be flipped on POA items / rush items / any
+    # product where the catalog price is unreliable.
+    manual_review_required = Column(
+        Boolean, nullable=False, default=False, server_default="0",
+    )
+    manual_review_reason = Column(Text, nullable=True)
+    # v34 — operator-only notes. Distinct from `notes` (which is
+    # customer-facing — Craig may quote it back). `internal_notes`
+    # NEVER reaches the customer; it's strictly for the dashboard.
+    internal_notes = Column(Text, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -115,10 +130,21 @@ class ProductAlias(Base):
 class SurchargeRule(Base):
     """
     Named surcharge rules. Each tenant defines their own.
+
     `kind`:
       - multiplier : applies as price * (1 + multiplier)
       - additive   : adds a fixed amount per unit (multiplier holds the amount)
-    `applies_to_category` is optional — null means applies to all products.
+
+    Scope precedence — most specific wins (v34):
+      1. `applies_to_product_keys` non-empty → only applies to products
+         whose `key` is in the list.
+      2. `applies_to_category` non-null → only applies to products in
+         that category.
+      3. Both null → global (applies to every product in the org).
+
+    If both keys + category are set, product-keys wins. The category
+    field is preserved for backwards compatibility with v32 surcharges
+    that were already category-scoped.
     """
     __tablename__ = "surcharge_rules"
 
@@ -128,6 +154,9 @@ class SurchargeRule(Base):
     multiplier = Column(Float, nullable=False)
     kind = Column(String(20), nullable=False, default="multiplier")
     applies_to_category = Column(String(80))
+    # v34 — per-product scoping. JSON list of product `key` strings.
+    # When non-empty, this overrides applies_to_category at runtime.
+    applies_to_product_keys = Column(JSON, nullable=True)
     description = Column(Text)
 
     __table_args__ = (
@@ -368,6 +397,23 @@ class Quote(Base):
     notification_message_id = Column(String(128), nullable=True)
     notification_last_error = Column(Text, nullable=True)
 
+    # v34 — manual-review escalation. When the engine detects a
+    # product flagged manual_review_required (per-sq/m, POA, rush
+    # job), Craig auto-creates a Quote with status='needs_revision'
+    # and final_price_inc_vat=NULL — Justin prices it from the
+    # dashboard. The reason is copied from Product.manual_review_reason
+    # so the email + sidebar can show why without joining back.
+    manual_review_reason = Column(Text, nullable=True)
+    # Justin's hand-typed price + audit. Set via the
+    # PATCH /quotes/{id}/manual-price endpoint, which then flips the
+    # status to 'pending_approval' so the v33 approval pipeline takes
+    # over (Resend approval email → Approve click → payment link).
+    manual_quote_price_inc_vat = Column(Float, nullable=True)
+    manual_quote_price_ex_vat = Column(Float, nullable=True)
+    manual_quote_notes = Column(Text, nullable=True)
+    manually_priced_at = Column(DateTime, nullable=True)
+    manually_priced_by = Column(String(120), nullable=True)
+
     # Phase F — customer-uploaded artwork file. Cloud Storage URL +
     # original filename + size. (Singular columns kept for backwards
     # compat with code paths that haven't been updated to read the
@@ -389,4 +435,51 @@ class Quote(Base):
     __table_args__ = (
         Index("ix_quote_org_status", "organization_slug", "status"),
         Index("ix_quote_org_created", "organization_slug", "created_at"),
+    )
+
+
+# =============================================================================
+# PRICING VERIFICATION (v34)
+# =============================================================================
+
+
+class PricingVerificationFlag(Base):
+    """
+    v34 — operator-side flag + comment for a (product, quantity, spec_key)
+    row in the Pricing Verification table.
+
+    Justin uses the new dashboard tab to scan every product's calculated
+    price at representative quantities, flag any that look wrong, and
+    leave a per-row note. Persisting the flag means his observations
+    survive page reloads + Excel re-exports.
+
+    Distinct from Product.internal_notes (per-product) — these flags
+    are per-product-quantity-pairing, so he can flag "100 business
+    cards is wrong" without affecting the quantity-1 tier.
+    """
+    __tablename__ = "pricing_verification_flags"
+
+    id = Column(Integer, primary_key=True)
+    organization_slug = Column(String(80), nullable=False, default=DEFAULT_ORG_SLUG, index=True)
+    product_key = Column(String(80), nullable=False, index=True)
+    quantity = Column(Integer, nullable=False)
+    # spec_key disambiguates booklets ("32pp|soft_touch") and similar
+    # multi-axis products. Empty string for products that don't use it.
+    spec_key = Column(String(120), nullable=False, default="", server_default="")
+    flagged_wrong = Column(Boolean, nullable=False, default=False, server_default="0")
+    comment = Column(Text, nullable=True)
+    flagged_by = Column(String(120), nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_slug", "product_key", "quantity", "spec_key",
+            name="uq_pricing_verification_flag",
+        ),
+        Index(
+            "ix_pricing_verification_org_prod",
+            "organization_slug", "product_key",
+        ),
     )

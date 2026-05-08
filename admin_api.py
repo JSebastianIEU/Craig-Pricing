@@ -33,6 +33,7 @@ from db.models import (
     CategoryTaxMap,
     Conversation,
     PriceTier,
+    PricingVerificationFlag,
     Product,
     Quote,
     Setting,
@@ -272,6 +273,11 @@ def _product_to_dict(p: Product, tiers: list[PriceTier]) -> dict[str, Any]:
         "bulk_price": p.bulk_price,
         "bulk_threshold": p.bulk_threshold,
         "min_qty": p.min_qty,
+        # v34 — manual-review escalation flag + reason. When True,
+        # Craig refuses to auto-quote this product.
+        "manual_review_required": bool(getattr(p, "manual_review_required", False)),
+        "manual_review_reason": getattr(p, "manual_review_reason", None),
+        "internal_notes": getattr(p, "internal_notes", None),
         "tiers": [
             {"id": t.id, "spec_key": t.spec_key, "quantity": t.quantity, "price": t.price}
             for t in tiers
@@ -329,6 +335,11 @@ class CreateProductRequest(BaseModel):
     bulk_price: Optional[float] = None
     bulk_threshold: Optional[int] = None
     min_qty: Optional[int] = 1
+    # v34 — manual-review fields. Default False; explicit True flips
+    # this product's quotes to escalate-only.
+    manual_review_required: Optional[bool] = False
+    manual_review_reason: Optional[str] = Field(default=None, max_length=500)
+    internal_notes: Optional[str] = Field(default=None, max_length=2000)
 
     @field_validator("pricing_strategy")
     @classmethod
@@ -387,6 +398,9 @@ def create_product(
         bulk_price=body.bulk_price,
         bulk_threshold=body.bulk_threshold,
         min_qty=body.min_qty or 1,
+        manual_review_required=bool(body.manual_review_required),
+        manual_review_reason=body.manual_review_reason,
+        internal_notes=body.internal_notes,
     )
     db.add(p)
     db.commit()
@@ -411,6 +425,11 @@ class UpdateProductRequest(BaseModel):
     min_qty: Optional[int] = None
     pricing_unit: Optional[str] = None
     price_per: Optional[str] = None
+    # v34 — manual-review controls. The PATCH handler uses
+    # exclude_unset so omitting these leaves the existing flag intact.
+    manual_review_required: Optional[bool] = None
+    manual_review_reason: Optional[str] = Field(default=None, max_length=500)
+    internal_notes: Optional[str] = Field(default=None, max_length=2000)
 
     @field_validator("pricing_strategy")
     @classmethod
@@ -724,6 +743,11 @@ def _surcharge_to_dict(s: SurchargeRule) -> dict[str, Any]:
         "multiplier": s.multiplier,
         "kind": s.kind,
         "applies_to_category": s.applies_to_category,
+        # v34 — per-product scoping. JSON list of product `key` strings,
+        # or null for category/global scope. When non-empty,
+        # applies_to_product_keys takes precedence over
+        # applies_to_category at runtime (most-specific-wins).
+        "applies_to_product_keys": getattr(s, "applies_to_product_keys", None),
         "description": s.description,
     }
 
@@ -745,6 +769,9 @@ class CreateSurchargeRequest(BaseModel):
     multiplier: float
     kind: str = Field(default="multiplier")
     applies_to_category: Optional[str] = None
+    # v34 — per-product scoping. When non-empty, this surcharge ONLY
+    # applies to listed product keys (overrides category-scoping).
+    applies_to_product_keys: Optional[list[str]] = None
     description: Optional[str] = None
 
     @field_validator("kind")
@@ -769,12 +796,27 @@ def create_surcharge(
     if db.query(SurchargeRule).filter_by(organization_slug=target_org, name=body.name).first():
         raise HTTPException(status_code=409, detail="Surcharge with that name already exists")
 
+    # v34 — validate product keys exist for this org
+    if body.applies_to_product_keys:
+        existing_keys = {
+            p.key for p in db.query(Product.key)
+            .filter_by(organization_slug=target_org).all()
+        }
+        unknown = [k for k in body.applies_to_product_keys if k not in existing_keys]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown product keys: {unknown}. Surcharge "
+                       f"applies_to_product_keys must reference existing products.",
+            )
+
     s = SurchargeRule(
         organization_slug=target_org,
         name=body.name,
         multiplier=body.multiplier,
         kind=body.kind,
         applies_to_category=body.applies_to_category,
+        applies_to_product_keys=body.applies_to_product_keys,
         description=body.description,
     )
     db.add(s)
@@ -789,6 +831,8 @@ class UpdateSurchargeRequest(BaseModel):
     multiplier: Optional[float] = None
     kind: Optional[str] = None
     applies_to_category: Optional[str] = None
+    # v34 — per-product scoping. Pass an empty list to clear it.
+    applies_to_product_keys: Optional[list[str]] = None
     description: Optional[str] = None
 
 
@@ -805,7 +849,25 @@ def update_surcharge(
     s = _scope(db.query(SurchargeRule), SurchargeRule, claims, org_slug).filter(SurchargeRule.id == surcharge_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="Surcharge not found")
-    for k, v in body.model_dump(exclude_unset=True).items():
+
+    # v34 — validate product keys exist for this org before commit
+    update_data = body.model_dump(exclude_unset=True)
+    if "applies_to_product_keys" in update_data and update_data["applies_to_product_keys"]:
+        existing_keys = {
+            p.key for p in db.query(Product.key)
+            .filter_by(organization_slug=s.organization_slug).all()
+        }
+        unknown = [
+            k for k in update_data["applies_to_product_keys"]
+            if k not in existing_keys
+        ]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown product keys: {unknown}.",
+            )
+
+    for k, v in update_data.items():
         setattr(s, k, v)
     db.commit()
     db.refresh(s)
@@ -1019,6 +1081,30 @@ def _quote_to_dict(q: Quote) -> dict[str, Any]:
             }
             for i, e in enumerate(parse_artwork_files(getattr(q, "artwork_files", None)))
         ],
+        # v33 — operator notification audit
+        "approved_at": (
+            q.approved_at.isoformat()
+            if getattr(q, "approved_at", None) else None
+        ),
+        "notification_sent_at": (
+            q.notification_sent_at.isoformat()
+            if getattr(q, "notification_sent_at", None) else None
+        ),
+        "notification_message_id": getattr(q, "notification_message_id", None),
+        "notification_last_error": getattr(q, "notification_last_error", None),
+        # v34 — manual-review escalation. Populated when the engine
+        # refused to auto-quote (per-sq/m, POA, etc.) and the LLM
+        # auto-created a needs_revision Quote. Justin uses the
+        # dashboard ManualPricingForm to type the price.
+        "manual_review_reason": getattr(q, "manual_review_reason", None),
+        "manual_quote_price_inc_vat": getattr(q, "manual_quote_price_inc_vat", None),
+        "manual_quote_price_ex_vat": getattr(q, "manual_quote_price_ex_vat", None),
+        "manual_quote_notes": getattr(q, "manual_quote_notes", None),
+        "manually_priced_at": (
+            q.manually_priced_at.isoformat()
+            if getattr(q, "manually_priced_at", None) else None
+        ),
+        "manually_priced_by": getattr(q, "manually_priced_by", None),
     }
 
 
@@ -1043,7 +1129,15 @@ def list_quotes(
 
 class UpdateQuoteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    status: str = Field(..., pattern=r"^(pending_approval|approved|sent|accepted|rejected)$")
+    # v34 — `needs_revision` is the new manual-pricing status. Justin
+    # cannot transition needs_revision -> approved directly via this
+    # endpoint; he must save a manual price first via the dedicated
+    # /manual-price PATCH (which flips it to pending_approval, after
+    # which a normal approve works).
+    status: str = Field(
+        ...,
+        pattern=r"^(pending_approval|approved|sent|accepted|rejected|needs_revision)$",
+    )
     notes: Optional[str] = None
 
 
@@ -1080,6 +1174,21 @@ def update_quote(
         raise HTTPException(status_code=404, detail="Quote not found")
 
     prev_status = q.status
+
+    # v34 — gate: cannot transition needs_revision -> approved without
+    # going through the manual-price endpoint first. This guarantees
+    # final_price_inc_vat is non-null before Stripe payment-link
+    # creation runs (which would otherwise crash on a NULL price).
+    if prev_status == "needs_revision" and body.status == "approved":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot approve a needs_revision quote directly. Save "
+                "a manual price first via "
+                "PATCH /admin/api/orgs/{org_slug}/quotes/{id}/manual-price."
+            ),
+        )
+
     q.status = body.status
     if body.status in ("approved", "rejected"):
         q.approved_by = claims.email
@@ -1167,6 +1276,144 @@ def update_quote(
     if integrations:
         response["integrations"] = integrations
     return response
+
+
+# ============================================================================
+# v34 — manual pricing (Justin types a price for a needs_revision quote)
+# ============================================================================
+
+
+class ManualPriceBody(BaseModel):
+    """Body for PATCH /quotes/{id}/manual-price.
+
+    Justin types `price_inc_vat`. If `price_ex_vat` is omitted, we derive
+    it from the product's category VAT rate. `notes` are persisted
+    separately on `manual_quote_notes` so they don't clobber any
+    customer-facing `quote.notes`.
+    """
+    model_config = ConfigDict(extra="forbid")
+    price_inc_vat: float = Field(gt=0, description="Inc-VAT total Justin wants to charge.")
+    price_ex_vat: Optional[float] = Field(
+        default=None,
+        description="Optional. Auto-derived from category VAT rate if omitted.",
+    )
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+@router.patch("/orgs/{org_slug}/quotes/{quote_id}/manual-price")
+def manual_price_quote(
+    org_slug: str,
+    quote_id: int,
+    body: ManualPriceBody,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    v34 — save Justin's manual price for a needs_revision quote and
+    flip the status to pending_approval.
+
+    The quote MUST be at status='needs_revision' (the engine flagged
+    it as manual-review-required and the LLM auto-created the row).
+    Once Justin saves a price, the row plugs straight into the v33
+    approval pipeline — the v33 'ready for approval' Resend email
+    fires, then a single Approve click does the rest (Stripe link +
+    Missive auto-send).
+
+    Idempotent: a second call with the same price + notes is a no-op
+    (status stays at pending_approval, manually_priced_at is left
+    unchanged).
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_member")
+
+    q = (
+        _scope(db.query(Quote), Quote, claims, org_slug)
+        .filter(Quote.id == quote_id)
+        .first()
+    )
+    if not q:
+        raise HTTPException(status_code=404, detail="Quote not found")
+
+    if q.status != "needs_revision":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Quote is at status='{q.status}'. Manual pricing only "
+                f"applies to quotes at status='needs_revision'."
+            ),
+        )
+
+    # Derive ex-VAT if not provided. Use the product's category to
+    # find the right VAT rate, fall back to the standard Irish 23%.
+    price_inc = round(float(body.price_inc_vat), 2)
+    if body.price_ex_vat is not None:
+        price_ex = round(float(body.price_ex_vat), 2)
+    else:
+        from pricing_engine import _get_vat_rate_for_category
+        # Best-effort category lookup. If the product is unknown
+        # (key was null on the needs_revision row — shouldn't happen
+        # but be defensive), default to 23%.
+        category = "small_format"
+        if q.product_key:
+            prod = (
+                db.query(Product)
+                .filter_by(organization_slug=org_slug, key=q.product_key)
+                .first()
+            )
+            if prod and prod.category:
+                category = prod.category
+        vat_rate = _get_vat_rate_for_category(db, category, organization_slug=org_slug)
+        price_ex = round(price_inc / (1.0 + vat_rate), 2)
+
+    vat_amount = round(price_inc - price_ex, 2)
+
+    # Persist manual values + audit
+    import datetime as _dt
+    q.manual_quote_price_inc_vat = price_inc
+    q.manual_quote_price_ex_vat = price_ex
+    q.manual_quote_notes = body.notes
+    q.manually_priced_at = _dt.datetime.utcnow()
+    q.manually_priced_by = claims.email
+
+    # Mirror onto the canonical price columns so downstream code
+    # (PDF, Stripe link, dashboard display) reads consistent values.
+    q.final_price_ex_vat = price_ex
+    q.vat_amount = vat_amount
+    q.final_price_inc_vat = price_inc
+    # `total` historically = final_inc + artwork_inc + shipping_inc.
+    # Manual quotes don't have separate artwork/shipping line items
+    # (Justin is responsible for including everything in price_inc),
+    # so total = price_inc here.
+    q.total = price_inc
+
+    # Reset the v33 notification flag so the 'ready for approval'
+    # email fires when the trigger runs next (it's idempotent on
+    # notification_sent_at, so we need to clear it for the new
+    # life-cycle stage).
+    q.notification_sent_at = None
+    q.notification_message_id = None
+    q.notification_last_error = None
+
+    # Flip status — now part of the v33 approval queue.
+    q.status = "pending_approval"
+
+    db.commit()
+    db.refresh(q)
+
+    # Fire v33 approval-ready notification (idempotent — safe even if
+    # the customer or some other path already triggered it once).
+    try:
+        from notifications import trigger_approval_notification
+        trigger_approval_notification(db, org_slug, q.id)
+    except Exception as e:
+        # Logged inside trigger; never block the manual-price save.
+        print(
+            f"[admin_api] manual_price: post-save approval notification "
+            f"failed (non-fatal) err={type(e).__name__}: {e}",
+            flush=True,
+        )
+
+    return {"quote": _quote_to_dict(q), "noop": False}
 
 
 # ----------------------------------------------------------------------------
@@ -2595,4 +2842,326 @@ def get_metrics(
             {"date": str(day), "count": int(cnt), "value": round(float(val), 2)}
             for day, cnt, val in by_day_rows
         ],
+    }
+
+
+# ============================================================================
+# v34 — Pricing Verification table + price preview
+# ----------------------------------------------------------------------------
+# Justin uses these endpoints in the Pricing tab to (a) sanity-check
+# every product's calculated price at representative quantities, (b)
+# flag rows that look wrong, (c) leave per-row comments, (d) export
+# the whole table to Excel for offline review, and (e) live-preview a
+# single product's price as he edits its tier/strategy.
+# ============================================================================
+
+
+def _representative_quantities(p: Product, tiers: list[PriceTier]) -> list[tuple[int, str]]:
+    """Return a list of (quantity, spec_key) pairs to evaluate for a
+    given product's verification table. Strategy-aware:
+
+      tiered          → every PriceTier qty (spec_key='')
+      per_unit        → [1, 10, 50, 100, 500] (spec_key='')
+      per_unit_metric → [1, 10, 50, 100, 500] (spec_key='')
+      bulk_break      → [bulk_threshold-1, bulk_threshold, bulk_threshold*2]
+                        capped at 1+ (spec_key='')
+      per_job         → every (spec_key, qty) on PriceTier (booklets)
+    """
+    strategy = (p.pricing_strategy or "tiered").lower()
+
+    if strategy == "tiered":
+        return [(t.quantity, t.spec_key or "") for t in tiers if (t.spec_key or "") == ""]
+
+    if strategy in ("per_unit", "per_unit_metric"):
+        return [(q, "") for q in (1, 10, 50, 100, 500)]
+
+    if strategy == "bulk_break":
+        bt = max(1, int(p.bulk_threshold or 10))
+        return [(max(1, bt - 1), ""), (bt, ""), (bt * 2, "")]
+
+    if strategy == "per_job":
+        return [(t.quantity, t.spec_key or "") for t in tiers]
+
+    # Fallback
+    return [(q, "") for q in (1, 10, 100)]
+
+
+@router.get("/orgs/{org_slug}/pricing-verification")
+def pricing_verification(
+    org_slug: str,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    v34 — list every product × representative quantity pair with the
+    engine's calculated price. For products flagged
+    `manual_review_required=True`, no price is calculated; the row
+    carries the escalation reason instead.
+
+    Joins the `pricing_verification_flags` table so any rows the
+    operator has flagged as wrong (or commented on) round-trip.
+    """
+    access_guard(org_slug, claims)
+
+    # Lazy-import to avoid a circular dep at module load
+    from pricing_engine import (
+        quote_small_format, quote_large_format, quote_booklet,
+        EscalationResult,
+    )
+
+    target_org = (
+        org_slug if claims.role == "strategos_admin" else claims.org_slug
+    )
+
+    products = (
+        db.query(Product)
+        .filter_by(organization_slug=target_org)
+        .order_by(Product.category, Product.name)
+        .all()
+    )
+
+    # Pre-load all flags for this org so we can do an in-memory join
+    # rather than N+1 queries.
+    flag_rows = (
+        db.query(PricingVerificationFlag)
+        .filter_by(organization_slug=target_org)
+        .all()
+    )
+    flag_index: dict[tuple[str, int, str], PricingVerificationFlag] = {
+        (f.product_key, f.quantity, f.spec_key or ""): f for f in flag_rows
+    }
+
+    rows: list[dict[str, Any]] = []
+    for p in products:
+        tiers = (
+            db.query(PriceTier)
+            .filter_by(product_id=p.id)
+            .order_by(PriceTier.spec_key, PriceTier.quantity)
+            .all()
+        )
+        pairs = _representative_quantities(p, tiers)
+        for qty, spec_key in pairs:
+            row: dict[str, Any] = {
+                "product_key": p.key,
+                "product_name": p.name,
+                "category": p.category,
+                "pricing_strategy": p.pricing_strategy,
+                "pricing_unit": p.pricing_unit,
+                "quantity": qty,
+                "spec_key": spec_key,
+                "manual_review_required": bool(p.manual_review_required),
+                "internal_notes": p.internal_notes,
+            }
+
+            # Run the engine for the matching family. Wrap in try/except
+            # so a single broken product doesn't 500 the whole request.
+            try:
+                if p.category == "small_format":
+                    result = quote_small_format(
+                        db, product_key=p.key, quantity=qty,
+                        organization_slug=target_org,
+                    )
+                elif p.category == "large_format":
+                    result = quote_large_format(
+                        db, product_key=p.key, quantity=qty,
+                        organization_slug=target_org,
+                    )
+                elif p.category == "booklet" and spec_key:
+                    # spec_key format: "{pages}pp|{cover_type}"
+                    parts = spec_key.split("|")
+                    pages = int(parts[0].rstrip("pp")) if parts else 0
+                    cover = parts[1] if len(parts) > 1 else "self_cover"
+                    binding = "saddle_stitch" if "saddle_stitch" in p.key else "perfect_bound"
+                    fmt = "a5" if "a5" in p.key else "a4"
+                    result = quote_booklet(
+                        db, format=fmt, binding=binding, pages=pages,
+                        cover_type=cover, quantity=qty,
+                        organization_slug=target_org,
+                    )
+                else:
+                    result = None
+
+                if isinstance(result, EscalationResult):
+                    row["calculated_price_inc_vat"] = None
+                    row["calculated_price_ex_vat"] = None
+                    row["surcharges_applied"] = []
+                    row["escalation_reason"] = result.reason
+                elif result is not None and getattr(result, "success", False):
+                    row["calculated_price_inc_vat"] = result.final_price_inc_vat
+                    row["calculated_price_ex_vat"] = result.final_price_ex_vat
+                    row["surcharges_applied"] = list(result.surcharges_applied or [])
+                    row["escalation_reason"] = None
+                else:
+                    row["calculated_price_inc_vat"] = None
+                    row["calculated_price_ex_vat"] = None
+                    row["surcharges_applied"] = []
+                    row["escalation_reason"] = "engine returned no result"
+            except Exception as e:
+                row["calculated_price_inc_vat"] = None
+                row["calculated_price_ex_vat"] = None
+                row["surcharges_applied"] = []
+                row["escalation_reason"] = f"engine_error: {type(e).__name__}"
+
+            # Join flags
+            f = flag_index.get((p.key, qty, spec_key or ""))
+            row["flagged_wrong"] = bool(f.flagged_wrong) if f else False
+            row["comment"] = f.comment if f else None
+            row["flagged_by"] = f.flagged_by if f else None
+            row["updated_at"] = (
+                f.updated_at.isoformat() if f and f.updated_at else None
+            )
+
+            rows.append(row)
+
+    return {"rows": rows, "count": len(rows)}
+
+
+class PricingVerificationFlagBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_key: str = Field(min_length=1, max_length=80)
+    quantity: int = Field(gt=0)
+    spec_key: Optional[str] = Field(default="", max_length=120)
+    flagged_wrong: bool
+    comment: Optional[str] = Field(default=None, max_length=2000)
+
+
+@router.put("/orgs/{org_slug}/pricing-verification/flag")
+def upsert_pricing_verification_flag(
+    org_slug: str,
+    body: PricingVerificationFlagBody,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v34 — upsert a flag/comment for a (product, qty, spec_key) row."""
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    target_org = (
+        org_slug if claims.role == "strategos_admin" else claims.org_slug
+    )
+    spec_key = body.spec_key or ""
+
+    existing = (
+        db.query(PricingVerificationFlag)
+        .filter_by(
+            organization_slug=target_org,
+            product_key=body.product_key,
+            quantity=body.quantity,
+            spec_key=spec_key,
+        )
+        .first()
+    )
+    if existing is not None:
+        existing.flagged_wrong = body.flagged_wrong
+        existing.comment = body.comment
+        existing.flagged_by = claims.email
+    else:
+        existing = PricingVerificationFlag(
+            organization_slug=target_org,
+            product_key=body.product_key,
+            quantity=body.quantity,
+            spec_key=spec_key,
+            flagged_wrong=body.flagged_wrong,
+            comment=body.comment,
+            flagged_by=claims.email,
+        )
+        db.add(existing)
+
+    db.commit()
+    db.refresh(existing)
+    return {
+        "flag": {
+            "product_key": existing.product_key,
+            "quantity": existing.quantity,
+            "spec_key": existing.spec_key,
+            "flagged_wrong": bool(existing.flagged_wrong),
+            "comment": existing.comment,
+            "flagged_by": existing.flagged_by,
+            "updated_at": existing.updated_at.isoformat() if existing.updated_at else None,
+        }
+    }
+
+
+# ============================================================================
+# v34 — Live price preview (used by ProductFormDialog)
+# ============================================================================
+
+
+class PricePreviewBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    quantity: int = Field(gt=0)
+    double_sided: Optional[bool] = False
+    finish: Optional[str] = None
+
+
+@router.post("/orgs/{org_slug}/products/{product_key}/price-preview")
+def price_preview(
+    org_slug: str,
+    product_key: str,
+    body: PricePreviewBody,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v34 — run the engine for a product without persisting. Returns
+    the price + surcharges + escalation status. Used by the dashboard
+    Product form to show 'At qty=100 this would price at €X' as
+    Justin edits."""
+    access_guard(org_slug, claims)
+    target_org = (
+        org_slug if claims.role == "strategos_admin" else claims.org_slug
+    )
+
+    p = (
+        db.query(Product)
+        .filter_by(organization_slug=target_org, key=product_key)
+        .first()
+    )
+    if not p:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    from pricing_engine import (
+        quote_small_format, quote_large_format, EscalationResult,
+    )
+
+    try:
+        if p.category == "small_format":
+            result = quote_small_format(
+                db, product_key=p.key, quantity=body.quantity,
+                double_sided=bool(body.double_sided),
+                finish=body.finish, organization_slug=target_org,
+            )
+        elif p.category == "large_format":
+            result = quote_large_format(
+                db, product_key=p.key, quantity=body.quantity,
+                organization_slug=target_org,
+            )
+        else:
+            return {
+                "supported": False,
+                "message": f"Live preview not supported for category '{p.category}' yet.",
+            }
+    except Exception as e:
+        return {
+            "supported": True,
+            "error": f"engine_error: {type(e).__name__}: {str(e)[:200]}",
+            "manual_review_required": bool(p.manual_review_required),
+        }
+
+    if isinstance(result, EscalationResult):
+        return {
+            "supported": True,
+            "manual_review_required": bool(result.manual_review),
+            "escalation_reason": result.reason,
+            "price_inc_vat": None,
+            "price_ex_vat": None,
+            "surcharges_applied": [],
+        }
+
+    return {
+        "supported": True,
+        "manual_review_required": False,
+        "escalation_reason": None,
+        "price_inc_vat": result.final_price_inc_vat,
+        "price_ex_vat": result.final_price_ex_vat,
+        "surcharges_applied": list(result.surcharges_applied or []),
     }
