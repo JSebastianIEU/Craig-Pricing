@@ -70,8 +70,11 @@ from db.models import DEFAULT_ORG_SLUG, Product, Setting, SurchargeRule
 # ---------------------------------------------------------------------------
 
 _COLUMN_DEFS = [
-    # Product manual-review flag + per-product internal notes
-    ("products", "manual_review_required", 'BOOLEAN NOT NULL DEFAULT 0'),
+    # Product manual-review flag + per-product internal notes.
+    # Postgres needs FALSE (boolean literal); SQLite uses 0. The
+    # _add_column_if_missing helper rewrites the literal at the right
+    # moment based on engine.url.drivername.
+    ("products", "manual_review_required", 'BOOLEAN NOT NULL DEFAULT FALSE'),
     ("products", "manual_review_reason", "TEXT NULL"),
     ("products", "internal_notes", "TEXT NULL"),
 
@@ -220,12 +223,20 @@ def _column_exists(conn, table: str, column: str) -> bool:
 def _add_column_if_missing(conn, table: str, name: str, defn: str) -> bool:
     if _column_exists(conn, table, name):
         return False
-    # SQLite type-token rewrites: TIMESTAMP -> DATETIME, JSONB -> TEXT,
-    # FLOAT stays as REAL conceptually but FLOAT works in SQLite too.
-    if not _is_postgres():
+    # Dialect-specific token rewrites. Postgres requires FALSE/TRUE
+    # for boolean defaults; SQLite accepts 0/1. Postgres uses JSONB
+    # for JSON columns; SQLite stores JSON as TEXT. TIMESTAMP works
+    # everywhere on Postgres but SQLite prefers DATETIME (and accepts
+    # both, but DATETIME is the conventional spelling).
+    if _is_postgres():
+        # Postgres: leave FALSE/TRUE as-is, JSONB as-is, TIMESTAMP as-is
+        pass
+    else:
         defn = (
             defn.replace("TIMESTAMP", "DATETIME")
                 .replace("JSONB", "TEXT")
+                .replace("DEFAULT FALSE", "DEFAULT 0")
+                .replace("DEFAULT TRUE", "DEFAULT 1")
         )
     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {defn}"))
     return True
