@@ -625,37 +625,42 @@
             background: #f1f5f9;
         }
 
-        /* v35 — Report Issue modal */
-        .jp-report-modal {
-            position: fixed;
-            inset: 0;
-            z-index: 2147483647;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 16px;
-            font-family: var(--jp-brand-font, 'Poppins', sans-serif);
-        }
-        .jp-report-backdrop {
+        /* v35 — Report Issue panel — INLINE inside the widget,
+           not a full-page modal. position: absolute scoped to the
+           widget panel (.jp-panel), so it covers ONLY the chat area
+           and never overlays the customer's website. */
+        .jp-report-screen {
             position: absolute;
             inset: 0;
-            background: rgba(15, 23, 42, 0.5);
+            z-index: 10;
+            display: flex;
+            align-items: stretch;
+            justify-content: stretch;
+            background: rgba(15, 23, 42, 0.4);
             backdrop-filter: blur(2px);
+            font-family: var(--jp-brand-font, 'Poppins', sans-serif);
+            animation: jpReportFadeIn 0.18s ease-out;
         }
-        .jp-report-card {
-            position: relative;
+        /* CRITICAL: jp-hidden must beat the screen's display:flex.
+           The widget already uses .jp-hidden on other elements with
+           plain `display: none` — but those are NOT also `display:flex`
+           by default. So we need !important for this one. */
+        .jp-report-screen.jp-hidden { display: none !important; }
+        .jp-report-screen-card {
             background: #fff;
-            border-radius: 16px;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-            max-width: 480px;
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+            margin: auto;
+            max-width: calc(100% - 24px);
             width: 100%;
-            max-height: 90vh;
+            max-height: calc(100% - 24px);
             overflow-y: auto;
-            animation: jpReportFadeIn 0.2s ease-out;
+            display: flex;
+            flex-direction: column;
         }
         @keyframes jpReportFadeIn {
-            from { opacity: 0; transform: scale(0.95) translateY(10px); }
-            to { opacity: 1; transform: scale(1) translateY(0); }
+            from { opacity: 0; }
+            to { opacity: 1; }
         }
         .jp-report-header {
             padding: 20px 24px 12px;
@@ -1364,61 +1369,63 @@
                         </button>
                     </div>
                     <!-- v35 — Report an issue link in the chat footer.
-                         Opens the report modal where the customer can
-                         describe what went wrong. -->
+                         Opens an inline form INSIDE the widget panel
+                         (not a full-page modal). Customers describe
+                         what went wrong; submission posts to
+                         /widget/conversations/{cid}/report-issue. -->
                     <div class="jp-footer">
                         <button type="button" class="jp-report-link" id="jpReportLink">
                             Something wrong? Report an issue
                         </button>
                     </div>
-                </div>
-            </div>
-        </div>
 
-        <!-- v35 — Report Issue modal. Hidden by default; toggled by the
-             footer link. Submits to /widget/conversations/{cid}/report-issue
-             and shows a friendly canned reply in the chat afterward. -->
-        <div class="jp-report-modal jp-hidden" id="jpReportModal" role="dialog" aria-labelledby="jpReportTitle">
-            <div class="jp-report-backdrop" id="jpReportBackdrop"></div>
-            <div class="jp-report-card">
-                <div class="jp-report-header">
-                    <h3 id="jpReportTitle">Report an issue</h3>
-                    <button type="button" class="jp-report-close" id="jpReportClose" aria-label="Close">×</button>
-                </div>
-                <div class="jp-report-body">
-                    <p class="jp-report-help">
-                        Sorry something went wrong. Tell us what happened — we&rsquo;ll
-                        review it and get back to you ASAP to keep your quote
-                        moving.
-                    </p>
-                    <label class="jp-report-label" for="jpReportMessage">
-                        What went wrong? <span class="jp-report-required">*</span>
-                    </label>
-                    <textarea
-                        id="jpReportMessage"
-                        class="jp-report-textarea"
-                        rows="4"
-                        placeholder="e.g. The price seems too high, the bot didn't understand my question, it kept asking the same thing..."
-                        maxlength="4000"
-                    ></textarea>
-                    <label class="jp-report-label" for="jpReportEmail">
-                        Email (optional, so we can follow up)
-                    </label>
-                    <input
-                        id="jpReportEmail"
-                        type="email"
-                        class="jp-report-input"
-                        placeholder="you@example.com"
-                        autocomplete="email"
-                    />
-                    <div class="jp-report-error jp-hidden" id="jpReportError"></div>
-                    <div class="jp-report-actions">
-                        <button type="button" class="jp-report-btn-secondary" id="jpReportCancel">
-                            Cancel
-                        </button>
-                        <button type="button" class="jp-report-btn-primary" id="jpReportSubmit">
-                            Send report
-                        </button>
+                    <!-- v35 — inline Report Issue panel. Slides over
+                         the chat-view inside the widget panel only,
+                         NOT as a full-page modal. Hidden by default
+                         via the jp-hidden class, which CSS explicitly
+                         overrides display:flex with !important. -->
+                    <div class="jp-report-screen jp-hidden" id="jpReportModal" role="dialog" aria-labelledby="jpReportTitle">
+                        <div class="jp-report-screen-card">
+                            <div class="jp-report-header">
+                                <h3 id="jpReportTitle">Report an issue</h3>
+                                <button type="button" class="jp-report-close" id="jpReportClose" aria-label="Close">×</button>
+                            </div>
+                            <div class="jp-report-body">
+                                <p class="jp-report-help">
+                                    Sorry something went wrong. Tell us what happened — we&rsquo;ll
+                                    review it and get back to you ASAP.
+                                </p>
+                                <label class="jp-report-label" for="jpReportMessage">
+                                    What went wrong? <span class="jp-report-required">*</span>
+                                </label>
+                                <textarea
+                                    id="jpReportMessage"
+                                    class="jp-report-textarea"
+                                    rows="4"
+                                    placeholder="e.g. The price seems off, the bot didn't understand me..."
+                                    maxlength="4000"
+                                ></textarea>
+                                <label class="jp-report-label" for="jpReportEmail">
+                                    Email (optional, so we can follow up)
+                                </label>
+                                <input
+                                    id="jpReportEmail"
+                                    type="email"
+                                    class="jp-report-input"
+                                    placeholder="you@example.com"
+                                    autocomplete="email"
+                                />
+                                <div class="jp-report-error jp-hidden" id="jpReportError"></div>
+                                <div class="jp-report-actions">
+                                    <button type="button" class="jp-report-btn-secondary" id="jpReportCancel">
+                                        Cancel
+                                    </button>
+                                    <button type="button" class="jp-report-btn-primary" id="jpReportSubmit">
+                                        Send report
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2394,11 +2401,10 @@
         });
 
         // ──────────────────────────────────────────────────────────
-        // v35 — Report Issue modal wiring
+        // v35 — Report Issue inline screen wiring (NOT a full-page modal)
         // ──────────────────────────────────────────────────────────
         const reportLink = $('jpReportLink');
         const reportModal = $('jpReportModal');
-        const reportBackdrop = $('jpReportBackdrop');
         const reportClose = $('jpReportClose');
         const reportCancel = $('jpReportCancel');
         const reportSubmit = $('jpReportSubmit');
@@ -2407,15 +2413,18 @@
         const reportError = $('jpReportError');
 
         function openReportModal() {
+            if (!reportModal || !reportError) return;
             reportError.classList.add('jp-hidden');
             reportError.textContent = '';
             reportModal.classList.remove('jp-hidden');
             // Slight delay for the animation to settle before focus
-            setTimeout(() => reportMessage.focus(), 50);
+            setTimeout(() => {
+                if (reportMessage) reportMessage.focus();
+            }, 50);
         }
 
         function closeReportModal() {
-            reportModal.classList.add('jp-hidden');
+            if (reportModal) reportModal.classList.add('jp-hidden');
         }
 
         async function submitReport() {
@@ -2481,7 +2490,12 @@
         }
         if (reportClose) reportClose.addEventListener('click', closeReportModal);
         if (reportCancel) reportCancel.addEventListener('click', closeReportModal);
-        if (reportBackdrop) reportBackdrop.addEventListener('click', closeReportModal);
+        // Click on the overlay (but NOT on the card itself) closes
+        if (reportModal) {
+            reportModal.addEventListener('click', (e) => {
+                if (e.target === reportModal) closeReportModal();
+            });
+        }
         if (reportSubmit) reportSubmit.addEventListener('click', submitReport);
         if (reportMessage) {
             reportMessage.addEventListener('keydown', (e) => {
