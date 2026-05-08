@@ -21,7 +21,21 @@ Base = declarative_base()
 DEFAULT_ORG_SLUG = "just-print"
 
 # Pricing strategies a Product can use. Strings (not Enum) so SQLite is happy.
-PRICING_STRATEGIES = ("tiered", "per_unit", "per_unit_metric", "bulk_break", "per_job")
+#
+# v36 added 'per_sqm' (vinyl labels, banners) and 'per_sheet' (foamex /
+# dibond / corri panels) so Craig can ACTUALLY price these instead of
+# always escalating like v34 did. The legacy 'per_unit_metric' name
+# remains a synonym for 'per_sqm' for backwards compat with any rows
+# stamped before v36.
+PRICING_STRATEGIES = (
+    "tiered",
+    "per_unit",
+    "per_unit_metric",
+    "bulk_break",
+    "per_job",
+    "per_sqm",
+    "per_sheet",
+)
 
 
 # =============================================================================
@@ -68,6 +82,32 @@ class Product(Base):
     bulk_threshold = Column(Integer)
     pricing_unit = Column(String(60))
     min_qty = Column(Integer, default=1)
+
+    # v36 — per-sq/m + per-sheet config.
+    #
+    # `yield_per_sqm` (Float, nullable) is the count of items produced
+    # per square meter for products like vinyl labels (e.g. 81 for
+    # 50x30mm labels). When the customer doesn't specify per-item
+    # dimensions and `default_unit_size_mm` isn't set, the engine
+    # falls back to this to compute m^2 from quantity:
+    #   total_m2 = quantity / yield_per_sqm
+    # For products priced strictly by area (banners), `yield_per_sqm`
+    # stays null and the engine requires `width_mm`/`height_mm` from
+    # the LLM call.
+    yield_per_sqm = Column(Float, nullable=True)
+    # `default_unit_size_mm` is the per-item size used when the customer
+    # doesn't specify one. Format: "WIDTHxHEIGHT" e.g. "50x30" for
+    # 50mm x 30mm vinyl labels. Engine parses this lazily via
+    # _parse_size_mm in pricing_engine.
+    default_unit_size_mm = Column(String(20), nullable=True)
+    # `sheet_size_mm` is the size of one sheet (e.g. 8x4 ft = 2400x1200)
+    # used for `per_sheet` strategy. Default null; engine errors out
+    # cleanly if a per_sheet product is mis-configured.
+    sheet_size_mm = Column(String(20), nullable=True)
+    # `sheet_price` is the cost of one full sheet for `per_sheet`
+    # products. The engine multiplies ceil(qty / units_per_sheet) by
+    # this. Null = config missing -> escalate.
+    sheet_price = Column(Float, nullable=True)
 
     # v34 — manual-review escalation flag. When True, Craig refuses to
     # auto-quote this product and instead creates a Quote with

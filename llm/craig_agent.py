@@ -412,8 +412,14 @@ def _build_catalog_context(db: Session, organization_slug: str) -> str:
     knows what finishes, quantities, bindings etc. actually exist. This
     replaces the previously hardcoded "Products and their options" block
     in the system prompt.
+
+    v36 — also injects per-product `description` and per-category
+    `description` so the operator can use those as a customer-facing
+    knowledge base. Craig will quote the description back when asked
+    "what's this made of / what specs / etc." instead of escalating
+    to Justin.
     """
-    from db.models import Product, PriceTier
+    from db.models import Product, PriceTier, Category
 
     products = (
         db.query(Product)
@@ -424,6 +430,17 @@ def _build_catalog_context(db: Session, organization_slug: str) -> str:
     if not products:
         return ""
 
+    # v36 — preload all categories for this tenant so we can attach
+    # their descriptions to the section headers without N+1 queries.
+    cat_rows = (
+        db.query(Category)
+        .filter_by(organization_slug=organization_slug)
+        .all()
+    )
+    cat_descs: dict[str, str] = {
+        c.slug: (c.description or "").strip() for c in cat_rows
+    }
+
     # Group by category
     by_cat: dict[str, list[Product]] = {}
     for p in products:
@@ -433,10 +450,19 @@ def _build_catalog_context(db: Session, organization_slug: str) -> str:
         "## Product catalog (live from database — the ONLY products/specs/quantities that exist)",
         "Do NOT ask about options not listed here. If the customer asks for something off-list, escalate.",
         "",
+        "Each product may have an `about` line — that's your knowledge base. Quote it back",
+        "when customers ask for specs, materials, sizing, or feature questions. Paraphrase",
+        "rather than reading verbatim.",
+        "",
     ]
 
     for cat, items in by_cat.items():
         lines.append(f"### {cat.replace('_', ' ').title()}")
+        # v36 — per-category description
+        cat_desc = cat_descs.get(cat, "")
+        if cat_desc:
+            lines.append(f"_{cat_desc}_")
+            lines.append("")
         for p in items:
             tiers = (
                 db.query(PriceTier)
@@ -448,12 +474,28 @@ def _build_catalog_context(db: Session, organization_slug: str) -> str:
             qtys = sorted({t.quantity for t in tiers if t.quantity is not None})
             spec_keys = sorted({t.spec_key for t in tiers if t.spec_key})
             parts: list[str] = [f"- `{p.key}` — {p.name}"]
+            # v36 — customer-facing description used as a knowledge base.
+            if p.description:
+                parts.append(f"  about: {p.description.strip()}")
             if spec_keys:
                 parts.append(f"  options: {', '.join(spec_keys)}")
             if qtys:
                 parts.append(f"  quantities: {', '.join(str(q) for q in qtys)}")
+            # v36 — pricing-strategy hint so the LLM knows when to ask
+            # for dimensions vs quantities.
+            strategy = (p.pricing_strategy or "").lower()
+            if strategy in ("per_sqm", "per_unit_metric"):
+                hint_parts = ["per sq/m"]
+                if p.yield_per_sqm:
+                    hint_parts.append(f"~{int(p.yield_per_sqm)} per m² default")
+                parts.append(f"  pricing: {' · '.join(hint_parts)} — ask for size in mm")
+            elif strategy == "per_sheet":
+                hint_parts = ["per sheet"]
+                if p.sheet_size_mm:
+                    hint_parts.append(f"sheet {p.sheet_size_mm} mm")
+                parts.append(f"  pricing: {' · '.join(hint_parts)} — ask for panel size in mm")
             if p.notes:
-                parts.append(f"  note: {p.notes}")
+                parts.append(f"  note: {p.notes.strip()}")
             lines.append("\n".join(parts))
         lines.append("")
 

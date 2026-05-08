@@ -269,6 +269,55 @@ def _parse_unit_base(price_per: str) -> int:
         return 1
 
 
+def _parse_size_mm(s: Optional[str]) -> Optional[tuple[int, int]]:
+    """v36 — parse a 'WxH' or 'W x H' string (mm) into (width, height).
+
+    Used for `Product.default_unit_size_mm` and `Product.sheet_size_mm`,
+    both of which are stored as strings ('50x30', '2400x1200',
+    '8 x 4 ft' would NOT work — use mm) for human readability.
+
+    Returns None on any parse error so the caller can fall back gracefully
+    to escalation rather than crashing on a typo in the catalog.
+    """
+    if not s:
+        return None
+    cleaned = s.strip().lower().replace(" ", "")
+    # Accept both 'x' and '×' separators
+    sep = "x" if "x" in cleaned else ("×" if "×" in cleaned else None)
+    if not sep:
+        return None
+    try:
+        w_str, h_str = cleaned.split(sep, 1)
+        w = int(float(w_str))
+        h = int(float(h_str))
+        if w <= 0 or h <= 0:
+            return None
+        return (w, h)
+    except (ValueError, TypeError):
+        return None
+
+
+def _units_per_sheet(panel_w: int, panel_h: int, sheet_w: int, sheet_h: int) -> int:
+    """v36 — greedy axis-aligned packing of identical rectangles. Tries
+    both panel orientations on the sheet and returns the larger yield.
+
+    Pure integer math — does NOT account for rotated mixed-orientation
+    layouts (a known suboptimal case), but matches how Justin actually
+    cuts panels on the saw. Returns 0 if the panel doesn't fit at all.
+    """
+    if panel_w <= 0 or panel_h <= 0 or sheet_w <= 0 or sheet_h <= 0:
+        return 0
+    # Orientation A: panel oriented as-is
+    cols_a = sheet_w // panel_w
+    rows_a = sheet_h // panel_h
+    yield_a = cols_a * rows_a
+    # Orientation B: panel rotated 90 degrees
+    cols_b = sheet_w // panel_h
+    rows_b = sheet_h // panel_w
+    yield_b = cols_b * rows_b
+    return max(yield_a, yield_b)
+
+
 # ---------------------------------------------------------------------------
 # v34 — stack-tier helper
 # ---------------------------------------------------------------------------
@@ -751,6 +800,347 @@ def quote_small_format(
 
 
 # =============================================================================
+# LARGE FORMAT — per-sq/m + per-sheet helpers (v36)
+# =============================================================================
+
+
+def _quote_per_sqm(
+    db: Session,
+    product: Product,
+    quantity: int,
+    *,
+    width_mm: Optional[int] = None,
+    height_mm: Optional[int] = None,
+    area_sqm: Optional[float] = None,
+    needs_artwork: bool = False,
+    artwork_hours: float = 0.0,
+    organization_slug: str = DEFAULT_ORG_SLUG,
+) -> "QuoteResult | EscalationResult":
+    """v36 — price a per-square-meter product (vinyl labels, banners,
+    graphics, fabric displays).
+
+    Computation flow (first non-None wins):
+      1. `area_sqm` passed explicitly → use as total area.
+      2. `width_mm` + `height_mm` provided:
+           per_unit_area = (w × h) / 1_000_000
+           total_m² = quantity × per_unit_area  (for area-based products)
+                  OR total_m² = quantity / yield_per_sqm  (for items-cut-from-sheet products)
+      3. Fall back to `product.default_unit_size_mm` (parsed) using the same logic.
+      4. Fall back to `product.yield_per_sqm` alone (uses qty-based formula).
+      5. Out of options → EscalationResult(manual_review=True).
+
+    Then:
+      total_ex_vat = total_m² × unit_price (or bulk_price if total_m² ≥ bulk_threshold)
+      + client multiplier + VAT + artwork.
+    """
+    if quantity <= 0:
+        return EscalationResult(
+            reason="quantity must be positive",
+            product_name=product.name,
+        )
+
+    # 1. Resolve total area
+    total_m2: Optional[float] = None
+    breakdown_note: str = ""
+    yield_value = product.yield_per_sqm  # may be null
+
+    if area_sqm is not None and area_sqm > 0:
+        total_m2 = float(area_sqm)
+        breakdown_note = f"customer-supplied area: {total_m2:.2f} m²"
+    else:
+        # If width+height passed, prefer them
+        if width_mm and height_mm:
+            unit_area = (float(width_mm) * float(height_mm)) / 1_000_000.0
+            if yield_value and yield_value > 0:
+                # Items-cut-from-sheet: prefer the explicit yield over
+                # multiplying area×qty (the customer might have given
+                # a label size for visual reference, but the catalog
+                # configuration says "we cut N per m²" — trust the
+                # catalog).
+                # Actually, items-cut-from-sheet uses qty/yield. We
+                # only multiply by qty when there's NO yield and the
+                # product is treated as area-based (banners).
+                pass
+            if yield_value is None:
+                # Area-based (banners): qty × per-unit area
+                total_m2 = round(quantity * unit_area, 4)
+                breakdown_note = (
+                    f"{quantity} × ({width_mm}×{height_mm} mm) "
+                    f"= {total_m2:.2f} m²"
+                )
+            else:
+                # Items-cut-from-sheet: derive yield from the SUPPLIED
+                # dimensions if we have them — that's the most
+                # accurate. Otherwise fall back to the catalog yield.
+                if unit_area > 0:
+                    derived_yield = 1.0 / unit_area
+                    total_m2 = round(quantity / derived_yield, 4)
+                    breakdown_note = (
+                        f"{quantity} units × {width_mm}×{height_mm} mm "
+                        f"({derived_yield:.0f} per m²) "
+                        f"= {total_m2:.2f} m²"
+                    )
+                else:
+                    total_m2 = round(quantity / yield_value, 4)
+                    breakdown_note = (
+                        f"{quantity} / {yield_value:.0f} per m² "
+                        f"= {total_m2:.2f} m²"
+                    )
+
+        # No width+height passed — try product defaults
+        if total_m2 is None and product.default_unit_size_mm:
+            parsed = _parse_size_mm(product.default_unit_size_mm)
+            if parsed:
+                w, h = parsed
+                unit_area = (w * h) / 1_000_000.0
+                if yield_value is None:
+                    total_m2 = round(quantity * unit_area, 4)
+                    breakdown_note = (
+                        f"{quantity} × default {w}×{h} mm "
+                        f"= {total_m2:.2f} m²"
+                    )
+                elif unit_area > 0:
+                    derived_yield = 1.0 / unit_area
+                    total_m2 = round(quantity / derived_yield, 4)
+                    breakdown_note = (
+                        f"{quantity} units × default {w}×{h} mm "
+                        f"({derived_yield:.0f} per m²) "
+                        f"= {total_m2:.2f} m²"
+                    )
+
+        # Last resort: pure yield-based math (no per-item area)
+        if total_m2 is None and yield_value and yield_value > 0:
+            total_m2 = round(quantity / yield_value, 4)
+            breakdown_note = (
+                f"{quantity} / {yield_value:.0f} per m² "
+                f"= {total_m2:.2f} m²"
+            )
+
+    if total_m2 is None or total_m2 <= 0:
+        # Couldn't compute area from any input. Escalate.
+        return EscalationResult(
+            reason=(
+                f"Per-sq/m product needs dimensions or area. Pass "
+                f"width_mm + height_mm, or area_sqm directly. "
+                f"Configure default_unit_size_mm / yield_per_sqm on "
+                f"{product.key} in the catalog if you want a fallback."
+            ),
+            product_name=product.name,
+            manual_review=True,
+            message=(
+                "Ask the customer for the size of each item in mm "
+                "(width × height), then re-quote with width_mm + "
+                "height_mm. If the customer gave overall area instead, "
+                "pass area_sqm."
+            ),
+        )
+
+    # 2. Pick price per m² (bulk if total_m² ≥ threshold)
+    surcharges_applied: list[str] = [breakdown_note]
+    threshold = product.bulk_threshold or 0
+    if threshold and total_m2 >= threshold and product.bulk_price is not None:
+        unit_price = float(product.bulk_price)
+        surcharges_applied.append(
+            f"Bulk pricing applied ({total_m2:.2f} m² ≥ {threshold} m²)"
+        )
+    else:
+        unit_price = float(product.unit_price or 0.0)
+
+    if unit_price <= 0:
+        return EscalationResult(
+            reason=f"unit_price not configured on {product.key}",
+            product_name=product.name,
+            manual_review=True,
+        )
+
+    total_ex = round(total_m2 * unit_price, 2)
+
+    # Client multiplier (after surcharges, before VAT)
+    client_mult = _get_client_multiplier(db, organization_slug=organization_slug)
+    if abs(client_mult - 1.0) > 1e-6:
+        total_ex = round(total_ex * client_mult, 2)
+        pct = int(round((client_mult - 1.0) * 100))
+        sign = "+" if pct >= 0 else ""
+        surcharges_applied.append(f"Client adjustment: {sign}{pct}%")
+
+    # VAT
+    vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
+    vat = round(total_ex * vat_rate, 2)
+
+    # Artwork (service line item)
+    artwork_ex = None
+    artwork_inc = None
+    total = round(total_ex + vat, 2)
+    if needs_artwork and artwork_hours > 0:
+        artwork_rate = _get_setting(
+            db, "artwork_rate_eur", 65.0, organization_slug=organization_slug,
+        )
+        artwork_ex = round(artwork_rate * artwork_hours, 2)
+        artwork_inc = round(artwork_ex * (1 + _STANDARD_VAT_RATE), 2)
+        total = round(total + artwork_inc, 2)
+
+    turnaround = _get_setting(
+        db, "standard_turnaround", "3-5 working days",
+        organization_slug=organization_slug,
+    )
+
+    return QuoteResult(
+        success=True,
+        product_name=product.name,
+        category="large_format",
+        quantity=quantity,
+        quantity_unit=product.pricing_unit or "per sq/m",
+        base_price=unit_price,
+        surcharges_applied=surcharges_applied,
+        surcharge_amount=0.0,
+        final_price_ex_vat=total_ex,
+        vat_amount=vat,
+        final_price_inc_vat=round(total_ex + vat, 2),
+        artwork_cost_ex_vat=artwork_ex,
+        artwork_cost_inc_vat=artwork_inc,
+        total_inc_everything=total,
+        turnaround=turnaround,
+        notes=[product.notes] if product.notes else [],
+        pricing_unit=product.pricing_unit or "per sq/m",
+    )
+
+
+def _quote_per_sheet(
+    db: Session,
+    product: Product,
+    quantity: int,
+    *,
+    width_mm: Optional[int] = None,
+    height_mm: Optional[int] = None,
+    needs_artwork: bool = False,
+    artwork_hours: float = 0.0,
+    organization_slug: str = DEFAULT_ORG_SLUG,
+) -> "QuoteResult | EscalationResult":
+    """v36 — price a per-sheet product (foamex / dibond / corri panels).
+
+    Customer specifies panel size (`width_mm`, `height_mm`); engine
+    computes how many panels fit on a sheet of `product.sheet_size_mm`
+    (axis-aligned, with rotation), then bills:
+        sheets_needed = ceil(quantity / units_per_sheet)
+        total_ex_vat  = sheets_needed × product.sheet_price
+    + client multiplier + VAT + artwork.
+
+    If panel dimensions or sheet config are missing, escalates with
+    `manual_review=True` so the LLM falls back to the v34 ask-for-info
+    flow.
+    """
+    if quantity <= 0:
+        return EscalationResult(
+            reason="quantity must be positive",
+            product_name=product.name,
+        )
+
+    # 1. Need panel dimensions — no sensible default for panels
+    if not (width_mm and height_mm):
+        return EscalationResult(
+            reason=(
+                f"{product.name} is priced per sheet — need panel "
+                f"dimensions in mm to calculate yield."
+            ),
+            product_name=product.name,
+            manual_review=True,
+            message=(
+                "Ask the customer for the size of each panel in mm "
+                "(width × height), then re-quote with width_mm + "
+                "height_mm."
+            ),
+        )
+
+    # 2. Need sheet config
+    sheet_parsed = _parse_size_mm(product.sheet_size_mm)
+    sheet_price = product.sheet_price or 0.0
+    if not sheet_parsed or sheet_price <= 0:
+        return EscalationResult(
+            reason=(
+                f"{product.key} is missing sheet config "
+                f"(sheet_size_mm={product.sheet_size_mm!r}, "
+                f"sheet_price={product.sheet_price!r}). Configure in "
+                f"the dashboard catalog."
+            ),
+            product_name=product.name,
+            manual_review=True,
+        )
+    sheet_w, sheet_h = sheet_parsed
+
+    # 3. Compute panels per sheet
+    units_per_sheet = _units_per_sheet(int(width_mm), int(height_mm), sheet_w, sheet_h)
+    if units_per_sheet <= 0:
+        return EscalationResult(
+            reason=(
+                f"Panel size {width_mm}×{height_mm} mm exceeds sheet "
+                f"size {sheet_w}×{sheet_h} mm — can't cut from a "
+                f"single sheet."
+            ),
+            product_name=product.name,
+            manual_review=True,
+        )
+
+    import math
+    sheets_needed = math.ceil(quantity / units_per_sheet)
+    total_ex = round(sheets_needed * sheet_price, 2)
+
+    surcharges_applied: list[str] = [
+        f"{units_per_sheet} per sheet × {sheets_needed} sheet(s) "
+        f"(panel {width_mm}×{height_mm} mm on sheet {sheet_w}×{sheet_h} mm) "
+        f"= {sheets_needed * units_per_sheet} panels billed"
+    ]
+
+    # Client multiplier
+    client_mult = _get_client_multiplier(db, organization_slug=organization_slug)
+    if abs(client_mult - 1.0) > 1e-6:
+        total_ex = round(total_ex * client_mult, 2)
+        pct = int(round((client_mult - 1.0) * 100))
+        sign = "+" if pct >= 0 else ""
+        surcharges_applied.append(f"Client adjustment: {sign}{pct}%")
+
+    # VAT
+    vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
+    vat = round(total_ex * vat_rate, 2)
+
+    # Artwork
+    artwork_ex = None
+    artwork_inc = None
+    total = round(total_ex + vat, 2)
+    if needs_artwork and artwork_hours > 0:
+        artwork_rate = _get_setting(
+            db, "artwork_rate_eur", 65.0, organization_slug=organization_slug,
+        )
+        artwork_ex = round(artwork_rate * artwork_hours, 2)
+        artwork_inc = round(artwork_ex * (1 + _STANDARD_VAT_RATE), 2)
+        total = round(total + artwork_inc, 2)
+
+    turnaround = _get_setting(
+        db, "standard_turnaround", "3-5 working days",
+        organization_slug=organization_slug,
+    )
+
+    return QuoteResult(
+        success=True,
+        product_name=product.name,
+        category="large_format",
+        quantity=quantity,
+        quantity_unit=product.pricing_unit or "per sheet",
+        base_price=sheet_price,
+        surcharges_applied=surcharges_applied,
+        surcharge_amount=0.0,
+        final_price_ex_vat=total_ex,
+        vat_amount=vat,
+        final_price_inc_vat=round(total_ex + vat, 2),
+        artwork_cost_ex_vat=artwork_ex,
+        artwork_cost_inc_vat=artwork_inc,
+        total_inc_everything=total,
+        turnaround=turnaround,
+        notes=[product.notes] if product.notes else [],
+        pricing_unit=product.pricing_unit or "per sheet",
+    )
+
+
+# =============================================================================
 # LARGE FORMAT
 # =============================================================================
 
@@ -801,6 +1191,27 @@ def quote_large_format(
                 "auto-quote. Customer should be told 'let me check' and "
                 "asked for the missing detail (dimensions in mm, etc.)."
             ),
+        )
+
+    # v36 — per-sq/m + per-sheet pricing strategies. These short-circuit
+    # the legacy bulk_break path because their inputs (dimensions, sheet
+    # config) require completely different math. Both helpers return
+    # either a successful QuoteResult or an EscalationResult — the LLM
+    # shell already handles either.
+    strategy = (product.pricing_strategy or "").lower()
+    if strategy in ("per_sqm", "per_unit_metric"):
+        return _quote_per_sqm(
+            db, product, quantity,
+            width_mm=width_mm, height_mm=height_mm, area_sqm=area_sqm,
+            needs_artwork=needs_artwork, artwork_hours=artwork_hours,
+            organization_slug=organization_slug,
+        )
+    if strategy == "per_sheet":
+        return _quote_per_sheet(
+            db, product, quantity,
+            width_mm=width_mm, height_mm=height_mm,
+            needs_artwork=needs_artwork, artwork_hours=artwork_hours,
+            organization_slug=organization_slug,
         )
 
     if quantity < (product.min_qty or 1):

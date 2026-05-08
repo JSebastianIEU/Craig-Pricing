@@ -60,6 +60,14 @@ def main() -> None:
     )
     _run("v35 pre-DDL (test-chat flag + issue_reports table)", v35_ddl_only)
 
+    # v36 pre-DDL — adds per-sqm + per-sheet config columns on Product.
+    # The model declares them so any ORM SELECT on Product needs them
+    # to exist before the older migrations run.
+    from scripts.v36_per_sqm_per_sheet_pricing import (
+        migrate_ddl_only as v36_ddl_only,
+    )
+    _run("v36 pre-DDL (per-sqm + per-sheet product columns)", v36_ddl_only)
+
     # Only bootstrap pricing data if the DB is empty — otherwise this wipes
     # everything the user has edited since first deploy (system_prompt,
     # business_rules, catalog edits, etc.).
@@ -104,6 +112,7 @@ def main() -> None:
     from scripts.v33_auto_send_and_notifications import migrate as v33_migrate
     from scripts.v34_manual_review_and_product_surcharges import migrate as v34_migrate
     from scripts.v35_test_chat_and_issue_reports import migrate as v35_migrate
+    from scripts.v36_per_sqm_per_sheet_pricing import migrate as v36_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -136,6 +145,7 @@ def main() -> None:
     _run("v33 dashboard approval + operator notifications + lifecycle UI", v33_migrate)
     _run("v34 manual-review escalation + per-product surcharges + verification table", v34_migrate)
     _run("v35 test-chat sandbox + issue reports + admin alerts", v35_migrate)
+    _run("v36 per-sqm + per-sheet pricing strategies", v36_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

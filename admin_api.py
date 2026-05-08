@@ -279,6 +279,11 @@ def _product_to_dict(p: Product, tiers: list[PriceTier]) -> dict[str, Any]:
         "manual_review_required": bool(getattr(p, "manual_review_required", False)),
         "manual_review_reason": getattr(p, "manual_review_reason", None),
         "internal_notes": getattr(p, "internal_notes", None),
+        # v36 — per-sq/m + per-sheet config
+        "yield_per_sqm": getattr(p, "yield_per_sqm", None),
+        "default_unit_size_mm": getattr(p, "default_unit_size_mm", None),
+        "sheet_size_mm": getattr(p, "sheet_size_mm", None),
+        "sheet_price": getattr(p, "sheet_price", None),
         "tiers": [
             {"id": t.id, "spec_key": t.spec_key, "quantity": t.quantity, "price": t.price}
             for t in tiers
@@ -341,6 +346,11 @@ class CreateProductRequest(BaseModel):
     manual_review_required: Optional[bool] = False
     manual_review_reason: Optional[str] = Field(default=None, max_length=500)
     internal_notes: Optional[str] = Field(default=None, max_length=2000)
+    # v36 — per-sq/m + per-sheet config
+    yield_per_sqm: Optional[float] = Field(default=None, ge=0)
+    default_unit_size_mm: Optional[str] = Field(default=None, max_length=20)
+    sheet_size_mm: Optional[str] = Field(default=None, max_length=20)
+    sheet_price: Optional[float] = Field(default=None, ge=0)
 
     @field_validator("pricing_strategy")
     @classmethod
@@ -402,6 +412,11 @@ def create_product(
         manual_review_required=bool(body.manual_review_required),
         manual_review_reason=body.manual_review_reason,
         internal_notes=body.internal_notes,
+        # v36 — per-sq/m + per-sheet config
+        yield_per_sqm=body.yield_per_sqm,
+        default_unit_size_mm=body.default_unit_size_mm,
+        sheet_size_mm=body.sheet_size_mm,
+        sheet_price=body.sheet_price,
     )
     db.add(p)
     db.commit()
@@ -431,6 +446,11 @@ class UpdateProductRequest(BaseModel):
     manual_review_required: Optional[bool] = None
     manual_review_reason: Optional[str] = Field(default=None, max_length=500)
     internal_notes: Optional[str] = Field(default=None, max_length=2000)
+    # v36 — per-sq/m + per-sheet config
+    yield_per_sqm: Optional[float] = Field(default=None, ge=0)
+    default_unit_size_mm: Optional[str] = Field(default=None, max_length=20)
+    sheet_size_mm: Optional[str] = Field(default=None, max_length=20)
+    sheet_price: Optional[float] = Field(default=None, ge=0)
 
     @field_validator("pricing_strategy")
     @classmethod
@@ -1427,6 +1447,262 @@ def manual_price_quote(
         )
 
     return {"quote": _quote_to_dict(q), "noop": False}
+
+
+# ============================================================================
+# v36 — DELETE quote + bulk operations on quotes / conversations
+# ============================================================================
+#
+# Permissive delete (per Justin's request): any quote at any status can
+# be physically deleted. The dashboard surfaces a confirmation dialog
+# describing side-effects (Stripe link still active, PrintLogic order
+# still active, etc) before actually firing this endpoint. The header
+# X-Confirm-Delete: yes is required so a drive-by client can't burn
+# rows by accident.
+# ============================================================================
+
+
+@router.delete("/orgs/{org_slug}/quotes/{quote_id}", status_code=204)
+def delete_quote(
+    org_slug: str,
+    quote_id: int,
+    request: Request,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> None:
+    """v36 — physically delete a Quote row. Requires
+    `X-Confirm-Delete: yes` header so accidental client-side calls
+    don't wipe data. Strip payment-link / PrintLogic / Missive draft
+    side-effects are NOT cleaned up automatically — the dashboard
+    confirm dialog warns the operator about anything still active
+    upstream so they can cancel via the dedicated endpoints first."""
+    access_guard(org_slug, claims)
+    require_role(claims, "client_member")
+
+    confirm = (
+        request.headers.get("x-confirm-delete")
+        or request.headers.get("X-Confirm-Delete")
+        or ""
+    ).strip().lower()
+    if confirm != "yes":
+        raise HTTPException(
+            status_code=412,
+            detail=(
+                "Missing X-Confirm-Delete: yes header. The dashboard "
+                "confirm dialog must include this header to actually "
+                "delete the row."
+            ),
+        )
+
+    q = (
+        _scope(db.query(Quote), Quote, claims, org_slug)
+        .filter(Quote.id == quote_id)
+        .first()
+    )
+    if not q:
+        raise HTTPException(status_code=404, detail="Quote not found")
+
+    db.delete(q)
+    db.commit()
+
+
+class BulkQuoteAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ids: list[int] = Field(min_length=1, max_length=200)
+    action: str = Field(pattern=r"^(approve|reject|delete)$")
+
+
+@router.post("/orgs/{org_slug}/quotes/bulk")
+def bulk_quotes(
+    org_slug: str,
+    body: BulkQuoteAction,
+    request: Request,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v36 — bulk approve / reject / delete on quotes.
+
+    Iterates and calls the existing single-row handlers per id so
+    side-effects (Stripe link creation on approve, Missive auto-send,
+    audit timestamps) are identical to the single-row paths.
+
+    Returns {ok: int[], failed: [{id, error}]}. Per-row failures
+    don't abort the whole batch — they're collected and surfaced
+    so the dashboard can toast "approved 5, 1 failed: insufficient
+    funds" with full context.
+
+    For action='delete', this endpoint forwards the
+    X-Confirm-Delete header to the single-row delete (same safety
+    gate)."""
+    access_guard(org_slug, claims)
+    require_role(claims, "client_member")
+
+    if body.action == "delete":
+        confirm = (
+            request.headers.get("x-confirm-delete")
+            or request.headers.get("X-Confirm-Delete")
+            or ""
+        ).strip().lower()
+        if confirm != "yes":
+            raise HTTPException(
+                status_code=412,
+                detail="bulk delete requires X-Confirm-Delete: yes header",
+            )
+
+    ok_ids: list[int] = []
+    failed: list[dict[str, Any]] = []
+
+    for quote_id in body.ids:
+        q = (
+            _scope(db.query(Quote), Quote, claims, org_slug)
+            .filter(Quote.id == quote_id)
+            .first()
+        )
+        if not q:
+            failed.append({"id": quote_id, "error": "not_found"})
+            continue
+
+        try:
+            if body.action == "delete":
+                db.delete(q)
+                db.commit()
+                ok_ids.append(quote_id)
+            elif body.action == "approve":
+                # Re-use update_quote's logic by composing the body
+                # in-process. We can't just call the function (FastAPI
+                # would re-parse Depends), so replicate the meaningful
+                # transitions here.
+                if q.status == "needs_revision":
+                    failed.append({
+                        "id": quote_id,
+                        "error": (
+                            "needs_revision quotes must be manual-priced "
+                            "first, then approved one at a time"
+                        ),
+                    })
+                    continue
+                prev_status = q.status
+                q.status = "approved"
+                q.approved_by = claims.email
+                if q.approved_at is None:
+                    import datetime as _dt
+                    q.approved_at = _dt.datetime.utcnow()
+                # Fire Stripe + Missive only on FIRST transition
+                if prev_status != "approved":
+                    try:
+                        from stripe_push import create_link_for_quote
+                        create_link_for_quote(db, q, org_slug)
+                    except Exception as e:
+                        print(
+                            f"[admin_api] bulk approve: stripe failed "
+                            f"quote={quote_id} err={type(e).__name__}: {e}",
+                            flush=True,
+                        )
+                    try:
+                        from missive_outbound import send_quote_draft
+                        parent_conv = (
+                            db.query(Conversation)
+                            .filter_by(id=q.conversation_id)
+                            .first()
+                            if q.conversation_id else None
+                        )
+                        target_thread = (
+                            parent_conv.external_id.strip()
+                            if parent_conv
+                            and (parent_conv.channel or "").lower() == "missive"
+                            and (parent_conv.external_id or "").strip()
+                            else None
+                        )
+                        db.flush()
+                        send_quote_draft(
+                            db, q, org_slug,
+                            target_conversation_id=target_thread,
+                            send_immediately=True,
+                        )
+                    except Exception as e:
+                        print(
+                            f"[admin_api] bulk approve: missive failed "
+                            f"quote={quote_id} err={type(e).__name__}: {e}",
+                            flush=True,
+                        )
+                db.commit()
+                ok_ids.append(quote_id)
+            elif body.action == "reject":
+                q.status = "rejected"
+                q.approved_by = claims.email
+                db.commit()
+                ok_ids.append(quote_id)
+        except Exception as e:
+            db.rollback()
+            failed.append({
+                "id": quote_id,
+                "error": f"{type(e).__name__}: {e}",
+            })
+
+    return {"ok": ok_ids, "failed": failed}
+
+
+class BulkConversationAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ids: list[int] = Field(min_length=1, max_length=200)
+    action: str = Field(pattern=r"^(delete)$")  # only delete for now
+
+
+@router.post("/orgs/{org_slug}/conversations/bulk")
+def bulk_conversations(
+    org_slug: str,
+    body: BulkConversationAction,
+    request: Request,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v36 — bulk delete conversations (cascades to their quotes via the
+    same logic as the single-row endpoint)."""
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")  # higher bar — destroys quote history
+
+    confirm = (
+        request.headers.get("x-confirm-delete")
+        or request.headers.get("X-Confirm-Delete")
+        or ""
+    ).strip().lower()
+    if confirm != "yes":
+        raise HTTPException(
+            status_code=412,
+            detail="bulk delete requires X-Confirm-Delete: yes header",
+        )
+
+    ok_ids: list[int] = []
+    failed: list[dict[str, Any]] = []
+    total_quotes_deleted = 0
+
+    for cid in body.ids:
+        c = (
+            _scope(db.query(Conversation), Conversation, claims, org_slug)
+            .filter(Conversation.id == cid)
+            .first()
+        )
+        if not c:
+            failed.append({"id": cid, "error": "not_found"})
+            continue
+        try:
+            n = db.query(Quote).filter_by(conversation_id=c.id).delete()
+            total_quotes_deleted += n or 0
+            db.delete(c)
+            db.commit()
+            ok_ids.append(cid)
+        except Exception as e:
+            db.rollback()
+            failed.append({
+                "id": cid,
+                "error": f"{type(e).__name__}: {e}",
+            })
+
+    return {
+        "ok": ok_ids,
+        "failed": failed,
+        "quotes_deleted": total_quotes_deleted,
+    }
 
 
 # ----------------------------------------------------------------------------
