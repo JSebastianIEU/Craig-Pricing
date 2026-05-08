@@ -643,7 +643,7 @@
         }
         /* CRITICAL: jp-hidden must beat the screen's display:flex.
            The widget already uses .jp-hidden on other elements with
-           plain `display: none` — but those are NOT also `display:flex`
+           plain display:none -- but those are NOT also display:flex
            by default. So we need !important for this one. */
         .jp-report-screen.jp-hidden { display: none !important; }
         .jp-report-screen-card {
