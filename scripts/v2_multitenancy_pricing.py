@@ -120,18 +120,33 @@ def migrate() -> None:
             backfill_org(conn, tbl)
 
     # 4) Backfill product.pricing_strategy from category
-    with db_session() as db:
-        products = db.query(Product).all()
-        for p in products:
-            if not p.pricing_strategy or p.pricing_strategy == "tiered":
-                inferred = infer_pricing_strategy(p.category)
-                if p.pricing_strategy != inferred:
-                    p.pricing_strategy = inferred
+    #
+    # v34 fix — uses RAW SQL with explicit columns instead of ORM. The
+    # ORM model would otherwise SELECT every column on Product,
+    # including v34 columns (manual_review_required, manual_review_reason,
+    # internal_notes) which don't exist yet at this point in the
+    # migration chain. Same fix pattern as v25/v26.
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            "SELECT id, category, pricing_strategy FROM products"
+        )).fetchall()
+        for pid, category, current in rows:
+            if not current or current == "tiered":
+                inferred = infer_pricing_strategy(category)
+                if current != inferred:
+                    conn.execute(
+                        text("UPDATE products SET pricing_strategy = :s WHERE id = :id"),
+                        {"s": inferred, "id": pid},
+                    )
         # Backfill surcharge.kind
-        for s in db.query(SurchargeRule).all():
-            if not s.kind:
-                s.kind = "multiplier"
-        print(f"  ↪ pricing_strategy + surcharge.kind backfilled")
+        rows = conn.execute(text("SELECT id, kind FROM surcharge_rules")).fetchall()
+        for sid, kind in rows:
+            if not kind:
+                conn.execute(
+                    text("UPDATE surcharge_rules SET kind = :k WHERE id = :id"),
+                    {"k": "multiplier", "id": sid},
+                )
+        print(f"  pricing_strategy + surcharge.kind backfilled (raw SQL)")
 
     # 5) Seed tax rates and category map for Just Print
     print()

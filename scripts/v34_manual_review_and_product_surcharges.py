@@ -310,10 +310,34 @@ def _seed_setting(db, key: str, value: str, *, force: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 
+def migrate_ddl_only() -> None:
+    """v34 DDL only — extracted so it can run BEFORE the rest of the
+    migration chain. The ORM model in db/models.py declares the new
+    v34 columns, and any earlier migration that does
+    `db.query(Product).all()` would fail with 'column does not exist'
+    if v34's DDL hadn't run yet.
+
+    Called from scripts/startup.py before v2/v3/.../v33 migrations.
+    Idempotent — column-existence checks are inside _add_column_if_missing.
+    """
+    print("V34 DDL (pre-chain): column + table creation...")
+    with engine.begin() as conn:
+        for table, name, defn in _COLUMN_DEFS:
+            if _add_column_if_missing(conn, table, name, defn):
+                print(f"  + {table}.{name}")
+            else:
+                print(f"  - {table}.{name} already present")
+        if _create_pricing_verification_flags(conn):
+            print("  + pricing_verification_flags table created")
+        else:
+            print("  - pricing_verification_flags already exists")
+
+
 def migrate() -> None:
     print("V34: manual-review escalation + per-product surcharges + verification...")
 
-    # ── 1. Schema ──────────────────────────────────────────────────────
+    # ── 1. Schema (now a no-op when migrate_ddl_only ran first; still
+    #              idempotent for direct invocations of v34) ─────────────
     added = 0
     with engine.begin() as conn:
         for table, name, defn in _COLUMN_DEFS:
@@ -321,12 +345,12 @@ def migrate() -> None:
                 print(f"  + {table}.{name}")
                 added += 1
             else:
-                print(f"  · {table}.{name} already present")
+                print(f"  - {table}.{name} already present")
 
         if _create_pricing_verification_flags(conn):
             print("  + pricing_verification_flags table created")
         else:
-            print("  · pricing_verification_flags already exists")
+            print("  - pricing_verification_flags already exists")
 
     # ── 2. Backfill: per-sq/m manual_review flags ──────────────────────
     if _is_postgres():
