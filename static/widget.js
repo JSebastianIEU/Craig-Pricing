@@ -602,6 +602,157 @@
             align-items: center;
         }
 
+        /* v35 — Footer with "Report an issue" link */
+        .jp-footer {
+            padding: 4px 12px 8px;
+            background: #fff;
+            text-align: center;
+        }
+        .jp-report-link {
+            background: none;
+            border: none;
+            color: #94a3b8;
+            font-size: 11px;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+            text-decoration: underline;
+            text-underline-offset: 2px;
+            font-family: inherit;
+        }
+        .jp-report-link:hover {
+            color: var(--jp-brand-primary, #040f2a);
+            background: #f1f5f9;
+        }
+
+        /* v35 — Report Issue modal */
+        .jp-report-modal {
+            position: fixed;
+            inset: 0;
+            z-index: 2147483647;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+            font-family: var(--jp-brand-font, 'Poppins', sans-serif);
+        }
+        .jp-report-backdrop {
+            position: absolute;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.5);
+            backdrop-filter: blur(2px);
+        }
+        .jp-report-card {
+            position: relative;
+            background: #fff;
+            border-radius: 16px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+            max-width: 480px;
+            width: 100%;
+            max-height: 90vh;
+            overflow-y: auto;
+            animation: jpReportFadeIn 0.2s ease-out;
+        }
+        @keyframes jpReportFadeIn {
+            from { opacity: 0; transform: scale(0.95) translateY(10px); }
+            to { opacity: 1; transform: scale(1) translateY(0); }
+        }
+        .jp-report-header {
+            padding: 20px 24px 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #e4e7ee;
+        }
+        .jp-report-header h3 {
+            margin: 0;
+            font-size: 17px;
+            font-weight: 600;
+            color: #0f172a;
+        }
+        .jp-report-close {
+            background: none;
+            border: none;
+            font-size: 26px;
+            line-height: 1;
+            color: #94a3b8;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 6px;
+        }
+        .jp-report-close:hover { background: #f1f5f9; color: #0f172a; }
+        .jp-report-body { padding: 16px 24px 24px; }
+        .jp-report-help {
+            margin: 0 0 16px;
+            font-size: 13px;
+            color: #475569;
+            line-height: 1.5;
+        }
+        .jp-report-label {
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
+            color: #334155;
+            margin: 12px 0 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+        }
+        .jp-report-required { color: #ef4444; }
+        .jp-report-textarea,
+        .jp-report-input {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1.5px solid #e4e7ee;
+            border-radius: 8px;
+            font-family: inherit;
+            font-size: 14px;
+            outline: none;
+            box-sizing: border-box;
+            resize: vertical;
+            background: #fff;
+            color: #0f172a;
+        }
+        .jp-report-textarea:focus,
+        .jp-report-input:focus {
+            border-color: var(--jp-brand-primary, #040f2a);
+        }
+        .jp-report-textarea { min-height: 80px; }
+        .jp-report-error {
+            margin: 10px 0 0;
+            color: #ef4444;
+            font-size: 12px;
+        }
+        .jp-report-actions {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+            margin-top: 18px;
+        }
+        .jp-report-btn-secondary,
+        .jp-report-btn-primary {
+            border: none;
+            border-radius: 8px;
+            padding: 9px 16px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            font-family: inherit;
+        }
+        .jp-report-btn-secondary {
+            background: #f1f5f9;
+            color: #475569;
+        }
+        .jp-report-btn-secondary:hover { background: #e2e8f0; }
+        .jp-report-btn-primary {
+            background: var(--jp-brand-primary, #040f2a);
+            color: #fff;
+        }
+        .jp-report-btn-primary:hover { opacity: 0.9; }
+        .jp-report-btn-primary:disabled {
+            background: #c4cad6;
+            cursor: not-allowed;
+        }
+
         .jp-input {
             flex: 1;
             padding: 11px 16px;
@@ -1210,6 +1361,63 @@
                                 <line x1="22" y1="2" x2="11" y2="13"></line>
                                 <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
                             </svg>
+                        </button>
+                    </div>
+                    <!-- v35 — Report an issue link in the chat footer.
+                         Opens the report modal where the customer can
+                         describe what went wrong. -->
+                    <div class="jp-footer">
+                        <button type="button" class="jp-report-link" id="jpReportLink">
+                            Something wrong? Report an issue
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- v35 — Report Issue modal. Hidden by default; toggled by the
+             footer link. Submits to /widget/conversations/{cid}/report-issue
+             and shows a friendly canned reply in the chat afterward. -->
+        <div class="jp-report-modal jp-hidden" id="jpReportModal" role="dialog" aria-labelledby="jpReportTitle">
+            <div class="jp-report-backdrop" id="jpReportBackdrop"></div>
+            <div class="jp-report-card">
+                <div class="jp-report-header">
+                    <h3 id="jpReportTitle">Report an issue</h3>
+                    <button type="button" class="jp-report-close" id="jpReportClose" aria-label="Close">×</button>
+                </div>
+                <div class="jp-report-body">
+                    <p class="jp-report-help">
+                        Sorry something went wrong. Tell us what happened — we&rsquo;ll
+                        review it and get back to you ASAP to keep your quote
+                        moving.
+                    </p>
+                    <label class="jp-report-label" for="jpReportMessage">
+                        What went wrong? <span class="jp-report-required">*</span>
+                    </label>
+                    <textarea
+                        id="jpReportMessage"
+                        class="jp-report-textarea"
+                        rows="4"
+                        placeholder="e.g. The price seems too high, the bot didn't understand my question, it kept asking the same thing..."
+                        maxlength="4000"
+                    ></textarea>
+                    <label class="jp-report-label" for="jpReportEmail">
+                        Email (optional, so we can follow up)
+                    </label>
+                    <input
+                        id="jpReportEmail"
+                        type="email"
+                        class="jp-report-input"
+                        placeholder="you@example.com"
+                        autocomplete="email"
+                    />
+                    <div class="jp-report-error jp-hidden" id="jpReportError"></div>
+                    <div class="jp-report-actions">
+                        <button type="button" class="jp-report-btn-secondary" id="jpReportCancel">
+                            Cancel
+                        </button>
+                        <button type="button" class="jp-report-btn-primary" id="jpReportSubmit">
+                            Send report
                         </button>
                     </div>
                 </div>
@@ -2184,6 +2392,107 @@
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') sendMessage();
         });
+
+        // ──────────────────────────────────────────────────────────
+        // v35 — Report Issue modal wiring
+        // ──────────────────────────────────────────────────────────
+        const reportLink = $('jpReportLink');
+        const reportModal = $('jpReportModal');
+        const reportBackdrop = $('jpReportBackdrop');
+        const reportClose = $('jpReportClose');
+        const reportCancel = $('jpReportCancel');
+        const reportSubmit = $('jpReportSubmit');
+        const reportMessage = $('jpReportMessage');
+        const reportEmail = $('jpReportEmail');
+        const reportError = $('jpReportError');
+
+        function openReportModal() {
+            reportError.classList.add('jp-hidden');
+            reportError.textContent = '';
+            reportModal.classList.remove('jp-hidden');
+            // Slight delay for the animation to settle before focus
+            setTimeout(() => reportMessage.focus(), 50);
+        }
+
+        function closeReportModal() {
+            reportModal.classList.add('jp-hidden');
+        }
+
+        async function submitReport() {
+            const message = (reportMessage.value || '').trim();
+            const email = (reportEmail.value || '').trim();
+            if (!message) {
+                reportError.textContent = 'Please describe what went wrong.';
+                reportError.classList.remove('jp-hidden');
+                reportMessage.focus();
+                return;
+            }
+            if (!conversationId) {
+                // No conversation yet — surface a gentle reminder.
+                reportError.textContent =
+                    'Please send a chat message first so we have context, then report the issue.';
+                reportError.classList.remove('jp-hidden');
+                return;
+            }
+            reportSubmit.disabled = true;
+            reportSubmit.textContent = 'Sending…';
+            try {
+                const res = await fetch(
+                    `${API_BASE}/widget/conversations/${conversationId}/report-issue`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            external_id: sessionId,
+                            message,
+                            email: email || null,
+                        }),
+                    },
+                );
+                if (!res.ok) {
+                    const text = await res.text();
+                    throw new Error(`HTTP ${res.status}: ${text}`);
+                }
+                const data = await res.json();
+                // Append Craig's canned reply to the chat so the customer
+                // sees something happened. The server has already stored
+                // it on the conversation transcript.
+                if (data.assistant_reply) {
+                    addMsg(data.assistant_reply, 'assistant');
+                }
+                // Reset + close
+                reportMessage.value = '';
+                reportEmail.value = '';
+                closeReportModal();
+            } catch (e) {
+                reportError.textContent =
+                    'Sorry, we couldn\'t send your report just now. ' +
+                    'Please try again, or email info@just-print.ie directly.';
+                reportError.classList.remove('jp-hidden');
+                console.error('[jp] report-issue failed:', e);
+            } finally {
+                reportSubmit.disabled = false;
+                reportSubmit.textContent = 'Send report';
+            }
+        }
+
+        if (reportLink) {
+            reportLink.addEventListener('click', openReportModal);
+        }
+        if (reportClose) reportClose.addEventListener('click', closeReportModal);
+        if (reportCancel) reportCancel.addEventListener('click', closeReportModal);
+        if (reportBackdrop) reportBackdrop.addEventListener('click', closeReportModal);
+        if (reportSubmit) reportSubmit.addEventListener('click', submitReport);
+        if (reportMessage) {
+            reportMessage.addEventListener('keydown', (e) => {
+                // Cmd/Ctrl + Enter submits
+                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                    submitReport();
+                }
+                // Escape closes
+                if (e.key === 'Escape') closeReportModal();
+            });
+        }
 
         // v30.2 — when the iOS keyboard pops up, the visual viewport
         // shrinks but our `position: fixed` panel keeps full height,
