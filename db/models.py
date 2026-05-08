@@ -299,6 +299,17 @@ class Conversation(Base):
         Boolean, nullable=False, default=False, server_default="0",
     )
 
+    # v35 — test-mode flag. When True, this is a sandbox conversation
+    # from the dashboard's Test Chat module — Craig skips the funnel
+    # (no artwork question, no contact-info form, no delivery prompt)
+    # and the row is hidden from the regular Conversations module so
+    # JS / Justin can play with the bot without polluting real
+    # customer data.
+    is_test = Column(
+        Boolean, nullable=False, default=False, server_default="0",
+        index=True,
+    )
+
     quotes = relationship("Quote", back_populates="conversation", cascade="all, delete-orphan")
 
     __table_args__ = (
@@ -414,6 +425,14 @@ class Quote(Base):
     manually_priced_at = Column(DateTime, nullable=True)
     manually_priced_by = Column(String(120), nullable=True)
 
+    # v35 — test-mode mirror of Conversation.is_test. When True, this
+    # quote was generated in a sandbox conversation from the Test Chat
+    # module. Hidden from the regular Quotations module by default.
+    is_test = Column(
+        Boolean, nullable=False, default=False, server_default="0",
+        index=True,
+    )
+
     # Phase F — customer-uploaded artwork file. Cloud Storage URL +
     # original filename + size. (Singular columns kept for backwards
     # compat with code paths that haven't been updated to read the
@@ -482,4 +501,59 @@ class PricingVerificationFlag(Base):
             "ix_pricing_verification_org_prod",
             "organization_slug", "product_key",
         ),
+    )
+
+
+# =============================================================================
+# ISSUE REPORTS (v35)
+# =============================================================================
+
+
+class IssueReport(Base):
+    """
+    v35 — customer-reported issue from the widget (or email channel).
+    Triggered by the "Report an issue" link in the widget footer or
+    by Craig's escalate_to_justin tool with reason_code='customer_reported_issue'.
+
+    Captures the customer's message + a snapshot of their conversation
+    so the operator can review what went wrong without losing context
+    when the conversation moves on. Sends an admin alert email to
+    sebastian@strategos-ai.com (or whoever the org's admin_alert_email
+    setting points at).
+
+    The customer gets a friendly canned reply: "Thanks for letting us
+    know — we're working on improving Craig and will reach out ASAP
+    to keep your quote moving."
+    """
+    __tablename__ = "issue_reports"
+
+    id = Column(Integer, primary_key=True)
+    organization_slug = Column(String(80), nullable=False, default=DEFAULT_ORG_SLUG, index=True)
+    # Conversation the customer was in (if any). Null = standalone report.
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=True, index=True)
+    # Captured at submit time so the alert email has context even if the
+    # conversation later changes / is deleted.
+    customer_email = Column(String(200), nullable=True)
+    customer_name = Column(String(200), nullable=True)
+    channel = Column(String(30), nullable=True)  # web | missive | etc
+    # Customer's free-text message describing the issue.
+    message = Column(Text, nullable=False)
+    # Status workflow — for now 'open' on creation, manually flipped via
+    # admin endpoints later (resolve / dismiss / etc).
+    status = Column(String(30), nullable=False, default="open", server_default="open")
+    reviewed_by = Column(String(120), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    resolution_notes = Column(Text, nullable=True)
+
+    # Admin notification audit (mirrors the v33 pattern on Quote).
+    notification_sent_at = Column(DateTime, nullable=True)
+    notification_message_id = Column(String(128), nullable=True)
+    notification_last_error = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_issue_reports_org_status", "organization_slug", "status"),
+        Index("ix_issue_reports_org_created", "organization_slug", "created_at"),
     )

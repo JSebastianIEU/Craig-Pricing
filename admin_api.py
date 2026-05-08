@@ -32,6 +32,7 @@ from db.models import (
     Category,
     CategoryTaxMap,
     Conversation,
+    IssueReport,
     PriceTier,
     PricingVerificationFlag,
     Product,
@@ -1105,6 +1106,8 @@ def _quote_to_dict(q: Quote) -> dict[str, Any]:
             if getattr(q, "manually_priced_at", None) else None
         ),
         "manually_priced_by": getattr(q, "manually_priced_by", None),
+        # v35 — test-mode mirror from Conversation.is_test
+        "is_test": bool(getattr(q, "is_test", False)),
     }
 
 
@@ -1114,6 +1117,8 @@ def list_quotes(
     status: Optional[str] = Query(None),
     channel: Optional[str] = Query(None),
     limit: int = Query(100, le=500),
+    include_test: bool = Query(False, description="v35 — include is_test=True quotes (default: hidden)"),
+    only_test: bool = Query(False, description="v35 — return ONLY is_test=True quotes (used by Test Chat module)"),
     claims: StrategosClaims = Depends(require_claims),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -1123,6 +1128,14 @@ def list_quotes(
         q = q.filter(Quote.status == status)
     if channel:
         q = q.join(Conversation, Quote.conversation_id == Conversation.id).filter(Conversation.channel == channel)
+    # v35 — by default hide test quotes from the regular Quotations
+    # module so they don't pollute Justin's view. The Test Chat module
+    # passes only_test=true to flip the filter. include_test=true
+    # returns everything (used for debugging).
+    if only_test:
+        q = q.filter(Quote.is_test.is_(True))
+    elif not include_test:
+        q = q.filter(Quote.is_test.is_(False))
     rows = q.order_by(Quote.created_at.desc()).limit(limit).all()
     return {"quotes": [_quote_to_dict(r) for r in rows]}
 
@@ -2556,6 +2569,8 @@ def _conv_summary(c: Conversation) -> dict[str, Any]:
         #   has_own=False                      -> design service
         "customer_has_own_artwork": getattr(c, "customer_has_own_artwork", None),
         "artwork_will_send_later": bool(getattr(c, "artwork_will_send_later", False)),
+        # v35 — test-mode flag (sandbox conversation from dashboard Test Chat)
+        "is_test": bool(getattr(c, "is_test", False)),
     }
 
 
@@ -2567,6 +2582,8 @@ def list_conversations(
     channel: Optional[str] = None,
     search: Optional[str] = None,
     include_noise: bool = Query(False),
+    include_test: bool = Query(False, description="v35 — include is_test=True conversations (default: hidden)"),
+    only_test: bool = Query(False, description="v35 — return ONLY is_test=True conversations (used by Test Chat module)"),
     claims: StrategosClaims = Depends(require_claims),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -2604,6 +2621,14 @@ def list_conversations(
             | (func.lower(Conversation.customer_email).like(like))
             | (Conversation.customer_phone.like(f"%{search}%"))
         )
+    # v35 — test-mode partition. By default, hide test conversations
+    # so they don't pollute the regular Conversations module. Pass
+    # only_test=true to return ONLY test conversations (used by the
+    # Test Chat module's left rail).
+    if only_test:
+        q = q.filter(Conversation.is_test.is_(True))
+    elif not include_test:
+        q = q.filter(Conversation.is_test.is_(False))
     rows = q.order_by(Conversation.updated_at.desc()).limit(limit).all()
     return {"conversations": [_conv_summary(r) for r in rows]}
 
@@ -3062,6 +3087,14 @@ def upsert_pricing_verification_flag(
         )
         .first()
     )
+    # v35 — track what changed so we only fire an admin alert when the
+    # operator actually flagged a row or wrote a comment (not on every
+    # noop write that the table component sometimes does on focus loss).
+    prev_flagged = bool(existing.flagged_wrong) if existing else False
+    prev_comment = (existing.comment or "") if existing else ""
+    new_flagged = bool(body.flagged_wrong)
+    new_comment = (body.comment or "")
+
     if existing is not None:
         existing.flagged_wrong = body.flagged_wrong
         existing.comment = body.comment
@@ -3080,6 +3113,31 @@ def upsert_pricing_verification_flag(
 
     db.commit()
     db.refresh(existing)
+
+    # v35 — admin alert on a meaningful change (flag toggled on, OR
+    # comment added/changed). Best-effort, never raises.
+    flag_just_set = new_flagged and not prev_flagged
+    comment_changed = (new_comment.strip() != prev_comment.strip()) and bool(new_comment.strip())
+    if flag_just_set or comment_changed:
+        try:
+            from notifications import send_admin_alert_for_price_flag
+            send_admin_alert_for_price_flag(
+                db,
+                org_slug=target_org,
+                product_key=existing.product_key,
+                quantity=existing.quantity,
+                spec_key=existing.spec_key or "",
+                flagged_wrong=new_flagged,
+                comment=existing.comment,
+                flagged_by=existing.flagged_by,
+            )
+        except Exception as e:
+            print(
+                f"[admin_api] price-flag admin-alert failed (non-fatal) "
+                f"err={type(e).__name__}: {e}",
+                flush=True,
+            )
+
     return {
         "flag": {
             "product_key": existing.product_key,
@@ -3176,3 +3234,203 @@ def price_preview(
         "price_ex_vat": result.final_price_ex_vat,
         "surcharges_applied": list(result.surcharges_applied or []),
     }
+
+
+# ============================================================================
+# v35 — Test Chat (sandbox conversations from the dashboard)
+# ============================================================================
+#
+# JS uses this endpoint via the new TestChatModule to play with Craig
+# without polluting real customer data. Conversations created here
+# are marked is_test=True and hidden from the regular Conversations
+# module by default. The chat skips the entire customer funnel —
+# no artwork question, no contact form, no delivery prompt.
+# ============================================================================
+
+
+class TestChatBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    conversation_id: Optional[int] = None
+    message: str = Field(min_length=1, max_length=4000)
+
+
+@router.post("/orgs/{org_slug}/test-chat")
+def test_chat(
+    org_slug: str,
+    body: TestChatBody,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v35 — sandbox chat endpoint. Wraps `chat_with_craig` with
+    `is_test=True` and an external_id derived from the operator's
+    email so test conversations can be reused across reloads."""
+    access_guard(org_slug, claims)
+    require_role(claims, "client_member")
+
+    target_org = (
+        org_slug if claims.role == "strategos_admin" else claims.org_slug
+    )
+
+    # Verify conversation_id (if provided) belongs to this org AND is
+    # actually a test conversation — prevents using this endpoint to
+    # impersonate real customer chats.
+    if body.conversation_id is not None:
+        existing = (
+            db.query(Conversation)
+            .filter_by(id=body.conversation_id, organization_slug=target_org)
+            .first()
+        )
+        if existing is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        if not getattr(existing, "is_test", False):
+            raise HTTPException(
+                status_code=409,
+                detail="conversation is not a test conversation",
+            )
+
+    from llm.craig_agent import chat_with_craig
+
+    try:
+        result = chat_with_craig(
+            db,
+            conversation_id=body.conversation_id,
+            user_message=body.message,
+            external_id=f"test:{claims.email}",
+            channel="web",
+            organization_slug=target_org,
+            is_test=True,
+        )
+    except Exception as e:
+        print(
+            f"[admin_api] test-chat: chat_with_craig crashed "
+            f"err={type(e).__name__}: {e}",
+            flush=True,
+        )
+        raise HTTPException(status_code=500, detail=f"chat_failed: {e}")
+
+    return {
+        "reply": result.get("reply", ""),
+        "conversation_id": result.get("conversation_id"),
+        "quote_generated": bool(result.get("quote_generated")),
+        "escalated": bool(result.get("escalated")),
+        "tool_calls": result.get("tool_calls", []),
+    }
+
+
+@router.delete("/orgs/{org_slug}/test-chat/{cid}", status_code=204)
+def delete_test_chat(
+    org_slug: str,
+    cid: int,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> None:
+    """v35 — delete a test conversation + its associated test quotes.
+    Only allowed on conversations marked is_test=True so this can't
+    be used to wipe real customer data."""
+    access_guard(org_slug, claims)
+    require_role(claims, "client_member")
+
+    target_org = (
+        org_slug if claims.role == "strategos_admin" else claims.org_slug
+    )
+    conv = (
+        db.query(Conversation)
+        .filter_by(id=cid, organization_slug=target_org)
+        .first()
+    )
+    if conv is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    if not getattr(conv, "is_test", False):
+        raise HTTPException(
+            status_code=409, detail="not a test conversation",
+        )
+
+    # Cascade-delete quotes first (the relationship has
+    # cascade='all, delete-orphan' but we explicit-delete for clarity).
+    db.query(Quote).filter_by(conversation_id=conv.id).delete()
+    db.delete(conv)
+    db.commit()
+
+
+# ============================================================================
+# v35 — Issue Reports
+# ============================================================================
+
+
+def _issue_to_dict(issue: IssueReport) -> dict[str, Any]:
+    return {
+        "id": issue.id,
+        "conversation_id": issue.conversation_id,
+        "customer_email": issue.customer_email,
+        "customer_name": issue.customer_name,
+        "channel": issue.channel,
+        "message": issue.message,
+        "status": issue.status,
+        "reviewed_by": issue.reviewed_by,
+        "reviewed_at": (
+            issue.reviewed_at.isoformat() if issue.reviewed_at else None
+        ),
+        "resolution_notes": issue.resolution_notes,
+        "notification_sent_at": (
+            issue.notification_sent_at.isoformat()
+            if issue.notification_sent_at else None
+        ),
+        "notification_last_error": issue.notification_last_error,
+        "created_at": (
+            issue.created_at.isoformat() if issue.created_at else None
+        ),
+    }
+
+
+@router.get("/orgs/{org_slug}/issues")
+def list_issues(
+    org_slug: str,
+    status: Optional[str] = Query(None, description="open | resolved | dismissed"),
+    limit: int = Query(100, le=500),
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v35 — list customer-reported issues from the widget."""
+    access_guard(org_slug, claims)
+    q = _scope(db.query(IssueReport), IssueReport, claims, org_slug)
+    if status:
+        q = q.filter(IssueReport.status == status)
+    rows = q.order_by(IssueReport.created_at.desc()).limit(limit).all()
+    return {"issues": [_issue_to_dict(r) for r in rows]}
+
+
+class UpdateIssueBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Optional[str] = Field(default=None, pattern=r"^(open|resolved|dismissed)$")
+    resolution_notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+@router.patch("/orgs/{org_slug}/issues/{issue_id}")
+def update_issue(
+    org_slug: str,
+    issue_id: int,
+    body: UpdateIssueBody,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v35 — update an issue's status (open/resolved/dismissed) and
+    resolution notes. Stamps reviewed_by + reviewed_at."""
+    access_guard(org_slug, claims)
+    require_role(claims, "client_member")
+    issue = (
+        _scope(db.query(IssueReport), IssueReport, claims, org_slug)
+        .filter(IssueReport.id == issue_id)
+        .first()
+    )
+    if issue is None:
+        raise HTTPException(status_code=404, detail="Issue not found")
+    import datetime as _dt
+    if body.status is not None:
+        issue.status = body.status
+        issue.reviewed_by = claims.email
+        issue.reviewed_at = _dt.datetime.utcnow()
+    if body.resolution_notes is not None:
+        issue.resolution_notes = body.resolution_notes
+    db.commit()
+    db.refresh(issue)
+    return {"issue": _issue_to_dict(issue)}

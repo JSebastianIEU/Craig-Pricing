@@ -51,6 +51,15 @@ def main() -> None:
     )
     _run("v34 pre-DDL (columns must exist before any ORM query)", v34_ddl_only)
 
+    # v35 pre-DDL — same pattern as v34. Adds Conversation.is_test +
+    # Quote.is_test + issue_reports table. Models declare these so any
+    # ORM SELECT against Conversation/Quote on a fresh deploy needs
+    # them to exist before the older migrations run.
+    from scripts.v35_test_chat_and_issue_reports import (
+        migrate_ddl_only as v35_ddl_only,
+    )
+    _run("v35 pre-DDL (test-chat flag + issue_reports table)", v35_ddl_only)
+
     # Only bootstrap pricing data if the DB is empty — otherwise this wipes
     # everything the user has edited since first deploy (system_prompt,
     # business_rules, catalog edits, etc.).
@@ -94,6 +103,7 @@ def main() -> None:
     from scripts.v31_missive_auto_send import migrate as v31_migrate
     from scripts.v33_auto_send_and_notifications import migrate as v33_migrate
     from scripts.v34_manual_review_and_product_surcharges import migrate as v34_migrate
+    from scripts.v35_test_chat_and_issue_reports import migrate as v35_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -125,6 +135,7 @@ def main() -> None:
     _run("v31 missive auto-send setting (clarifying replies auto-send, PDF drafts)", v31_migrate)
     _run("v33 dashboard approval + operator notifications + lifecycle UI", v33_migrate)
     _run("v34 manual-review escalation + per-product surcharges + verification table", v34_migrate)
+    _run("v35 test-chat sandbox + issue reports + admin alerts", v35_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

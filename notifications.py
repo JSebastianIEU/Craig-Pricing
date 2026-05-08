@@ -693,3 +693,245 @@ def trigger_manual_review_notification(
         except Exception:
             db.rollback()
         return {"ok": False, "skipped": False, "error": result.get("error")}
+
+
+# ---------------------------------------------------------------------------
+# v35 — generic admin alerts (sebastian@strategos-ai.com or wherever the
+# org's admin_alert_email points). Distinct from the operator (Justin)
+# notification surface; this is the agency-side feedback loop.
+# Triggers on:
+#   - customer-reported issues from the widget
+#   - Justin flagging a price wrong in Pricing Verification
+#   - Justin commenting on a price row in Pricing Verification
+# ---------------------------------------------------------------------------
+
+
+def send_admin_alert(
+    db: Session,
+    *,
+    org_slug: str,
+    kind: str,
+    title: str,
+    body_html: str,
+    body_text: str,
+    dashboard_url: Optional[str] = None,
+) -> dict:
+    """Send a one-off admin-feedback email via Resend. Returns
+    {ok, message_id, error}. Never raises — admin alerts are
+    best-effort + must not block customer/operator flows.
+
+    `kind` is a short tag included in the subject ("issue_reported",
+    "price_flagged_wrong", "price_comment", "other"). The receiving
+    inbox can filter by kind if needed.
+    """
+    enabled = _setting(
+        db, "notifications_enabled", "true", organization_slug=org_slug,
+    ).lower() == "true"
+    if not enabled:
+        return {"ok": False, "message_id": None, "error": "notifications_disabled"}
+
+    api_key = os.environ.get(_RESEND_API_KEY_ENV, "").strip()
+    if not api_key:
+        return {"ok": False, "message_id": None, "error": "missing_RESEND_API_KEY"}
+
+    sender_addr = _setting(
+        db, "notification_sender_address",
+        "craig@notifications.strategos-ai.com",
+        organization_slug=org_slug,
+    )
+    sender_name = _setting(
+        db, "notification_sender_name",
+        "Craig (Just Print)",
+        organization_slug=org_slug,
+    )
+    to_addr = _setting(
+        db, "admin_alert_email", "sebastian@strategos-ai.com",
+        organization_slug=org_slug,
+    )
+    if not to_addr:
+        return {"ok": False, "message_id": None, "error": "missing_admin_alert_email"}
+
+    prefix = _setting(
+        db, "admin_alert_subject_prefix", "[Strategos]",
+        organization_slug=org_slug,
+    )
+    subject = f"{prefix} {title}"
+
+    # Optional dashboard link footer
+    if dashboard_url:
+        body_html += (
+            f'<div style="margin-top:24px;">'
+            f'<a href="{_html.escape(dashboard_url)}" '
+            f'style="color:#040f2a;text-decoration:underline;">'
+            f'Open in dashboard ↗</a></div>'
+        )
+        body_text += f"\n\nDashboard: {dashboard_url}\n"
+
+    try:
+        import resend
+        resend.api_key = api_key
+        params = {
+            "from": f"{sender_name} <{sender_addr}>",
+            "to": [to_addr],
+            "subject": subject,
+            "html": body_html,
+            "text": body_text,
+        }
+        result = resend.Emails.send(params)
+        msg_id = (result or {}).get("id") if isinstance(result, dict) else None
+        print(
+            f"[notifications] admin-alert sent kind={kind} org={org_slug} "
+            f"to={to_addr} id={msg_id}",
+            flush=True,
+        )
+        return {"ok": True, "message_id": msg_id, "error": None}
+    except Exception as e:
+        msg = f"resend_error: {type(e).__name__}: {str(e)[:200]}"
+        print(
+            f"[notifications] admin-alert FAILED kind={kind} org={org_slug} err={msg}",
+            flush=True,
+        )
+        return {"ok": False, "message_id": None, "error": msg}
+
+
+def send_admin_alert_for_issue(
+    db: Session, issue, org_slug: str,
+) -> dict:
+    """Compose + send the v35 issue-reported email. `issue` is an
+    `IssueReport` row. Uses `send_admin_alert` under the hood."""
+    cust_name = _safe(issue.customer_name, fallback="(anonymous)")
+    cust_email = _safe(issue.customer_email, fallback="(no email provided)")
+    channel = _safe(issue.channel, fallback="?")
+    msg_safe = _html.escape(issue.message or "")
+
+    base = _setting(
+        db, "dashboard_base_url", _DEFAULT_DASHBOARD_BASE,
+        organization_slug=org_slug,
+    )
+    dashboard_url = (
+        f"{base.rstrip('/')}/c/{org_slug}/a/craig/conversations"
+        + (f"?focus={issue.conversation_id}" if issue.conversation_id else "")
+    )
+
+    body_html = (
+        f'<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;'
+        f'max-width:600px;margin:0 auto;color:#0f172a;">'
+        f'<h2 style="margin:0 0 12px;color:#9a3412;">Customer reported an issue</h2>'
+        f'<p style="margin:0 0 18px;color:#475569;font-size:14px;">'
+        f'A customer used the &ldquo;Report an issue&rdquo; link to flag a problem '
+        f'with their interaction. The conversation transcript is preserved in '
+        f'the dashboard so you can review what went wrong.'
+        f'</p>'
+        f'<table style="width:100%;font-size:14px;border-collapse:collapse;margin:12px 0;">'
+        f'<tr><td style="padding:4px 0;color:#64748b;width:140px;">Customer</td><td>{cust_name}</td></tr>'
+        f'<tr><td style="padding:4px 0;color:#64748b;">Email</td><td>{cust_email}</td></tr>'
+        f'<tr><td style="padding:4px 0;color:#64748b;">Channel</td><td>{channel}</td></tr>'
+        f'<tr><td style="padding:4px 0;color:#64748b;vertical-align:top;">Conversation</td>'
+        f'<td>{issue.conversation_id if issue.conversation_id else "(standalone)"}</td></tr>'
+        f'</table>'
+        f'<h3 style="margin:18px 0 6px;font-size:13px;color:#475569;text-transform:uppercase;'
+        f'letter-spacing:0.5px;">Customer message</h3>'
+        f'<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:12px;'
+        f'white-space:pre-wrap;font-size:13px;line-height:1.5;">{msg_safe}</div>'
+        f'</div>'
+    )
+    body_text = (
+        f"Customer reported an issue\n\n"
+        f"Customer:    {cust_name}\n"
+        f"Email:       {cust_email}\n"
+        f"Channel:     {channel}\n"
+        f"Conversation: {issue.conversation_id or '(standalone)'}\n"
+        f"\n"
+        f"Message:\n{issue.message or ''}\n"
+    )
+
+    return send_admin_alert(
+        db,
+        org_slug=org_slug,
+        kind="issue_reported",
+        title=f"Customer issue — {cust_name}",
+        body_html=body_html,
+        body_text=body_text,
+        dashboard_url=dashboard_url,
+    )
+
+
+def send_admin_alert_for_price_flag(
+    db: Session,
+    *,
+    org_slug: str,
+    product_key: str,
+    quantity: int,
+    spec_key: str,
+    flagged_wrong: bool,
+    comment: Optional[str],
+    flagged_by: Optional[str],
+) -> dict:
+    """Send the v35 price-flag/comment email. Fired from the
+    PUT /pricing-verification/flag endpoint when Justin marks a row
+    wrong or leaves a note."""
+    base = _setting(
+        db, "dashboard_base_url", _DEFAULT_DASHBOARD_BASE,
+        organization_slug=org_slug,
+    )
+    dashboard_url = f"{base.rstrip('/')}/c/{org_slug}/a/craig/catalog"
+
+    if flagged_wrong:
+        kind = "price_flagged_wrong"
+        title = f"Price flagged wrong — {product_key} qty {quantity}"
+    else:
+        kind = "price_comment"
+        title = f"Price comment — {product_key} qty {quantity}"
+
+    spec_part = f" · spec=<code>{_html.escape(spec_key)}</code>" if spec_key else ""
+    flag_badge = (
+        '<span style="display:inline-block;background:#fee2e2;color:#991b1b;'
+        'padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600;">'
+        'FLAGGED WRONG</span>'
+        if flagged_wrong else
+        '<span style="display:inline-block;background:#fef3c7;color:#92400e;'
+        'padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600;">'
+        'COMMENT</span>'
+    )
+
+    by_safe = _html.escape(flagged_by or "(unknown)")
+    cmt_safe = _html.escape(comment or "(no comment)")
+
+    body_html = (
+        f'<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;'
+        f'max-width:600px;margin:0 auto;color:#0f172a;">'
+        f'<h2 style="margin:0 0 12px;">Pricing review note</h2>'
+        f'<p style="margin:0 0 18px;color:#475569;font-size:14px;">'
+        f'Justin (or another operator) flagged or commented on a row in the '
+        f'Pricing Verification table. {flag_badge}'
+        f'</p>'
+        f'<table style="width:100%;font-size:14px;border-collapse:collapse;margin:12px 0;">'
+        f'<tr><td style="padding:4px 0;color:#64748b;width:140px;">Product</td>'
+        f'<td><code>{_html.escape(product_key)}</code></td></tr>'
+        f'<tr><td style="padding:4px 0;color:#64748b;">Quantity</td><td>{quantity}{spec_part}</td></tr>'
+        f'<tr><td style="padding:4px 0;color:#64748b;">By</td><td>{by_safe}</td></tr>'
+        f'</table>'
+        f'<h3 style="margin:18px 0 6px;font-size:13px;color:#475569;text-transform:uppercase;'
+        f'letter-spacing:0.5px;">Comment</h3>'
+        f'<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;'
+        f'white-space:pre-wrap;font-size:13px;line-height:1.5;">{cmt_safe}</div>'
+        f'</div>'
+    )
+    body_text = (
+        f"Pricing review note ({'FLAGGED WRONG' if flagged_wrong else 'COMMENT'})\n\n"
+        f"Product:  {product_key}\n"
+        f"Quantity: {quantity}{(' · spec=' + spec_key) if spec_key else ''}\n"
+        f"By:       {flagged_by or '(unknown)'}\n"
+        f"\n"
+        f"Comment:\n{comment or '(no comment)'}\n"
+    )
+
+    return send_admin_alert(
+        db,
+        org_slug=org_slug,
+        kind=kind,
+        title=title,
+        body_html=body_html,
+        body_text=body_text,
+        dashboard_url=dashboard_url,
+    )

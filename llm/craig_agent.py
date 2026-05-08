@@ -1268,6 +1268,16 @@ def _handle_manual_review_escalation(
         if v is not None:
             specs[key] = v
 
+    # v35 — propagate Conversation.is_test onto Quote.is_test so test
+    # quotes never appear in the regular Quotations module.
+    is_test_conv = False
+    if conversation_id is not None:
+        try:
+            _conv = db.query(Conversation).filter_by(id=conversation_id).first()
+            is_test_conv = bool(_conv and getattr(_conv, "is_test", False))
+        except Exception:
+            is_test_conv = False
+
     quote_id: Optional[int] = None
     try:
         quote = Quote(
@@ -1285,6 +1295,7 @@ def _handle_manual_review_escalation(
             status="needs_revision",
             manual_review_reason=result.reason,
             notes=None,
+            is_test=is_test_conv,
         )
         db.add(quote)
         db.flush()
@@ -1766,6 +1777,7 @@ def chat_with_craig(
     channel: str = "web",
     organization_slug: str = "just-print",
     extra_system_messages: Optional[list[dict]] = None,
+    is_test: bool = False,
 ) -> dict:
     """
     Main entry point. Handles one turn of conversation.
@@ -1775,6 +1787,16 @@ def chat_with_craig(
         (falls back to the hardcoded CRAIG_SYSTEM_PROMPT if not found)
       - every tool call hits the pricing engine with that tenant's data
       - the Conversation + Quote records are tagged with that tenant
+
+    `is_test` (v35) — when True, this is a sandbox conversation from
+    the Test Chat module in the dashboard:
+      - Conversation is marked is_test=True (auto-filtered from
+        Conversations module)
+      - The artwork-question gate is skipped (the LLM can quote
+        immediately without first asking "do you have artwork?")
+      - The system prompt gains a TEST MODE header instructing the
+        LLM not to ask about contact info, delivery, or artwork
+      - Quotes generated are also marked is_test=True
 
     Returns:
       {
@@ -1796,6 +1818,7 @@ def chat_with_craig(
             conversation = Conversation(
                 organization_slug=organization_slug,
                 external_id=external_id, channel=channel, messages=[],
+                is_test=bool(is_test),
             )
             db.add(conversation)
             db.flush()
@@ -1803,8 +1826,22 @@ def chat_with_craig(
         conversation = Conversation(
             organization_slug=organization_slug,
             external_id=external_id, channel=channel, messages=[],
+            is_test=bool(is_test),
         )
         db.add(conversation)
+        db.flush()
+
+    # v35 — propagate the is_test flag if this is a re-entry on an
+    # existing conversation that was created as test (idempotent).
+    if is_test and not conversation.is_test:
+        conversation.is_test = True
+        db.flush()
+    # Pre-set artwork flag so the artwork-question gate skips. The
+    # tool-execution layer (_exec_tool) checks customer_has_own_artwork
+    # before pricing — setting it to True here means a test quote
+    # doesn't need a funnel preamble.
+    if conversation.is_test and conversation.customer_has_own_artwork is None:
+        conversation.customer_has_own_artwork = True
         db.flush()
 
     # Load this tenant's system prompt from the Setting table; fall back to the
@@ -1876,6 +1913,36 @@ def chat_with_craig(
 
     # Build message history for the LLM
     messages = [{"role": "system", "content": system_prompt}]
+
+    # v35 — TEST MODE banner. Sandbox conversations from the dashboard
+    # Test Chat module skip the entire customer funnel (no contact
+    # info, no delivery, no artwork). Inject a high-priority system
+    # message right after the base prompt so DeepSeek sees it before
+    # the channel/business-rule context.
+    if conversation.is_test:
+        messages.append({
+            "role": "system",
+            "content": (
+                "## TEST MODE (sandbox)\n"
+                "You are in a sandbox conversation from the dashboard's "
+                "Test Chat module — this is NOT a real customer. The "
+                "operator is testing your pricing logic.\n"
+                "\n"
+                "Skip the entire customer funnel:\n"
+                "  - DO NOT ask 'do you have artwork or need design service?'\n"
+                "  - DO NOT ask for name, email, phone, company, returning customer\n"
+                "  - DO NOT ask about delivery / collection / address\n"
+                "  - DO NOT emit [QUOTE_READY], [CUSTOMER_FORM], or "
+                "    [ARTWORK_UPLOAD] markers\n"
+                "\n"
+                "Just answer pricing questions directly. When you have a "
+                "product + quantity (and finish/double-sided if relevant), "
+                "call the pricing tool with needs_artwork=false. State "
+                "the inc-VAT total and any tier-combination breakdown "
+                "clearly so the operator can verify it. If asked, explain "
+                "your reasoning — this is a debugging session."
+            ),
+        })
 
     # v32.2 — server-injected context (e.g. [SENDER METADATA] +
     # [CUSTOMER STATUS] from the Missive handler). These appear BEFORE
@@ -2168,6 +2235,8 @@ def chat_with_craig(
                         artwork_cost=result.get("artwork_cost_ex_vat") or 0.0,
                         total=result["total_inc_everything"],
                         status="pending_approval",
+                        # v35 — mirror the test flag from the conversation
+                        is_test=bool(conversation.is_test),
                     )
                     db.add(q)
                     db.flush()  # get the ID

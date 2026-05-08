@@ -40,7 +40,7 @@ from sqlalchemy.orm import Session
 
 from rate_limiter import rate_limit
 from db import get_db, parse_artwork_files
-from db.models import Conversation, Quote
+from db.models import Conversation, IssueReport, Quote
 
 
 router = APIRouter(prefix="/widget", tags=["Widget"])
@@ -647,4 +647,117 @@ def delete_artwork_file(
             )
             for i, e in enumerate(files)
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# v35 — POST /widget/conversations/{cid}/report-issue
+# ---------------------------------------------------------------------------
+#
+# Customer clicked "Report an issue" in the widget footer. Captures
+# their free-text complaint + optional email, persists it as an
+# IssueReport row, and fires an admin alert email to
+# sebastian@strategos-ai.com (configurable via admin_alert_email
+# setting). The widget shows them a friendly canned reply.
+#
+# Anonymous (no JWT) — uses the same external_id session pattern as
+# the other widget endpoints. Rate-limited to prevent spam.
+# ---------------------------------------------------------------------------
+
+
+class ReportIssueBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    external_id: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=4000)
+    email: Optional[str] = Field(default=None, max_length=200)
+    name: Optional[str] = Field(default=None, max_length=200)
+
+
+@router.post(
+    "/conversations/{cid}/report-issue",
+    dependencies=[Depends(rate_limit("widget_report_issue", 10))],
+)
+def report_issue(
+    cid: int,
+    body: ReportIssueBody,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v35 — customer-side issue reporting from the widget footer.
+
+    Validates the session via external_id, persists an IssueReport
+    row, and triggers an admin-alert email. Returns a canned message
+    the widget displays in the chat as Craig's reply so the customer
+    feels heard.
+    """
+    conv = _validate_session(db, cid, body.external_id)
+
+    # Email validation — optional; the customer may not give one.
+    customer_email = (body.email or "").strip().lower() or None
+    if customer_email and not _EMAIL_RX.match(customer_email):
+        raise HTTPException(status_code=422, detail="invalid email format")
+
+    # Fall back to the conversation's existing customer info
+    final_email = customer_email or conv.customer_email
+    final_name = (body.name or "").strip() or conv.customer_name
+
+    issue = IssueReport(
+        organization_slug=conv.organization_slug,
+        conversation_id=conv.id,
+        customer_email=final_email,
+        customer_name=final_name,
+        channel=conv.channel,
+        message=body.message.strip(),
+        status="open",
+    )
+    db.add(issue)
+    db.flush()
+    db.commit()
+    db.refresh(issue)
+
+    # Fire admin alert (best-effort — never block the customer reply
+    # on a Resend hiccup). Logged inside the helper.
+    try:
+        from notifications import send_admin_alert_for_issue
+        result = send_admin_alert_for_issue(db, issue, conv.organization_slug)
+        if result.get("ok"):
+            issue.notification_sent_at = __import__("datetime").datetime.utcnow()
+            issue.notification_message_id = result.get("message_id")
+            db.commit()
+        else:
+            issue.notification_last_error = (result.get("error") or "")[:500]
+            db.commit()
+    except Exception as e:
+        print(
+            f"[widget] report-issue: alert failed (non-fatal) "
+            f"err={type(e).__name__}: {e}",
+            flush=True,
+        )
+
+    canned_reply = (
+        "Thanks for letting us know — we&apos;re working on improving "
+        "Craig and will reach out as soon as possible to keep your "
+        "quote moving. \U0001F44D"
+    )
+
+    # Append a synthetic system + assistant turn to the conversation
+    # transcript so the dashboard shows what happened. No LLM round-trip.
+    history = list(conv.messages or [])
+    history.append({
+        "role": "system",
+        "content": (
+            f"[SYSTEM] Customer reported an issue (issue_report_id={issue.id}): "
+            f"{body.message.strip()[:300]}"
+        ),
+    })
+    history.append({
+        "role": "assistant",
+        "content": canned_reply.replace("&apos;", "'"),
+    })
+    conv.messages = history
+    db.commit()
+
+    return {
+        "ok": True,
+        "issue_id": issue.id,
+        "assistant_reply": canned_reply.replace("&apos;", "'"),
     }
