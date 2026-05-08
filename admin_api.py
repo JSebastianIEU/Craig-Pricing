@@ -2860,16 +2860,27 @@ def _representative_quantities(p: Product, tiers: list[PriceTier]) -> list[tuple
     """Return a list of (quantity, spec_key) pairs to evaluate for a
     given product's verification table. Strategy-aware:
 
-      tiered          → every PriceTier qty (spec_key='')
-      per_unit        → [1, 10, 50, 100, 500] (spec_key='')
-      per_unit_metric → [1, 10, 50, 100, 500] (spec_key='')
-      bulk_break      → [bulk_threshold-1, bulk_threshold, bulk_threshold*2]
-                        capped at 1+ (spec_key='')
-      per_job         → every (spec_key, qty) on PriceTier (booklets)
+      tiered (small_format) → every PriceTier qty (spec_key='')
+      tiered (booklet)      → every (spec_key, qty) on PriceTier
+                              — booklets store the multi-axis spec
+                              ("8pp|self_cover", etc.) in spec_key.
+      per_unit / per_unit_metric → [1, 10, 50, 100, 500] (spec_key='')
+      bulk_break → [bulk_threshold-1, bulk_threshold, bulk_threshold*2]
+                   capped at 1+ (spec_key='')
+      per_job    → every (spec_key, qty) on PriceTier (legacy)
     """
     strategy = (p.pricing_strategy or "tiered").lower()
 
     if strategy == "tiered":
+        # v34 fix — booklets use category='booklet' + strategy='tiered'
+        # but every tier has a non-empty spec_key (e.g. "8pp|self_cover").
+        # The previous filter `if (t.spec_key or "") == ""` returned
+        # ZERO rows for booklets, so they never appeared in the export.
+        # Now: small_format keeps the empty-spec_key filter (each
+        # product is a single SKU), booklet returns every (qty, spec)
+        # combo so Justin sees the whole price ladder.
+        if p.category == "booklet":
+            return [(t.quantity, t.spec_key or "") for t in tiers]
         return [(t.quantity, t.spec_key or "") for t in tiers if (t.spec_key or "") == ""]
 
     if strategy in ("per_unit", "per_unit_metric"):

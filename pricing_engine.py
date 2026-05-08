@@ -269,6 +269,128 @@ def _parse_unit_base(price_per: str) -> int:
         return 1
 
 
+# ---------------------------------------------------------------------------
+# v34 — stack-tier helper
+# ---------------------------------------------------------------------------
+#
+# When the customer asks for a quantity that doesn't exactly match any
+# PriceTier (e.g. 530 business cards on a sheet with [100, 250, 500, 1000,
+# 2500] tiers), this helper builds the cheapest *combination* of available
+# tiers that totals >= requested qty. The customer pays for the combined
+# bin (e.g. 500 + 100 = 600 cards) at the sum of those tiers' prices.
+#
+# Confirmed by Justin (May 2026): 530 cards should NOT escalate to a
+# manual quote — Craig should bill it as 500 + 100 = 600 cards. Same
+# rule applies to flyers, brochures, NCR pads — every tiered product.
+#
+# Algorithm (greedy, largest-first):
+#   1. Sort available tiers descending by qty.
+#   2. While remaining > 0: take the largest tier ≤ remaining, decrement.
+#   3. If remaining > 0 (i.e. requested overflows the smallest tier):
+#      take the smallest tier ≥ remaining as a top-up.
+#   4. If still no fit (requested > max_oversize_factor × largest tier):
+#      return None — too far off, escalate to a manual quote.
+#
+# Greedy is naturally cost-optimal here because the per-unit price
+# decreases (or stays flat) with larger tiers — so picking larger
+# tiers first minimizes the bill. Tested against Justin's sheets.
+# ---------------------------------------------------------------------------
+
+
+def _stack_tiers(
+    db: Session,
+    product_id: int,
+    spec_key: str,
+    requested_qty: int,
+    unit_base: int = 1,
+    *,
+    per_job: bool = False,
+    max_oversize_factor: int = 5,
+) -> Optional[tuple[int, float, list[tuple[int, float]]]]:
+    """Build the cheapest combination of available tiers that totals
+    >= requested_qty.
+
+    Args:
+      unit_base: how the `tier.price` column is denominated for
+        per-base products. Small-format tiered products store per-base
+        prices (e.g. €38 = "per 100 business cards"), so the actual
+        line-item cost for a tier is
+        `tier.price * tier.quantity / unit_base`.
+      per_job: when True, treat `tier.price` as the FULL line-item cost
+        for `tier.quantity` items (no multiplication). Booklets are
+        priced this way — the 100-tier of an 8pp self-cover A5 booklet
+        IS €110, not "€110 per 100 booklets". Pass per_job=True from
+        quote_booklet.
+
+    Returns:
+      (billed_qty, total_price, breakdown)
+      where breakdown is a list of (tier_qty, line_item_price) entries
+      — note line_item_price is the FULL cost of using that tier.
+    Returns None when:
+      - no tiers exist for this product+spec_key
+      - requested_qty exceeds max_oversize_factor × largest tier qty
+        (we'd be guessing too much — escalate instead).
+
+    Edge cases:
+      - requested_qty <= smallest tier → the smallest tier is used
+        once. Customer pays for the smallest tier's full qty.
+        (e.g. 50 cards billed as 100 cards.)
+      - requested_qty exactly matches a tier → returns that single
+        tier (callers usually short-circuit to the single-tier path
+        BEFORE calling here, but it's still correct).
+    """
+    rows = (
+        db.query(PriceTier)
+        .filter_by(product_id=product_id, spec_key=spec_key)
+        .order_by(PriceTier.quantity.desc())
+        .all()
+    )
+    if not rows:
+        return None
+
+    base = max(1, int(unit_base or 1))
+    if per_job:
+        # tier.price IS the line-item cost — no multiplication.
+        tiers_desc: list[tuple[int, float]] = [
+            (int(t.quantity), float(t.price)) for t in rows
+        ]
+    else:
+        # tier.price is per-base; line-item cost = price * qty / base.
+        tiers_desc = [
+            (int(t.quantity), round(float(t.price) * int(t.quantity) / base, 2))
+            for t in rows
+        ]
+    smallest_qty, _ = tiers_desc[-1]
+    largest_qty, _ = tiers_desc[0]
+
+    if requested_qty > max_oversize_factor * largest_qty:
+        return None
+
+    # Special case: requested under the smallest tier → bill the smallest
+    # tier once. Customer pays for the smallest bin.
+    if requested_qty <= smallest_qty:
+        return (smallest_qty, tiers_desc[-1][1], [tiers_desc[-1]])
+
+    # Greedy fill (largest-first)
+    remaining = requested_qty
+    breakdown: list[tuple[int, float]] = []
+    while remaining > 0:
+        # Largest tier ≤ remaining
+        chosen = next(((q, p) for q, p in tiers_desc if q <= remaining), None)
+        if chosen is None:
+            # Remaining smaller than the smallest tier → top up with smallest
+            chosen = tiers_desc[-1]
+            breakdown.append(chosen)
+            remaining = 0
+            break
+        breakdown.append(chosen)
+        remaining -= chosen[0]
+
+    billed_qty = sum(q for q, _ in breakdown)
+    total_price = round(sum(p for _, p in breakdown), 2)
+    return (billed_qty, total_price, breakdown)
+
+
 # Fallback constants if a tenant has no tax_rates seeded yet
 _STANDARD_VAT_RATE = 0.23
 _REDUCED_VAT_RATE = 0.135
@@ -450,23 +572,52 @@ def quote_small_format(
     tier = db.query(PriceTier).filter_by(
         product_id=product.id, spec_key="", quantity=quantity,
     ).first()
-    if tier is None:
-        available = sorted(
-            t.quantity for t in db.query(PriceTier).filter_by(product_id=product.id, spec_key="").all()
-        )
-        return EscalationResult(
-            reason=f"Quantity {quantity} is not on the pricing sheet for {product.name}.",
-            product_name=product.name,
-            message=f"Available quantities: {available}. Justin needs to quote {quantity} directly.",
-        )
 
-    # Price on sheet is per unit base (e.g. per 100 cards, per 5 pads)
-    unit_price = tier.price
+    # v34 — stack-tier fallback. When the requested qty doesn't match a
+    # tier exactly (e.g. 530 business cards on [100, 250, 500, 1000,
+    # 2500]), bill it as the cheapest combination of available tiers
+    # whose sum ≥ requested. So 530 → 500 + 100 = 600 cards bin, cost =
+    # tier(500).price + tier(100).price. Confirmed by Justin: this is
+    # how the print shop actually charges off-tier qtys, not as an
+    # escalation. See _stack_tiers docstring for the algorithm.
     unit_base = _parse_unit_base(product.price_per)
-    qty_multiplier = quantity / unit_base
-    base_price = round(unit_price * qty_multiplier, 2)
-
+    base_price = 0.0
     surcharges_applied: list[str] = []
+    if tier is not None:
+        # Exact match — original behaviour. Tier prices are per-base
+        # (e.g. "per 100 cards"), so multiply by qty/base.
+        qty_multiplier = quantity / unit_base
+        base_price = round(tier.price * qty_multiplier, 2)
+    else:
+        stacked = _stack_tiers(db, product.id, "", quantity, unit_base)
+        if stacked is None:
+            available = sorted(
+                t.quantity for t in db.query(PriceTier)
+                .filter_by(product_id=product.id, spec_key="").all()
+            )
+            return EscalationResult(
+                reason=f"Quantity {quantity} is too far off the pricing sheet for {product.name}.",
+                product_name=product.name,
+                message=(
+                    f"Available quantities: {available}. {quantity} would "
+                    f"require >5x the largest tier — Justin needs to quote "
+                    f"this directly."
+                ),
+            )
+        billed_qty, total_price, breakdown = stacked
+        base_price = total_price
+        # Render a human-readable note about the stacking — Craig will
+        # repeat this in the customer reply (and Justin sees it in the
+        # quote breakdown).
+        tier_summary = " + ".join(str(q) for q, _ in breakdown)
+        if billed_qty == quantity:
+            surcharges_applied.append(
+                f"Tier combination: {tier_summary} = {quantity}"
+            )
+        else:
+            surcharges_applied.append(
+                f"Tier combination: {quantity} billed as {tier_summary} = {billed_qty}"
+            )
     multiplier = 1.0   # collects all multiplier-kind surcharges (e.g. +20%)
     additive = 0.0     # collects all additive-kind surcharges (e.g. +€15 flat)
 
@@ -767,28 +918,47 @@ def quote_booklet(
         product_id=product.id, spec_key=spec_key, quantity=quantity,
     ).first()
 
-    if tier is None:
-        # Gather available specs for a helpful escalation message
-        available_specs = db.query(PriceTier.spec_key, PriceTier.quantity).filter_by(
-            product_id=product.id,
-        ).all()
-        available_pages = sorted({int(s.split("pp")[0]) for s, _ in available_specs})
-        available_qtys = sorted({q for _, q in available_specs})
-        return EscalationResult(
-            reason=f"No matching price for {pages}pp / {cover_type} / qty {quantity}.",
-            product_name=product.name,
-            message=(
-                f"Available page counts: {available_pages}. "
-                f"Available quantities: {available_qtys}. "
-                f"Justin needs to quote this directly."
-            ),
-        )
-
-    base_price = tier.price  # booklets are "per job" — no unit multiplier
+    # v34 — stack-tier fallback. Booklets are priced per-job (one tier =
+    # one full price for the whole batch), so unit_base=1 and the
+    # breakdown items ARE the line-item costs. If a customer asks for
+    # 75 of an 8pp spec on a [25, 50, 100, 250, 500] sheet, we bill
+    # 50 + 25 = 75 exact, cost = tier(50).price + tier(25).price.
+    base_price = 0.0
+    applied: list[str] = []
+    if tier is not None:
+        base_price = float(tier.price)
+    else:
+        stacked = _stack_tiers(db, product.id, spec_key, quantity, per_job=True)
+        if stacked is None:
+            available_specs = db.query(PriceTier.spec_key, PriceTier.quantity).filter_by(
+                product_id=product.id,
+            ).all()
+            available_pages = sorted({int(s.split("pp")[0]) for s, _ in available_specs})
+            available_qtys = sorted({q for _, q in available_specs})
+            # Spec missing entirely (page/cover combo not on sheet) is
+            # different from "qty too far off": surface both cases the
+            # same way for the LLM.
+            return EscalationResult(
+                reason=f"No matching price for {pages}pp / {cover_type} / qty {quantity}.",
+                product_name=product.name,
+                message=(
+                    f"Available page counts: {available_pages}. "
+                    f"Available quantities: {available_qtys}. "
+                    f"Justin needs to quote this directly."
+                ),
+            )
+        billed_qty, total_price, breakdown = stacked
+        base_price = total_price
+        tier_summary = " + ".join(str(q) for q, _ in breakdown)
+        if billed_qty == quantity:
+            applied.append(f"Tier combination: {tier_summary} = {quantity}")
+        else:
+            applied.append(
+                f"Tier combination: {quantity} billed as {tier_summary} = {billed_qty}"
+            )
 
     # Client multiplier — applied BEFORE VAT like the other product families.
     final_ex = base_price
-    applied: list[str] = []
     client_mult = _get_client_multiplier(db, organization_slug=organization_slug)
     if abs(client_mult - 1.0) > 1e-6:
         final_ex = round(base_price * client_mult, 2)

@@ -221,7 +221,8 @@ def test_compliment_slips_1000_double_sided():
 # =============================================================================
 
 
-def test_invalid_quantity_escalates():
+def test_off_tier_quantity_stacks_instead_of_escalating():
+    """v34 — qty 750 used to escalate, now stacks (500+250=750 exact)."""
     r = client.post("/quote/small-format", json={
         "product_key": "flyers_a5",
         "quantity": 750,
@@ -229,9 +230,24 @@ def test_invalid_quantity_escalates():
         "finish": "gloss",
     })
     data = r.json()
+    assert data["success"] is True, data
+    # 500 tier @ 22 + 250 tier @ 30 = 110 + 75 = 185 ex VAT
+    assert data["base_price"] == 185.00
+    assert any("Tier combination" in s for s in data["surcharges_applied"])
+
+
+def test_invalid_quantity_escalates():
+    """v34 — only escalate when qty is >5x the largest tier (truly off-sheet)."""
+    r = client.post("/quote/small-format", json={
+        "product_key": "flyers_a5",
+        "quantity": 50000,  # >5x the 2500 largest tier
+        "double_sided": False,
+        "finish": "gloss",
+    })
+    data = r.json()
     assert data["success"] is False
     assert data["escalate"] is True
-    assert "750" in data["reason"]
+    assert "50000" in data["reason"]
 
 
 def test_invalid_finish_escalates():
@@ -421,7 +437,7 @@ def test_booklet_invalid_qty_escalates():
         "binding": "saddle_stitch",
         "pages": 16,
         "cover_type": "card_cover",
-        "quantity": 75,
+        "quantity": 5000,  # v34 — used to be 75, but now stacks (50+25=75). Use a truly off-sheet qty.
     })
     data = r.json()
     assert data["success"] is False
