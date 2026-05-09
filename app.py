@@ -850,22 +850,29 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             is_thread_reply=is_thread_reply,
         )
 
-        # v37 — three-tier triage on inbound:
-        #   Tier 1 — junk: verdict False OR confidence < LOW_FLOOR. Silent drop.
-        #   Tier 2 — uncertain: confidence in [LOW_FLOOR, threshold). Pause +
-        #            notify Justin. Craig writes nothing to Missive until
-        #            Justin clicks Approve in the dashboard.
-        #   Tier 3 — confident OR thread reply: verdict True AND confidence
-        #            >= threshold (or is_thread_reply, which short-circuits
-        #            to confidence=1.0). Proceed as today.
+        # v37 — three-tier triage on inbound. Confidence is the LLM's
+        # certainty about its verdict (`is_quote_inquiry`). Tier
+        # boundaries are confidence-driven, NOT verdict-driven, so a
+        # half-sure "this isn't a quote" still gets Justin's eyeball
+        # — that's the whole point of the gate.
+        #
+        #   Tier 1 — confidence < LOW_FLOOR: classifier is too confused
+        #            to call. Treat as garbled noise, silent drop.
+        #   Tier 2 — LOW_FLOOR <= confidence < threshold: uncertain
+        #            either way. Pause + notify Justin with the
+        #            pre-rendered Craig draft. Craig writes nothing to
+        #            Missive until Justin clicks Approve.
+        #   Tier 3 — confidence >= threshold (or is_thread_reply, which
+        #            short-circuits to confidence=1.0):
+        #            • verdict True  → respond as today
+        #            • verdict False → confident junk, silent drop
         confidence = float(verdict.get("confidence", 1.0))
+        is_quote = bool(verdict.get("is_quote_inquiry", True))
         from llm.inbound_classifier import LOW_CONFIDENCE_FLOOR
 
-        # If the conversation is already engagement_rejected (Justin
-        # explicitly told us not to engage on this Missive thread),
-        # silently drop ALL further inbound on it — no notification, no
-        # re-classification, no draft. Prevents a bad sender from
-        # repeatedly pestering Justin after he said "don't engage".
+        # Engagement-rejected threads stay silent forever — no
+        # re-classification, no notification, no draft. Prevents a
+        # bad sender from pestering Justin after he said "don't engage".
         if existing and existing.status == "engagement_rejected":
             _mlog.info(
                 "%s: thread previously engagement_rejected (conv_id=%s), dropping",
@@ -873,14 +880,12 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             )
             return
 
-        # Tier 1 — junk
-        if (
-            not verdict.get("is_quote_inquiry", True)
-            or confidence < LOW_CONFIDENCE_FLOOR
-        ):
+        # Tier 1 — classifier confused. Drop silently.
+        if confidence < LOW_CONFIDENCE_FLOOR:
             _mlog.info(
-                "%s: LLM-REJECT inbound (conv_id=%s) confidence=%.2f reason=%r",
-                org_slug, conversation_id, confidence, verdict.get("reason"),
+                "%s: TIER-1 DROP (conv_id=%s) confidence=%.2f below floor=%.2f reason=%r",
+                org_slug, conversation_id, confidence,
+                LOW_CONFIDENCE_FLOOR, verdict.get("reason"),
             )
             return
 
@@ -914,7 +919,25 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
                 verdict.get("reason"),
             )
 
-        # Tier 3 — high confidence (or thread reply): proceed as today.
+        # Tier 3 — high confidence. If verdict=False (LLM is confident
+        # this is NOT a quote), drop silently. We only Tier-3-respond
+        # when verdict is True.
+        if (
+            not needs_engagement_approval
+            and not is_thread_reply
+            and not already_engaged
+            and not is_quote
+        ):
+            _mlog.info(
+                "%s: TIER-3 CONFIDENT-DROP (conv_id=%s) "
+                "confidence=%.2f >= threshold=%.2f but verdict=False "
+                "reason=%r — confident this isn't a quote, silent drop",
+                org_slug, conversation_id, confidence, threshold,
+                verdict.get("reason"),
+            )
+            return
+
+        # Tier 3 (verdict True) or Tier 2 (running Craig for preview): fall through.
         # ── end v37 triage ────────────────────────────────────────────
 
         # ── v29: ingest customer-attached artwork files ──────────────

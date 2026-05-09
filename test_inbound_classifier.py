@@ -391,6 +391,44 @@ class TestConfidenceScore:
                 )
         assert 0.0 <= verdict["confidence"] <= 1.0
 
+    def test_tier_logic_low_conf_false_verdict_is_uncertain_not_junk(self):
+        """v37.3 — confidence=0.30 verdict=False used to drop as junk.
+        Production caught this: 'Hi guys, are you around?' got
+        confidence=0.30 verdict=False ('vague greeting, no print
+        details') — semantically uncertain (LLM is only 30% sure it
+        isn't a quote = 70% chance it might be). The fix routes by
+        confidence band only; verdict only matters when we're in the
+        confident-band. So this case must end up in Tier 2 (notify
+        Justin), not Tier 1 (silent drop).
+
+        This test asserts the contract on the classifier's return
+        value, not the webhook's branching. The webhook branches on
+        the classifier's output and is verified by the
+        TestIsSelfSentEmail / live-revision tests.
+        """
+        with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", "fake-key"):
+            mock_client = self._mock_with_response({
+                "is_quote_inquiry": False,
+                "confidence": 0.30,
+                "reason": "vague greeting, no print details",
+            })
+            with patch("llm.inbound_classifier.OpenAI", return_value=mock_client):
+                v = classify_inbound_email(
+                    from_address="bob@example.com",
+                    subject="Hi",
+                    body_preview="Hi guys, are you around?",
+                    is_thread_reply=False,
+                )
+        # Classifier still surfaces the verdict + the confidence;
+        # downstream tier routing reads BOTH.
+        assert v["is_quote_inquiry"] is False
+        assert v["confidence"] == pytest.approx(0.30, abs=0.01)
+        # Sanity: above floor (0.2), below default threshold (0.85)
+        # → webhook code maps this to Tier 2.
+        from llm.inbound_classifier import LOW_CONFIDENCE_FLOOR
+        assert v["confidence"] >= LOW_CONFIDENCE_FLOOR
+        assert v["confidence"] < 0.85
+
     def test_confidence_as_percentage_normalised(self):
         """Tolerate the LLM returning 92 (percentage) instead of 0.92."""
         with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", "fake-key"):
