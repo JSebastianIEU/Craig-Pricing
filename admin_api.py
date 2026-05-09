@@ -1744,18 +1744,23 @@ def _replay_craig_on_engagement_approval(
     import asyncio
     import html as _html
 
+    def _log(msg: str) -> None:
+        # Cloud Run captures stdout per request, so print() is the
+        # right primitive here (logging.info gets dropped under
+        # uvicorn without a configured handler).
+        print(f"[admin_api] approve-engagement conv={conversation_id} {msg}", flush=True)
+
     conv = db.query(Conversation).filter_by(id=conversation_id).first()
     if conv is None:
+        _log("ERROR conversation_not_found")
         return {"ok": False, "drafted": False, "reply_len": 0, "error": "conversation_not_found"}
 
     classification = dict(conv.engagement_classification or {})
     missive_external_id = conv.external_id
     if not missive_external_id:
-        # Flip status anyway so the row leaves the queue, but report
-        # we can't ship without a Missive thread. (Should never happen
-        # in practice — engagement gate only fires on Missive channel.)
         conv.status = "engagement_approved"
         db.commit()
+        _log("ERROR no_missive_thread (status flipped, no draft posted)")
         return {"ok": False, "drafted": False, "reply_len": 0, "error": "no_missive_thread"}
 
     # v37.1 — fast path. If the Tier-2 webhook stashed a proposed reply,
@@ -1764,6 +1769,12 @@ def _replay_craig_on_engagement_approval(
     proposed_html = (classification.get("proposed_html") or "").strip()
     proposed_subject = (classification.get("proposed_subject") or "").strip()
     proposed_quote_id = classification.get("proposed_quote_id")
+    _log(
+        f"classification keys={sorted(classification.keys())} "
+        f"reply_len={len(proposed_reply)} html_len={len(proposed_html)} "
+        f"subj_len={len(proposed_subject)} quote_id={proposed_quote_id} "
+        f"external_id={missive_external_id!r}"
+    )
 
     if proposed_reply and proposed_html:
         # Status flip first so a follow-up webhook on this thread (rare,
@@ -1777,7 +1788,12 @@ def _replay_craig_on_engagement_approval(
         from_addr = _get_setting(db, "missive_from_address", "", organization_slug=org_slug)
         from_name = _get_setting(db, "missive_from_name", "Craig", organization_slug=org_slug)
         enabled = _get_setting(db, "missive_enabled", "false", organization_slug=org_slug)
+        _log(
+            f"FAST-PATH token_set={bool(token)} from_addr={from_addr!r} "
+            f"enabled={enabled!r}"
+        )
         if not token or (enabled or "").lower() != "true":
+            _log(f"ERROR missive_disabled (token_set={bool(token)} enabled={enabled!r})")
             return {
                 "ok": True, "drafted": False,
                 "reply_len": len(proposed_reply),
@@ -1817,6 +1833,12 @@ def _replay_craig_on_engagement_approval(
                 )
 
         reply_subject = proposed_subject or "Re: Your quote from Just Print"
+        should_send = bool(classification.get("proposed_should_send", True))
+        _log(
+            f"posting Missive draft external_id={missive_external_id!r} "
+            f"subject={reply_subject!r} send={should_send} "
+            f"to_fields={to_fields} attachments={'yes' if attachments else 'no'}"
+        )
         try:
             asyncio.run(missive.create_draft(
                 conversation_id=missive_external_id,
@@ -1827,14 +1849,16 @@ def _replay_craig_on_engagement_approval(
                 token=token,
                 subject=reply_subject,
                 attachments=attachments,
-                send=bool(classification.get("proposed_should_send", True)),
+                send=should_send,
             ))
         except Exception as e:
+            _log(f"ERROR missive_draft_failed: {type(e).__name__}: {e}")
             return {
                 "ok": False, "drafted": False,
                 "reply_len": len(proposed_reply),
                 "error": f"missive_draft_failed: {type(e).__name__}: {e}",
             }
+        _log(f"OK Missive draft posted+sent (reply_len={len(proposed_reply)})")
 
         # If a quote was queued at Tier-2 time, fire the v33 approval
         # notification now (the webhook deliberately suppressed it
