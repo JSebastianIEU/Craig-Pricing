@@ -130,6 +130,53 @@ def migrate() -> None:
         print(f"  {r:>8}  setting engagement_confidence_threshold = 0.85")
         db.commit()
 
+    # 3. v36 cleanup: clear manual_review_required + manual_review_reason
+    # on the 6 per-sqm + 3 per-sheet products. v36's migration had an
+    # edge: if the product's pricing_strategy was already 'per_sqm' /
+    # 'per_sheet' (because of a partial earlier run, or because it was
+    # seeded that way by a fresh deploy), the idempotency guard
+    # SKIPPED the whole UPDATE — including the line that should have
+    # cleared the v34 manual_review flag. Result: production has
+    # vinyl_labels with pricing_strategy='per_sqm' AND
+    # manual_review_required=True, so quote_large_format() short-
+    # circuits to manual_review on EVERY request and never reaches
+    # _quote_per_sqm. This step force-clears the flag for products
+    # that have a v36 strategy. Idempotent — safe to re-run.
+    _PER_SQM_OR_SHEET_PRODUCT_KEYS = (
+        "vinyl_labels", "pvc_banners", "mesh_banners",
+        "window_graphics", "floor_graphics", "fabric_displays",
+        "foamex_boards", "dibond_boards", "corri_boards",
+    )
+    cleared = 0
+    with engine.begin() as conn:
+        for key in _PER_SQM_OR_SHEET_PRODUCT_KEYS:
+            row = conn.execute(
+                text(
+                    "SELECT id, pricing_strategy, manual_review_required "
+                    "FROM products WHERE key = :key"
+                ),
+                {"key": key},
+            ).fetchone()
+            if not row:
+                continue
+            pid, strategy, mr_required = row
+            if strategy not in ("per_sqm", "per_sheet"):
+                continue
+            if not mr_required:
+                continue
+            conn.execute(
+                text(
+                    "UPDATE products SET "
+                    "manual_review_required = :mrr, "
+                    "manual_review_reason = :mrn "
+                    "WHERE id = :id"
+                ),
+                {"mrr": False, "mrn": None, "id": pid},
+            )
+            cleared += 1
+            print(f"  + {key}: manual_review flag cleared (strategy={strategy})")
+    print(f"  -> cleared manual_review on {cleared} per-sqm/per-sheet product(s)")
+
     print()
     print("v37 migration complete.")
 
