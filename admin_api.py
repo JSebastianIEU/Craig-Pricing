@@ -1840,7 +1840,7 @@ def _replay_craig_on_engagement_approval(
             f"to_fields={to_fields} attachments={'yes' if attachments else 'no'}"
         )
         try:
-            asyncio.run(missive.create_draft(
+            mresp = asyncio.run(missive.create_draft(
                 conversation_id=missive_external_id,
                 html_body=proposed_html,
                 from_address=from_addr or "",
@@ -1858,6 +1858,17 @@ def _replay_craig_on_engagement_approval(
                 "reply_len": len(proposed_reply),
                 "error": f"missive_draft_failed: {type(e).__name__}: {e}",
             }
+        # v37.5 — log Missive's response so we can tell if it honoured
+        # the send=True flag or kept it as a draft. The .drafts object
+        # carries id, send (bool), sent_at, deleted, etc. — anything
+        # other than send=True + a recent sent_at means we have a
+        # delivery problem at the Missive layer (account misconfig,
+        # missing SMTP, etc.) rather than a Craig bug.
+        try:
+            drafts_resp = (mresp or {}).get("drafts") if isinstance(mresp, dict) else mresp
+        except Exception:
+            drafts_resp = None
+        _log(f"Missive response: drafts={drafts_resp!r}")
         _log(f"OK Missive draft posted+sent (reply_len={len(proposed_reply)})")
 
         # If a quote was queued at Tier-2 time, fire the v33 approval
