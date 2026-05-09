@@ -183,12 +183,13 @@ class TestClassifyThreadReplyHint:
         assert "Craig's last message" in user_msg or "last message" in user_msg.lower()
         assert "33.75" in user_msg
 
-    def test_offtopic_follow_up_returns_classifier_verdict_not_short_circuit(self):
-        """The bug from production: a follow-up like 'do you do website
-        hosting?' would short-circuit to True+1.0 in v37 — meaning
-        Craig would auto-respond to a clearly off-topic message. With
-        v37.4 the classifier runs and can return verdict=False so the
-        webhook can drop or gate."""
+    def test_offtopic_follow_up_returns_high_conf_false_so_webhook_can_route_to_tier2(self):
+        """v37.5 — the off-topic follow-up case: 'do you do hosting?'
+        in an engaged thread comes back with verdict=False high
+        confidence. The webhook then routes it to Tier 2 (notify
+        Justin) — NOT silent drop — because the customer is mid-
+        conversation and we owe them a response (or a deliberate
+        non-response decided by Justin)."""
         with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", "fake-key"):
             mock_client = self._mock_with_response({
                 "is_quote_inquiry": False,

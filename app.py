@@ -904,28 +904,40 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             default="0.85", organization_slug=org_slug,
         ) or 0.85)
 
-        # v37.4 — gate by confidence on EVERY message, including
-        # follow-ups in already-engaged conversations. The LLM gets
-        # an `is_thread_reply` hint + the last assistant snippet so
-        # it can correctly classify legitimate continuations as
-        # high-confidence quotes. Off-topic replies in active
-        # conversations now route to Justin instead of auto-replying.
-        needs_engagement_approval = bool(confidence < threshold)
+        # v37.5 — gate-routing rules:
+        #
+        #   confidence < threshold            → Tier 2 (notify Justin)
+        #   confidence >= threshold + True    → Tier 3 (respond)
+        #   confidence >= threshold + False   → depends on thread state:
+        #     • new thread (no prior assistant turn): silent drop
+        #       (newsletters, sales pitches, etc.)
+        #     • engaged thread (Craig already replied here): Tier 2
+        #       (notify Justin) — we don't silent-drop on a customer
+        #       who's mid-conversation with us; Justin gets to decide
+        #       whether Craig should send a polite "we don't do that"
+        #       or just leave it alone.
+        needs_engagement_approval = bool(
+            confidence < threshold
+            or (is_thread_reply and not is_quote)
+        )
         if needs_engagement_approval:
             _mlog.info(
                 "%s: TIER-2 PAUSE-WITH-PREVIEW (conv_id=%s) "
-                "confidence=%.2f threshold=%.2f thread_reply=%s reason=%r "
-                "— running Craig for preview, gating Missive + approval-notification",
+                "confidence=%.2f threshold=%.2f verdict=%s thread_reply=%s "
+                "reason=%r — running Craig for preview, gating Missive + "
+                "approval-notification",
                 org_slug, conversation_id, confidence, threshold,
-                is_thread_reply, verdict.get("reason"),
+                is_quote, is_thread_reply, verdict.get("reason"),
             )
 
-        # Tier 3 high confidence + verdict=False → confident junk, drop silently.
+        # Tier 3 confident-junk drop — ONLY for fresh inbound (no prior
+        # assistant turn). Off-topic continuations in engaged threads
+        # were rerouted to Tier 2 above so Justin sees them.
         if not needs_engagement_approval and not is_quote:
             _mlog.info(
                 "%s: TIER-3 CONFIDENT-DROP (conv_id=%s) "
-                "confidence=%.2f >= threshold=%.2f but verdict=False "
-                "reason=%r — confident this isn't a quote, silent drop",
+                "confidence=%.2f >= threshold=%.2f verdict=False "
+                "fresh-thread reason=%r — confident junk, silent drop",
                 org_slug, conversation_id, confidence, threshold,
                 verdict.get("reason"),
             )
