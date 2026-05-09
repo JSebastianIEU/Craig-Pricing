@@ -183,3 +183,113 @@ def test_create_new_thread_draft_default_send_false():
         ))
         body = json.loads(route.calls[0].request.read().decode())
     assert body["drafts"]["send"] is False
+
+
+# ---------------------------------------------------------------------------
+# v37.2 — self-sent / notification-loop prevention
+# ---------------------------------------------------------------------------
+
+
+class TestIsSelfSentEmail:
+    """v37.2 — `_is_self_sent_email` is the gate that drops emails the
+    webhook would otherwise treat as customer mail and reply to. It
+    prevents Craig from auto-responding to its own quote-approval and
+    manual-review notification emails when those land in a Missive-
+    watched inbox.
+    """
+
+    def test_real_customer_passes(self):
+        from app import _is_self_sent_email
+        assert _is_self_sent_email(
+            from_address="bob@example.com",
+            subject="500 business cards quote please",
+            missive_from_address="info@just-print.ie",
+            notification_sender_address="craig@strategos-ai.com",
+        ) is None
+
+    def test_blocks_missive_from_address(self):
+        from app import _is_self_sent_email
+        r = _is_self_sent_email(
+            from_address="info@just-print.ie",
+            subject="Re: anything",
+            missive_from_address="info@just-print.ie",
+            notification_sender_address="craig@strategos-ai.com",
+        )
+        assert r is not None and "address-match" in r
+
+    def test_blocks_notification_sender(self):
+        """The bug from production — Craig's own notification email
+        landed in Missive and Craig replied to it."""
+        from app import _is_self_sent_email
+        r = _is_self_sent_email(
+            from_address="craig@strategos-ai.com",
+            subject="[Just Print — needs your eyes] Quote JP-0097 — manual pricing required",
+            missive_from_address="info@just-print.ie",
+            notification_sender_address="craig@strategos-ai.com",
+        )
+        assert r is not None and "address-match" in r
+
+    def test_blocks_just_print_subject_prefix_even_without_addr_match(self):
+        """If the operator changed notification_sender_address but a
+        forward rule still drops the email into Missive, the subject
+        prefix is the last-ditch giveaway."""
+        from app import _is_self_sent_email
+        r = _is_self_sent_email(
+            from_address="some-new-mailer@third-party.com",
+            subject="[Just Print] Quote JP-0123 ready for approval",
+            missive_from_address="info@just-print.ie",
+            notification_sender_address="",  # not set
+        )
+        assert r is not None and "subject-prefix" in r
+
+    def test_case_insensitive_address(self):
+        from app import _is_self_sent_email
+        r = _is_self_sent_email(
+            from_address="Craig@Strategos-AI.com",
+            subject="hi",
+            missive_from_address="info@just-print.ie",
+            notification_sender_address="craig@strategos-ai.com",
+        )
+        assert r is not None
+
+    def test_empty_settings_still_pass_real_customer(self):
+        """When no settings are configured (fresh tenant / dev env),
+        only the subject sniff fires — real customer mail still passes."""
+        from app import _is_self_sent_email
+        assert _is_self_sent_email(
+            from_address="alice@gmail.com",
+            subject="hello, do you do banners?",
+            missive_from_address="",
+            notification_sender_address="",
+        ) is None
+
+    def test_empty_subject_with_self_address_still_blocks(self):
+        from app import _is_self_sent_email
+        r = _is_self_sent_email(
+            from_address="info@just-print.ie",
+            subject="",
+            missive_from_address="info@just-print.ie",
+            notification_sender_address="",
+        )
+        assert r is not None
+
+    def test_just_print_lowercase_subject_blocks(self):
+        from app import _is_self_sent_email
+        r = _is_self_sent_email(
+            from_address="x@y.com",
+            subject="[just print] something",
+            missive_from_address="",
+            notification_sender_address="",
+        )
+        assert r is not None
+
+    def test_normal_subject_with_just_print_in_middle_passes(self):
+        """Make sure we don't false-positive on legitimate emails that
+        happen to mention 'Just Print' inside the subject."""
+        from app import _is_self_sent_email
+        assert _is_self_sent_email(
+            from_address="bob@example.com",
+            subject="Question about Just Print services",
+            missive_from_address="",
+            notification_sender_address="",
+        ) is None
