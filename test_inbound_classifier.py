@@ -148,25 +148,63 @@ class TestObviousJunkHeaders:
 # ---------------------------------------------------------------------------
 
 
-class TestClassifyThreadReplyBypass:
-    """If the email is a reply in a thread Craig already drafted in,
-    we skip the LLM call (real customers replying to Craig are by
-    definition real customers)."""
+class TestClassifyThreadReplyHint:
+    """v37.4 — thread-reply is a HINT to the LLM, not a hard
+    short-circuit. Continuations are classified normally; the LLM
+    weighs the conversation state to decide verdict + confidence."""
 
-    def test_thread_reply_bypasses_llm(self):
-        # No mock — if the LLM were called, it would hit the network
-        # (no API key in tests) and return fail-open. But we want to
-        # assert no call happened. We patch OpenAI to raise if called.
-        with patch("llm.inbound_classifier.OpenAI") as mock_client_cls:
-            mock_client_cls.side_effect = AssertionError("LLM should not be called")
-            verdict = classify_inbound_email(
-                from_address="customer@example.com",
-                subject="Re: your quote",
-                body_preview="Cheers, see you soon",
-                is_thread_reply=True,
-            )
-        assert verdict["is_quote_inquiry"] is True
-        assert "thread reply" in verdict["reason"].lower()
+    def _mock_with_response(self, payload: dict):
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock()]
+        mock_resp.choices[0].message.content = json.dumps(payload)
+        mock_client.chat.completions.create.return_value = mock_resp
+        return mock_client
+
+    def test_thread_reply_is_passed_as_hint_to_llm(self):
+        """The LLM receives the thread-reply hint in the user message."""
+        with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", "fake-key"):
+            mock_client = self._mock_with_response({
+                "is_quote_inquiry": True,
+                "confidence": 0.92,
+                "reason": "continuation",
+            })
+            with patch("llm.inbound_classifier.OpenAI", return_value=mock_client):
+                classify_inbound_email(
+                    from_address="customer@example.com",
+                    subject="Re: your quote",
+                    body_preview="yes please, 250 of them",
+                    is_thread_reply=True,
+                    last_assistant_snippet="That'll be €33.75 for 500 vinyl labels...",
+                )
+                call = mock_client.chat.completions.create.call_args
+                user_msg = call.kwargs["messages"][1]["content"]
+        assert "reply in a thread Craig" in user_msg.lower() or "thread craig" in user_msg.lower()
+        assert "Craig's last message" in user_msg or "last message" in user_msg.lower()
+        assert "33.75" in user_msg
+
+    def test_offtopic_follow_up_returns_classifier_verdict_not_short_circuit(self):
+        """The bug from production: a follow-up like 'do you do website
+        hosting?' would short-circuit to True+1.0 in v37 — meaning
+        Craig would auto-respond to a clearly off-topic message. With
+        v37.4 the classifier runs and can return verdict=False so the
+        webhook can drop or gate."""
+        with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", "fake-key"):
+            mock_client = self._mock_with_response({
+                "is_quote_inquiry": False,
+                "confidence": 0.88,
+                "reason": "asking about hosting, not print",
+            })
+            with patch("llm.inbound_classifier.OpenAI", return_value=mock_client):
+                v = classify_inbound_email(
+                    from_address="customer@example.com",
+                    subject="Re: your quote",
+                    body_preview="actually, do you guys do website hosting too?",
+                    is_thread_reply=True,
+                    last_assistant_snippet="Got it, 500 business cards...",
+                )
+        assert v["is_quote_inquiry"] is False
+        assert v["confidence"] >= 0.85  # webhook will TIER-3 silent drop
 
 
 class TestClassifyFailOpen:
@@ -301,16 +339,31 @@ class TestConfidenceScore:
         mock_client.chat.completions.create.return_value = mock_resp
         return mock_client
 
-    def test_thread_reply_confidence_is_one(self):
-        """is_thread_reply short-circuits to confidence=1.0 — the
-        customer is replying to a Craig draft, by definition engaged."""
-        verdict = classify_inbound_email(
-            from_address="customer@example.com",
-            subject="Re: your quote",
-            body_preview="Sounds good",
-            is_thread_reply=True,
-        )
-        assert verdict["confidence"] == 1.0
+    def test_thread_reply_no_short_circuit_v37_4(self):
+        """v37.4 — is_thread_reply no longer auto-passes. The LLM is
+        called and returns its own verdict + confidence. Short-circuit
+        only on missing API key (defensive fail-open)."""
+        with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", "fake-key"):
+            mock_client = MagicMock()
+            mock_resp = MagicMock()
+            mock_resp.choices = [MagicMock()]
+            mock_resp.choices[0].message.content = json.dumps({
+                "is_quote_inquiry": True,
+                "confidence": 0.65,
+                "reason": "vague continuation",
+            })
+            mock_client.chat.completions.create.return_value = mock_resp
+            with patch("llm.inbound_classifier.OpenAI", return_value=mock_client):
+                verdict = classify_inbound_email(
+                    from_address="customer@example.com",
+                    subject="Re: your quote",
+                    body_preview="Sounds good",
+                    is_thread_reply=True,
+                )
+        # The LLM is called even when is_thread_reply=True.
+        assert mock_client.chat.completions.create.called
+        # And the verdict comes from the LLM, not a hard-coded 1.0.
+        assert verdict["confidence"] == pytest.approx(0.65, abs=0.01)
 
     def test_missing_api_key_fails_open_at_full_confidence(self):
         """Fail-open posture must come back at confidence=1.0 so the

@@ -158,6 +158,7 @@ def classify_inbound_email(
     subject: str,
     body_preview: str,
     is_thread_reply: bool = False,
+    last_assistant_snippet: str = "",
 ) -> dict[str, Any]:
     """
     Returns {"is_quote_inquiry": bool, "confidence": float, "reason": str}.
@@ -169,27 +170,32 @@ def classify_inbound_email(
                        keep tokens low — the LLM doesn't need the full
                        message to make this call)
       is_thread_reply: if True, this email is part of a Missive
-                       conversation Craig already drafted in. We
-                       short-circuit to confidence=1.0 without an LLM
-                       call — customers replying to Craig's drafts are
-                       by definition real customers.
+                       conversation Craig already drafted in. v37.4 —
+                       this is now a HINT to the LLM (added to the
+                       user message), NOT a hard short-circuit. The
+                       LLM weighs it: a clear quote-related continuation
+                       comes back with verdict=True high confidence; an
+                       off-topic follow-up still gets routed to the
+                       gate (Tier 2) so Justin can decide.
+      last_assistant_snippet: optional, ~200 chars from Craig's last
+                       assistant turn — gives the LLM the context it
+                       needs to judge short customer replies like
+                       'yes please' or '250 of those' that are
+                       meaningless without prior context.
 
     v37 — adds `confidence` (0.0–1.0). The webhook uses it for a
     three-tier decision: <LOW_CONFIDENCE_FLOOR drop, <threshold pause +
-    notify Justin, ≥threshold respond as today.
+    notify Justin, ≥threshold respond.
+
+    v37.4 — removed the is_thread_reply short-circuit. Off-topic
+    follow-ups in already-engaged conversations now route to Justin
+    instead of auto-replying.
 
     Failure modes (timeout, network, malformed JSON) → return
     {"is_quote_inquiry": True, "confidence": 1.0,
      "reason": "classifier-error fail-open"} so a real lead is never
     silently swallowed.
     """
-    if is_thread_reply:
-        return {
-            "is_quote_inquiry": True,
-            "confidence": 1.0,
-            "reason": "thread reply (skip LLM)",
-        }
-
     if not DEEPSEEK_API_KEY:
         # Defensive: in dev / tests where the key isn't set, don't
         # accidentally drop emails. Same fail-open posture.
@@ -203,7 +209,25 @@ def classify_inbound_email(
     # in tokens. Trim trailing whitespace so the LLM doesn't waste
     # tokens on signatures.
     preview = (body_preview or "").strip()[:800]
+
+    # v37.4 — surface the conversation state in the user message so
+    # short replies ('yes', '250') in active threads are classified
+    # against their context, not in isolation.
+    thread_hint = ""
+    if is_thread_reply:
+        thread_hint = (
+            "Note: this email is a reply in a thread Craig (the print-"
+            "shop bot) already wrote in. The customer is mid-"
+            "conversation — short or context-light messages are "
+            "normal IF they make sense as a continuation of a quote.\n"
+        )
+        if last_assistant_snippet:
+            snip = last_assistant_snippet.strip()[:300]
+            thread_hint += (
+                f"Craig's last message (for context): {snip!r}\n"
+            )
     user_msg = (
+        f"{thread_hint}"
         f"From: {from_address!r}\n"
         f"Subject: {subject!r}\n"
         f"Body (first ~800 chars):\n"

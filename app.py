@@ -836,11 +836,12 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             return
 
         prior_assistant_msgs = 0
+        last_assistant_snippet = ""
         if existing:
-            prior_assistant_msgs = sum(
-                1 for m in (existing.messages or [])
-                if m.get("role") == "assistant"
-            )
+            for m in (existing.messages or []):
+                if m.get("role") == "assistant":
+                    prior_assistant_msgs += 1
+                    last_assistant_snippet = (m.get("content") or "")[:300]
         is_thread_reply = prior_assistant_msgs > 0
 
         verdict = classify_inbound_email(
@@ -848,6 +849,7 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             subject=evt["subject"],
             body_preview=body_text[:800],
             is_thread_reply=is_thread_reply,
+            last_assistant_snippet=last_assistant_snippet,
         )
 
         # v37 — three-tier triage on inbound. Confidence is the LLM's
@@ -901,33 +903,25 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             db, "engagement_confidence_threshold",
             default="0.85", organization_slug=org_slug,
         ) or 0.85)
-        already_engaged = bool(
-            existing and existing.status in ("engagement_approved", "active")
-            and (existing.messages or [])
-        )
-        needs_engagement_approval = bool(
-            not is_thread_reply
-            and not already_engaged
-            and confidence < threshold
-        )
+
+        # v37.4 — gate by confidence on EVERY message, including
+        # follow-ups in already-engaged conversations. The LLM gets
+        # an `is_thread_reply` hint + the last assistant snippet so
+        # it can correctly classify legitimate continuations as
+        # high-confidence quotes. Off-topic replies in active
+        # conversations now route to Justin instead of auto-replying.
+        needs_engagement_approval = bool(confidence < threshold)
         if needs_engagement_approval:
             _mlog.info(
                 "%s: TIER-2 PAUSE-WITH-PREVIEW (conv_id=%s) "
-                "confidence=%.2f threshold=%.2f reason=%r — running Craig "
-                "for preview, gating Missive + approval-notification",
+                "confidence=%.2f threshold=%.2f thread_reply=%s reason=%r "
+                "— running Craig for preview, gating Missive + approval-notification",
                 org_slug, conversation_id, confidence, threshold,
-                verdict.get("reason"),
+                is_thread_reply, verdict.get("reason"),
             )
 
-        # Tier 3 — high confidence. If verdict=False (LLM is confident
-        # this is NOT a quote), drop silently. We only Tier-3-respond
-        # when verdict is True.
-        if (
-            not needs_engagement_approval
-            and not is_thread_reply
-            and not already_engaged
-            and not is_quote
-        ):
+        # Tier 3 high confidence + verdict=False → confident junk, drop silently.
+        if not needs_engagement_approval and not is_quote:
             _mlog.info(
                 "%s: TIER-3 CONFIDENT-DROP (conv_id=%s) "
                 "confidence=%.2f >= threshold=%.2f but verdict=False "
