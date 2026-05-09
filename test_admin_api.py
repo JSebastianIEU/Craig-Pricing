@@ -299,6 +299,327 @@ def test_integrations_status_blocks_other_org_for_client_member():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# v37 — engagement-approval endpoints
+# ---------------------------------------------------------------------------
+
+
+def _make_pending_engagement_conversation(channel: str = "missive"):
+    """Helper — create a Conversation in `pending_engagement_approval`
+    state with a stashed inbound body so the approve/reject endpoints
+    have something to act on."""
+    from db import db_session
+    from db.models import Conversation
+    import uuid as _uuid
+
+    with db_session() as db:
+        ext_id = f"test-thread-{_uuid.uuid4().hex[:10]}"
+        conv = Conversation(
+            organization_slug="just-print",
+            channel=channel,
+            external_id=ext_id,
+            customer_email="bob@example.com",
+            customer_name="Bob",
+            status="pending_engagement_approval",
+            messages=[{"role": "user", "content": "Hi, are you guys around?"}],
+            engagement_classification={
+                "from": "bob@example.com",
+                "subject": "Hi",
+                "body_preview": "Hi, are you guys around?",
+                "verdict": True,
+                "confidence": 0.55,
+                "reason": "vague greeting",
+                "classified_at": "2026-05-09T10:00:00",
+                "missive_message_id": "msg-xxx",
+                "missive_subject": "Hi",
+            },
+        )
+        db.add(conv)
+        db.commit()
+        return conv.id, ext_id
+
+
+def test_reject_engagement_flips_status():
+    cid, _ext = _make_pending_engagement_conversation()
+    r = client.post(
+        f"/admin/api/orgs/just-print/conversations/{cid}/reject-engagement",
+        headers=_auth("client_owner"),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["conversation"]["status"] == "engagement_rejected"
+    ec = body["conversation"]["engagement_classification"]
+    assert ec.get("rejected_at")
+    assert ec.get("rejected_by") == "test@example.com"
+
+
+def test_reject_engagement_idempotent():
+    """A second reject on an already-rejected conversation succeeds
+    (does not change rejected_at / rejected_by)."""
+    cid, _ext = _make_pending_engagement_conversation()
+    r1 = client.post(
+        f"/admin/api/orgs/just-print/conversations/{cid}/reject-engagement",
+        headers=_auth("client_owner"),
+    )
+    assert r1.status_code == 200
+    first_at = r1.json()["conversation"]["engagement_classification"]["rejected_at"]
+    r2 = client.post(
+        f"/admin/api/orgs/just-print/conversations/{cid}/reject-engagement",
+        headers=_auth("client_owner"),
+    )
+    assert r2.status_code == 200
+    second_at = r2.json()["conversation"]["engagement_classification"]["rejected_at"]
+    assert first_at == second_at
+
+
+def test_reject_engagement_rejects_active_conversation():
+    """The endpoint refuses to demote a normal conversation to
+    engagement_rejected — only paused or already-rejected ones."""
+    from db import db_session
+    from db.models import Conversation
+
+    with db_session() as db:
+        conv = Conversation(
+            organization_slug="just-print",
+            channel="web",
+            status="active",
+            messages=[],
+        )
+        db.add(conv)
+        db.commit()
+        cid = conv.id
+
+    r = client.post(
+        f"/admin/api/orgs/just-print/conversations/{cid}/reject-engagement",
+        headers=_auth("client_owner"),
+    )
+    assert r.status_code == 400
+
+
+def test_approve_engagement_runs_craig_and_drafts(monkeypatch):
+    """v37 — approve-engagement flips status, calls chat_with_craig with
+    the stashed inbound body, and posts a Missive draft. We mock both
+    side-effects to avoid LLM + network calls."""
+    cid, ext_id = _make_pending_engagement_conversation()
+
+    # Mock chat_with_craig to return a canned reply without burning tokens.
+    captured = {"calls": []}
+
+    def fake_chat(*args, **kwargs):
+        captured["calls"].append({
+            "user_message": kwargs.get("user_message"),
+            "external_id": kwargs.get("external_id"),
+            "channel": kwargs.get("channel"),
+        })
+        return {
+            "reply": "Hey, sure — what would you like printed?",
+            "quote_generated": False,
+            "quote_id": None,
+            "escalated": False,
+            "order_confirmed": False,
+            "conversation_id": kwargs.get("conversation_id"),
+        }
+
+    monkeypatch.setattr("llm.craig_agent.chat_with_craig", fake_chat)
+
+    # Mock missive.create_draft so we don't try to talk to Missive.
+    drafted = {"called": False, "args": None}
+
+    async def fake_create_draft(**kwargs):
+        drafted["called"] = True
+        drafted["args"] = kwargs
+        return {"id": "draft-fake"}
+
+    monkeypatch.setattr("missive.create_draft", fake_create_draft)
+
+    # Force the org to look enabled so the endpoint actually drafts.
+    from db import db_session
+    from db.models import Setting
+    with db_session() as db:
+        for k, v in (("missive_enabled", "true"), ("missive_api_token", "fake-token")):
+            row = db.query(Setting).filter_by(
+                organization_slug="just-print", key=k,
+            ).first()
+            if row:
+                row.value = v
+            else:
+                db.add(Setting(
+                    organization_slug="just-print", key=k, value=v,
+                    value_type="string",
+                ))
+        db.commit()
+
+    r = client.post(
+        f"/admin/api/orgs/just-print/conversations/{cid}/approve-engagement",
+        headers=_auth("client_owner"),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["conversation"]["status"] == "engagement_approved"
+    # The fake chat_with_craig saw the stashed inbound body
+    assert any(
+        "are you guys around" in (c.get("user_message") or "")
+        for c in captured["calls"]
+    )
+    # And a Missive draft was posted to the original thread
+    assert drafted["called"] is True
+    assert drafted["args"]["conversation_id"] == ext_id
+    assert drafted["args"]["send"] is True
+
+
+def test_approve_engagement_404_on_missing():
+    r = client.post(
+        "/admin/api/orgs/just-print/conversations/9999999/approve-engagement",
+        headers=_auth("client_owner"),
+    )
+    assert r.status_code == 404
+
+
+def test_approve_engagement_fast_path_uses_cached_reply(monkeypatch):
+    """v37.1 — when the Tier-2 webhook stashed a pre-rendered reply on
+    `engagement_classification.proposed_reply`, the approve endpoint
+    posts that exact text to Missive and DOES NOT re-invoke
+    chat_with_craig. The customer sees what Justin saw."""
+    cid, ext_id = _make_pending_engagement_conversation()
+
+    # Patch the cached reply onto the conversation row to simulate
+    # what the webhook would have stashed.
+    from db import db_session
+    from db.models import Conversation, Setting
+
+    cached_reply = "Hey Bob — sure, what would you like printed?"
+    cached_html = "<p>Hey Bob — sure, what would you like printed?</p>"
+    cached_subject = "Re: Hi"
+    with db_session() as db:
+        conv = db.query(Conversation).filter_by(id=cid).first()
+        c = dict(conv.engagement_classification or {})
+        c.update({
+            "proposed_reply": cached_reply,
+            "proposed_html": cached_html,
+            "proposed_subject": cached_subject,
+            "proposed_quote_id": None,
+            "proposed_should_send": True,
+        })
+        conv.engagement_classification = c
+        # Make sure Missive looks enabled
+        for k, v in (("missive_enabled", "true"), ("missive_api_token", "fake-token")):
+            row = db.query(Setting).filter_by(
+                organization_slug="just-print", key=k,
+            ).first()
+            if row:
+                row.value = v
+            else:
+                db.add(Setting(
+                    organization_slug="just-print", key=k, value=v,
+                    value_type="string",
+                ))
+        db.commit()
+
+    # If the fast path works, chat_with_craig must NOT be called.
+    def boom(*a, **kw):
+        raise AssertionError("chat_with_craig should not be called on the v37.1 fast path")
+
+    monkeypatch.setattr("llm.craig_agent.chat_with_craig", boom)
+
+    drafted = {"args": None}
+
+    async def fake_create_draft(**kwargs):
+        drafted["args"] = kwargs
+        return {"id": "draft-fast"}
+
+    monkeypatch.setattr("missive.create_draft", fake_create_draft)
+
+    r = client.post(
+        f"/admin/api/orgs/just-print/conversations/{cid}/approve-engagement",
+        headers=_auth("client_owner"),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["drafted"] is True
+    assert body["conversation"]["status"] == "engagement_approved"
+    # The exact cached HTML + subject got shipped to Missive
+    assert drafted["args"] is not None
+    assert drafted["args"]["html_body"] == cached_html
+    assert drafted["args"]["subject"] == cached_subject
+    assert drafted["args"]["conversation_id"] == ext_id
+
+
+def test_reject_engagement_cascades_pending_quote():
+    """v37.1 — rejecting engagement marks any pending Quote produced by
+    the Tier-2 preview as `rejected` so it disappears from the active
+    operator queue."""
+    cid, _ext = _make_pending_engagement_conversation()
+
+    from db import db_session
+    from db.models import Conversation, Quote
+    with db_session() as db:
+        # Add a pending quote linked to this conversation, mimicking
+        # the webhook's Tier-2 chat_with_craig run.
+        q = Quote(
+            conversation_id=cid,
+            organization_slug="just-print",
+            product_key="business_cards",
+            specs={"quantity": 500},
+            base_price=120.00,
+            final_price_ex_vat=145.00,
+            vat_amount=33.35,
+            final_price_inc_vat=178.35,
+            status="pending_approval",
+        )
+        db.add(q)
+        db.commit()
+        qid = q.id
+        # Stash the proposed_quote_id on the conversation
+        conv = db.query(Conversation).filter_by(id=cid).first()
+        c = dict(conv.engagement_classification or {})
+        c["proposed_quote_id"] = qid
+        conv.engagement_classification = c
+        db.commit()
+
+    r = client.post(
+        f"/admin/api/orgs/just-print/conversations/{cid}/reject-engagement",
+        headers=_auth("client_owner"),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert qid in body["quotes_rejected"]
+
+    # Verify in the DB
+    from db import db_session
+    from db.models import Quote
+    with db_session() as db:
+        q = db.query(Quote).filter_by(id=qid).first()
+        assert q.status == "rejected"
+
+
+def test_approve_engagement_blocks_wrong_status():
+    """approve-engagement on an already-approved conversation succeeds
+    (idempotent), but on an unrelated active conversation it 400s."""
+    from db import db_session
+    from db.models import Conversation
+
+    with db_session() as db:
+        conv = Conversation(
+            organization_slug="just-print",
+            channel="web",
+            status="active",
+            messages=[],
+        )
+        db.add(conv)
+        db.commit()
+        cid = conv.id
+
+    r = client.post(
+        f"/admin/api/orgs/just-print/conversations/{cid}/approve-engagement",
+        headers=_auth("client_owner"),
+    )
+    assert r.status_code == 400
+
+
 def test_chat_endpoint_rate_limit_fires_at_threshold():
     """30 req/min on /chat (rate_limit('chat', 30)). 31st should 429.
 

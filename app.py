@@ -801,13 +801,73 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             body_preview=body_text[:800],
             is_thread_reply=is_thread_reply,
         )
-        if not verdict.get("is_quote_inquiry", True):
+
+        # v37 — three-tier triage on inbound:
+        #   Tier 1 — junk: verdict False OR confidence < LOW_FLOOR. Silent drop.
+        #   Tier 2 — uncertain: confidence in [LOW_FLOOR, threshold). Pause +
+        #            notify Justin. Craig writes nothing to Missive until
+        #            Justin clicks Approve in the dashboard.
+        #   Tier 3 — confident OR thread reply: verdict True AND confidence
+        #            >= threshold (or is_thread_reply, which short-circuits
+        #            to confidence=1.0). Proceed as today.
+        confidence = float(verdict.get("confidence", 1.0))
+        from llm.inbound_classifier import LOW_CONFIDENCE_FLOOR
+
+        # If the conversation is already engagement_rejected (Justin
+        # explicitly told us not to engage on this Missive thread),
+        # silently drop ALL further inbound on it — no notification, no
+        # re-classification, no draft. Prevents a bad sender from
+        # repeatedly pestering Justin after he said "don't engage".
+        if existing and existing.status == "engagement_rejected":
             _mlog.info(
-                "%s: LLM-REJECT inbound (conv_id=%s) reason=%r",
-                org_slug, conversation_id, verdict.get("reason"),
+                "%s: thread previously engagement_rejected (conv_id=%s), dropping",
+                org_slug, conversation_id,
             )
             return
-        # ── end v28 spam filter ───────────────────────────────────────
+
+        # Tier 1 — junk
+        if (
+            not verdict.get("is_quote_inquiry", True)
+            or confidence < LOW_CONFIDENCE_FLOOR
+        ):
+            _mlog.info(
+                "%s: LLM-REJECT inbound (conv_id=%s) confidence=%.2f reason=%r",
+                org_slug, conversation_id, confidence, verdict.get("reason"),
+            )
+            return
+
+        # Tier 2 — low confidence: engagement-approval gate. v37.1 —
+        # Don't return here. We still run Craig like Tier 3 so Justin's
+        # approval email can show the proposed reply (one extra LLM call
+        # per ambiguous email, but Justin gets a full preview to decide
+        # on; once approved, the cached reply ships verbatim — no second
+        # LLM call). The Missive draft post + the order-confirmed
+        # approval notification are GATED on this flag below so nothing
+        # actually leaves the building until Justin clicks Approve.
+        threshold = float(_get_setting(
+            db, "engagement_confidence_threshold",
+            default="0.85", organization_slug=org_slug,
+        ) or 0.85)
+        already_engaged = bool(
+            existing and existing.status in ("engagement_approved", "active")
+            and (existing.messages or [])
+        )
+        needs_engagement_approval = bool(
+            not is_thread_reply
+            and not already_engaged
+            and confidence < threshold
+        )
+        if needs_engagement_approval:
+            _mlog.info(
+                "%s: TIER-2 PAUSE-WITH-PREVIEW (conv_id=%s) "
+                "confidence=%.2f threshold=%.2f reason=%r — running Craig "
+                "for preview, gating Missive + approval-notification",
+                org_slug, conversation_id, confidence, threshold,
+                verdict.get("reason"),
+            )
+
+        # Tier 3 — high confidence (or thread reply): proceed as today.
+        # ── end v37 triage ────────────────────────────────────────────
 
         # ── v29: ingest customer-attached artwork files ──────────────
         # If the inbound email has artwork attached (PDF, AI, INDD, JPG,
@@ -1003,7 +1063,18 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
         # turn. Idempotent — bails if `notification_sent_at` is set.
         # Catches its own errors so the customer flow continues even
         # if Resend is down.
-        if result.get("order_confirmed") and result.get("quote_id"):
+        # v37.1 — DO NOT fire when we're in Tier 2 (needs engagement
+        # approval). Justin will get the engagement-approval email
+        # below; firing the order-approval one too would be confusing
+        # (and arguably wrong — Craig hasn't actually contacted the
+        # customer yet, so an "order confirmed" notification is
+        # premature). The order-approval email will fire naturally
+        # later, when the customer replies post-engagement-approval.
+        if (
+            result.get("order_confirmed")
+            and result.get("quote_id")
+            and not needs_engagement_approval
+        ):
             try:
                 from notifications import trigger_approval_notification
                 trigger_approval_notification(
@@ -1194,6 +1265,68 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             org_slug, should_send, gating_reason, had_quote_marker,
             quote_generated_this_turn, bool(attachments), is_escalation,
         )
+
+        # v37.1 — engagement-approval branch. We've already run Craig
+        # (so we have a real reply + maybe a Quote), but Justin hasn't
+        # cleared this thread for outbound. Park the proposed reply
+        # inside `engagement_classification` and email Justin instead
+        # of posting to Missive. The approve endpoint reads these
+        # fields and posts the SAME reply/HTML/subject/attachments to
+        # Missive — no second LLM call, no drift between preview and
+        # what the customer actually sees.
+        if needs_engagement_approval:
+            from datetime import datetime as _dt37
+            from notifications import trigger_engagement_approval_notification
+
+            conv_id_ref = result.get("conversation_id") or conversation_id
+            conv_row = (
+                db.query(Conversation).filter_by(id=conv_id_ref).first()
+                if conv_id_ref else None
+            )
+            if conv_row is None:
+                _mlog.warning(
+                    "%s: TIER-2 has no conversation row to park on (id=%s) — "
+                    "skipping notification (Missive draft already gated)",
+                    org_slug, conv_id_ref,
+                )
+                return
+
+            conv_row.status = "pending_engagement_approval"
+            classification = dict(conv_row.engagement_classification or {})
+            classification.update({
+                "from": evt["from_address"],
+                "subject": evt.get("subject", ""),
+                "body_preview": body_text[:1500],
+                "verdict": bool(verdict.get("is_quote_inquiry", True)),
+                "confidence": confidence,
+                "reason": verdict.get("reason", ""),
+                "classified_at": _dt37.utcnow().isoformat(timespec="seconds"),
+                "missive_message_id": evt.get("message_id"),
+                "missive_subject": evt.get("subject", ""),
+                # v37.1 — pre-rendered draft. Approve endpoint posts
+                # these verbatim to Missive without a second LLM call.
+                "proposed_reply": reply_text_clean,
+                "proposed_html": html_body,
+                "proposed_subject": reply_subject,
+                "proposed_quote_id": result.get("quote_id"),
+                "proposed_attachments_present": bool(attachments),
+                "proposed_should_send": should_send,
+            })
+            conv_row.engagement_classification = classification
+            db.commit()
+            try:
+                trigger_engagement_approval_notification(db, org_slug, conv_row.id)
+            except Exception as notif_err:
+                _mlog.warning(
+                    "%s: engagement notification trigger failed (non-fatal): %s",
+                    org_slug, notif_err,
+                )
+            _mlog.info(
+                "%s: TIER-2 PARKED preview reply (conv_id=%s, reply_len=%d, quote_id=%s)",
+                org_slug, conv_row.id, len(reply_text_clean),
+                result.get("quote_id"),
+            )
+            return  # skip Missive post
 
         try:
             asyncio.run(missive.create_draft(

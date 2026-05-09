@@ -350,6 +350,27 @@ class Conversation(Base):
         index=True,
     )
 
+    # v37 — engagement-approval gate. When the inbound classifier
+    # returns a confidence below the per-tenant threshold (default
+    # 0.85), the Missive webhook DOES NOT call Craig; instead it sets
+    # `status='pending_engagement_approval'` and records the verdict
+    # here so Justin can review before any reply goes out. Shape:
+    #   {
+    #     "from": "...", "subject": "...", "body_preview": "...",
+    #     "verdict": bool, "confidence": float, "reason": str,
+    #     "classified_at": iso8601 str,
+    #     "notification_sent_at": iso8601 str | null,
+    #     "notification_message_id": str | null,
+    #     "notification_last_error": str | null,
+    #     "approved_at": iso8601 str | null,
+    #     "approved_by": str | null,
+    #     "rejected_at": iso8601 str | null,
+    #     "rejected_by": str | null,
+    #   }
+    # Stored as JSON (Postgres JSONB / SQLite TEXT) so we don't have
+    # to ALTER TABLE every time we want to add an audit field.
+    engagement_classification = Column(JSON, nullable=True)
+
     quotes = relationship("Quote", back_populates="conversation", cascade="all, delete-orphan")
 
     __table_args__ = (

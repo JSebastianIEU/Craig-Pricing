@@ -281,3 +281,127 @@ class TestClassifyHappyPath:
                 # Body in prompt is repr()'d — count x's between the
                 # body marker and the closing quote.
                 assert user_msg.count("x") <= 810  # 800 cap + small slop
+
+
+# ---------------------------------------------------------------------------
+# v37 — confidence score support
+# ---------------------------------------------------------------------------
+
+
+class TestConfidenceScore:
+    """v37 — the classifier returns a `confidence` float in [0, 1].
+    The webhook uses this for a 3-tier triage: junk drop / pause +
+    notify / respond."""
+
+    def _mock_with_response(self, payload: dict):
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock()]
+        mock_resp.choices[0].message.content = json.dumps(payload)
+        mock_client.chat.completions.create.return_value = mock_resp
+        return mock_client
+
+    def test_thread_reply_confidence_is_one(self):
+        """is_thread_reply short-circuits to confidence=1.0 — the
+        customer is replying to a Craig draft, by definition engaged."""
+        verdict = classify_inbound_email(
+            from_address="customer@example.com",
+            subject="Re: your quote",
+            body_preview="Sounds good",
+            is_thread_reply=True,
+        )
+        assert verdict["confidence"] == 1.0
+
+    def test_missing_api_key_fails_open_at_full_confidence(self):
+        """Fail-open posture must come back at confidence=1.0 so the
+        webhook treats it as Tier 3 (respond as today)."""
+        with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", ""):
+            verdict = classify_inbound_email(
+                from_address="customer@example.com",
+                subject="Quote please",
+                body_preview="500 business cards",
+                is_thread_reply=False,
+            )
+        assert verdict["confidence"] == 1.0
+        assert verdict["is_quote_inquiry"] is True
+
+    def test_llm_error_fails_open_at_full_confidence(self):
+        with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", "fake-key"):
+            with patch("llm.inbound_classifier.OpenAI") as mock_client_cls:
+                mock_client = MagicMock()
+                mock_client.chat.completions.create.side_effect = TimeoutError("slow")
+                mock_client_cls.return_value = mock_client
+                verdict = classify_inbound_email(
+                    from_address="customer@example.com",
+                    subject="Quote please",
+                    body_preview="500 business cards",
+                    is_thread_reply=False,
+                )
+        assert verdict["confidence"] == 1.0
+
+    def test_high_confidence_quote_passes_through(self):
+        with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", "fake-key"):
+            mock_client = self._mock_with_response({
+                "is_quote_inquiry": True,
+                "confidence": 0.95,
+                "reason": "explicit qty + product",
+            })
+            with patch("llm.inbound_classifier.OpenAI", return_value=mock_client):
+                verdict = classify_inbound_email(
+                    from_address="customer@example.com",
+                    subject="500 business cards 85x55mm",
+                    body_preview="Need 500 matte business cards",
+                    is_thread_reply=False,
+                )
+        assert verdict["is_quote_inquiry"] is True
+        assert verdict["confidence"] == 0.95
+
+    def test_low_confidence_passes_through_for_caller_to_gate(self):
+        """Even when verdict=True, a low confidence is reported so the
+        webhook can decide to pause + notify instead of auto-responding."""
+        with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", "fake-key"):
+            mock_client = self._mock_with_response({
+                "is_quote_inquiry": True,
+                "confidence": 0.55,
+                "reason": "vague greeting, could be a vendor",
+            })
+            with patch("llm.inbound_classifier.OpenAI", return_value=mock_client):
+                verdict = classify_inbound_email(
+                    from_address="hello@somewhere.com",
+                    subject="Hi",
+                    body_preview="Hi, are you guys around?",
+                    is_thread_reply=False,
+                )
+        assert verdict["is_quote_inquiry"] is True
+        assert 0.5 <= verdict["confidence"] < 0.85
+
+    def test_confidence_clamped_to_unit_range(self):
+        """The LLM might hallucinate a confidence outside [0,1].
+        Clamping prevents downstream comparisons from misbehaving."""
+        with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", "fake-key"):
+            mock_client = self._mock_with_response({
+                "is_quote_inquiry": True,
+                "confidence": 5.0,  # nonsense
+                "reason": "ok",
+            })
+            with patch("llm.inbound_classifier.OpenAI", return_value=mock_client):
+                verdict = classify_inbound_email(
+                    from_address="x@y.com", subject="x",
+                    body_preview="x", is_thread_reply=False,
+                )
+        assert 0.0 <= verdict["confidence"] <= 1.0
+
+    def test_confidence_as_percentage_normalised(self):
+        """Tolerate the LLM returning 92 (percentage) instead of 0.92."""
+        with patch("llm.inbound_classifier.DEEPSEEK_API_KEY", "fake-key"):
+            mock_client = self._mock_with_response({
+                "is_quote_inquiry": True,
+                "confidence": 92,  # 0..100 form
+                "reason": "ok",
+            })
+            with patch("llm.inbound_classifier.OpenAI", return_value=mock_client):
+                verdict = classify_inbound_email(
+                    from_address="x@y.com", subject="x",
+                    body_preview="x", is_thread_reply=False,
+                )
+        assert verdict["confidence"] == pytest.approx(0.92, abs=0.01)

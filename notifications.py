@@ -98,6 +98,21 @@ def _build_dashboard_link(
     return f"{base}/c/{org_slug}/a/craig/quotes{qs}"
 
 
+def _build_engagement_dashboard_link(
+    base: str, org_slug: str, conversation_id: int, *,
+    action: Optional[str] = None,
+) -> str:
+    """v37 — deep link for the engagement-approval flow. Routes to the
+    Conversations module with `?pending_engagement=N` (mirror of the
+    `?focus_quote=N` pattern). Optional `action='reject'` pre-selects
+    the reject confirmation dialog."""
+    base = (base or _DEFAULT_DASHBOARD_BASE).rstrip("/")
+    qs = f"?pending_engagement={conversation_id}"
+    if action:
+        qs += f"&action={action}"
+    return f"{base}/c/{org_slug}/a/craig/conversations{qs}"
+
+
 def _last_n_messages(conv: Optional[Conversation], n: int = 3) -> list[dict]:
     if conv is None or not conv.messages:
         return []
@@ -935,3 +950,327 @@ def send_admin_alert_for_price_flag(
         body_text=body_text,
         dashboard_url=dashboard_url,
     )
+
+
+# ---------------------------------------------------------------------------
+# v37 — engagement-approval gate
+# ---------------------------------------------------------------------------
+#
+# Why distinct from quote approval: this fires BEFORE Craig has even
+# touched the conversation. The classifier returned a confidence below
+# the per-tenant `engagement_confidence_threshold` setting (default
+# 0.85), so we don't yet have a Quote — only a Conversation in
+# `pending_engagement_approval` status with the inbound email body
+# preview + the classifier verdict cached in
+# `Conversation.engagement_classification` (JSON).
+#
+# Justin clicks one of two buttons:
+#   - Approve  → admin endpoint flips status to engagement_approved,
+#                replays the deferred Craig run + posts the Missive draft
+#   - Reject   → admin endpoint flips status to engagement_rejected,
+#                Craig stays silent on this thread forever
+# ---------------------------------------------------------------------------
+
+
+def _build_engagement_subject(classification: dict) -> str:
+    """Subject for the engagement-approval email. Confidence shown as
+    a percentage so Justin can eyeball the urgency at a glance."""
+    conf = float(classification.get("confidence", 0.0) or 0.0)
+    pct = int(round(conf * 100))
+    subj = (classification.get("subject") or "").strip() or "(no subject)"
+    return f"[Just Print] Should Craig respond? {pct}% — {subj[:80]}"
+
+
+def _build_html_body_engagement(
+    conv: Conversation,
+    approve_url: str,
+    reject_url: str,
+) -> str:
+    """v37 — HTML body for the 'should Craig respond?' email. Mirrors
+    the visual language of the manual-review template (amber-tinted
+    'needs your eyes' style) but with two action buttons."""
+    classification = conv.engagement_classification or {}
+    from_addr = _safe(classification.get("from"), fallback="(unknown sender)")
+    subject_line = _safe(classification.get("subject"), fallback="(no subject)")
+    body_preview = _safe(classification.get("body_preview"), fallback="(no body)")
+    reason = _safe(classification.get("reason"), fallback="(classifier gave no reason)")
+    confidence = float(classification.get("confidence", 0.0) or 0.0)
+    pct = int(round(confidence * 100))
+
+    # Cap preview at ~1500 chars in the email body — long enough for
+    # context, short enough to scroll comfortably on mobile.
+    preview_safe = _html.escape(body_preview)[:1500]
+
+    # v37.1 — pre-rendered Craig reply. Justin reads what Craig WOULD
+    # send and decides Approve vs Don't engage with full context. The
+    # approve endpoint ships this exact text — no drift between preview
+    # and what the customer sees.
+    proposed_reply = (classification.get("proposed_reply") or "").strip()
+    proposed_quote_id = classification.get("proposed_quote_id")
+    proposed_block_html = ""
+    if proposed_reply:
+        # Render line breaks visually but escape HTML.
+        body_lines = _html.escape(proposed_reply).replace("\n", "<br>")
+        quote_chip = ""
+        if proposed_quote_id:
+            quote_chip = (
+                f'<span style="display:inline-block;background:#fef3c7;'
+                f'color:#92400e;padding:2px 8px;border-radius:9999px;'
+                f'font-size:11px;font-weight:600;margin-left:8px;">'
+                f'Quote JP-{int(proposed_quote_id):04d} attached</span>'
+            )
+        proposed_block_html = (
+            '<h3 style="margin:24px 0 8px;font-size:13px;color:#475569;'
+            'text-transform:uppercase;letter-spacing:0.5px;">'
+            f'Craig\'s proposed reply (NOT sent yet){quote_chip}'
+            '</h3>'
+            '<div style="padding:14px 16px;background:#f0fdf4;border:1px solid #bbf7d0;'
+            'border-radius:8px;font-size:13px;line-height:1.55;color:#0f172a;">'
+            f'{body_lines}'
+            '</div>'
+            '<div style="margin-top:6px;font-size:11px;color:#64748b;font-style:italic;">'
+            'Approve below to send this exact reply to the customer. '
+            "Don’t engage drops it; Craig writes nothing."
+            '</div>'
+        )
+
+    return f"""\
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Should Craig respond?</title></head>
+<body style="margin:0;padding:24px;background:#fefce8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0f172a;">
+<table role="presentation" width="100%" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #fde68a;">
+  <tr>
+    <td style="padding:24px;">
+      <div style="font-size:11px;color:#92400e;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;font-weight:600;">
+        Just Print · Missive · NEW INBOUND — UNCERTAIN
+      </div>
+      <h1 style="margin:0 0 12px;font-size:22px;font-weight:700;color:#92400e;">
+        Should Craig respond to this email?
+      </h1>
+      <div style="background:#fef9c3;border:1px solid #fde68a;border-radius:8px;padding:12px 16px;margin:0 0 18px;">
+        <div style="font-size:11px;color:#92400e;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;font-weight:600;">Classifier verdict</div>
+        <div style="font-size:14px;color:#0f172a;">
+          Confidence <strong>{pct}%</strong> — below the {int(round(confidence * 100)) if False else '85'}% auto-respond threshold.<br/>
+          <span style="color:#475569;">Reason: {_html.escape(reason)}</span>
+        </div>
+      </div>
+      <p style="margin:0 0 18px;color:#475569;font-size:14px;line-height:1.5;">
+        Craig isn't sure this is a real quote request. He's drafted a
+        reply but hasn't sent it. Read his draft below — Approve sends
+        it as-is, Don't engage drops it and Craig stays silent.
+      </p>
+
+      <table style="width:100%;border-collapse:collapse;margin:0 0 24px;">
+        <tr>
+          <td style="padding-right:8px;">
+            <a href="{approve_url}" style="display:block;background:#15803d;color:#ffffff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600;font-size:15px;text-align:center;">
+              ✓ Approve — let Craig respond
+            </a>
+          </td>
+          <td style="padding-left:8px;">
+            <a href="{reject_url}" style="display:block;background:#475569;color:#ffffff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600;font-size:15px;text-align:center;">
+              ✗ Don't engage
+            </a>
+          </td>
+        </tr>
+      </table>
+
+      <h3 style="margin:20px 0 8px;font-size:13px;color:#475569;text-transform:uppercase;letter-spacing:0.5px;">
+        Inbound email
+      </h3>
+      <table style="width:100%;font-size:14px;border-collapse:collapse;">
+        <tr><td style="padding:4px 0;color:#64748b;width:90px;">From</td><td>{from_addr}</td></tr>
+        <tr><td style="padding:4px 0;color:#64748b;">Subject</td><td>{subject_line}</td></tr>
+      </table>
+      <div style="margin-top:12px;padding:12px 14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;line-height:1.55;white-space:pre-wrap;color:#0f172a;">{preview_safe}</div>
+
+      {proposed_block_html}
+
+      <div style="margin-top:28px;padding-top:16px;border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8;">
+        Sent automatically by Craig · You're getting this because the
+        triage classifier gave a low confidence score. Tune the threshold
+        in dashboard → Settings → engagement_confidence_threshold.
+      </div>
+    </td>
+  </tr>
+</table>
+</body>
+</html>
+"""
+
+
+def _build_text_body_engagement(
+    conv: Conversation, approve_url: str, reject_url: str,
+) -> str:
+    """Plain-text fallback for the engagement-approval email."""
+    c = conv.engagement_classification or {}
+    pct = int(round(float(c.get("confidence", 0.0) or 0.0) * 100))
+    proposed = (c.get("proposed_reply") or "").strip()
+    proposed_block = ""
+    if proposed:
+        quote_id = c.get("proposed_quote_id")
+        head = "--- Craig's proposed reply (NOT sent yet) ---"
+        if quote_id:
+            head += f" [Quote JP-{int(quote_id):04d} attached]"
+        proposed_block = (
+            f"\n{head}\n{proposed}\n--- end ---\n"
+        )
+    return (
+        f"Should Craig respond to this email? (confidence {pct}%)\n"
+        f"\n"
+        f"From:    {c.get('from') or '(unknown)'}\n"
+        f"Subject: {c.get('subject') or '(no subject)'}\n"
+        f"Reason:  {c.get('reason') or '(none)'}\n"
+        f"\n"
+        f"--- inbound body preview ---\n"
+        f"{(c.get('body_preview') or '')[:1500]}\n"
+        f"--- end ---\n"
+        f"{proposed_block}"
+        f"\n"
+        f"Approve (sends Craig's reply above):\n{approve_url}\n"
+        f"\n"
+        f"Don't engage (Craig stays silent):\n{reject_url}\n"
+    )
+
+
+def send_engagement_ready_for_approval(
+    db: Session,
+    conv: Conversation,
+    org_slug: str,
+    *,
+    dashboard_base_url: Optional[str] = None,
+) -> dict:
+    """Compose + send the v37 'should Craig respond?' email. Returns
+    {ok, message_id, error}. Never raises."""
+    enabled = _setting(db, "notifications_enabled", "true", organization_slug=org_slug).lower() == "true"
+    if not enabled:
+        return {"ok": False, "message_id": None, "error": "notifications_disabled"}
+
+    api_key = os.environ.get(_RESEND_API_KEY_ENV, "").strip()
+    if not api_key:
+        return {"ok": False, "message_id": None, "error": "missing_RESEND_API_KEY"}
+
+    sender_addr = _setting(
+        db, "notification_sender_address",
+        "craig@notifications.strategos-ai.com",
+        organization_slug=org_slug,
+    )
+    sender_name = _setting(
+        db, "notification_sender_name",
+        "Craig (Just Print)",
+        organization_slug=org_slug,
+    )
+    to_addr = _setting(db, "notification_to_address", "", organization_slug=org_slug)
+    if not to_addr:
+        return {"ok": False, "message_id": None, "error": "missing_notification_to_address"}
+
+    base = dashboard_base_url or _setting(
+        db, "dashboard_base_url", _DEFAULT_DASHBOARD_BASE,
+        organization_slug=org_slug,
+    )
+
+    approve_url = _build_engagement_dashboard_link(base, org_slug, conv.id)
+    reject_url = _build_engagement_dashboard_link(base, org_slug, conv.id, action="reject")
+
+    classification = conv.engagement_classification or {}
+    subject = _build_engagement_subject(classification)
+    html_body = _build_html_body_engagement(conv, approve_url, reject_url)
+    text_body = _build_text_body_engagement(conv, approve_url, reject_url)
+
+    try:
+        import resend
+        resend.api_key = api_key
+        params = {
+            "from": f"{sender_name} <{sender_addr}>",
+            "to": [to_addr],
+            "subject": subject,
+            "html": html_body,
+            "text": text_body,
+        }
+        result = resend.Emails.send(params)
+        msg_id = (result or {}).get("id") if isinstance(result, dict) else None
+        print(
+            f"[notifications] sent engagement-approval email org={org_slug} "
+            f"conv={conv.id} to={to_addr} id={msg_id}",
+            flush=True,
+        )
+        return {"ok": True, "message_id": msg_id, "error": None}
+    except Exception as e:
+        msg = f"resend_error: {type(e).__name__}: {str(e)[:200]}"
+        print(
+            f"[notifications] engagement-approval send FAILED org={org_slug} "
+            f"conv={conv.id} err={msg}",
+            flush=True,
+        )
+        return {"ok": False, "message_id": None, "error": msg}
+
+
+def trigger_engagement_approval_notification(
+    db: Session,
+    org_slug: str,
+    conversation_id: int,
+) -> dict:
+    """v37 — idempotent trigger for the engagement-approval email.
+    Called from the Missive webhook when classifier confidence is
+    above the junk floor but below the auto-respond threshold.
+
+    Idempotency is gated on
+    `Conversation.engagement_classification.notification_sent_at`
+    (kept inside the JSON blob so we don't have to ALTER TABLE every
+    time a new audit field appears).
+
+    Returns {ok, skipped, error}.
+    """
+    conv = db.query(Conversation).filter_by(id=conversation_id).first()
+    if conv is None:
+        print(
+            f"[notifications] engagement trigger: conversation_not_found "
+            f"id={conversation_id} org={org_slug}",
+            flush=True,
+        )
+        return {"ok": False, "skipped": False, "error": "conversation_not_found"}
+
+    classification = dict(conv.engagement_classification or {})
+    if classification.get("notification_sent_at"):
+        print(
+            f"[notifications] engagement trigger: already sent (idempotent skip) "
+            f"conv={conv.id} org={org_slug}",
+            flush=True,
+        )
+        return {"ok": True, "skipped": True, "error": None}
+
+    print(
+        f"[notifications] engagement trigger: firing for conv={conv.id} "
+        f"org={org_slug}",
+        flush=True,
+    )
+    result = send_engagement_ready_for_approval(db, conv, org_slug)
+    if result.get("ok"):
+        try:
+            classification["notification_sent_at"] = _dt.datetime.utcnow().isoformat(timespec="seconds")
+            classification["notification_message_id"] = result.get("message_id")
+            classification["notification_last_error"] = None
+            conv.engagement_classification = classification
+            db.commit()
+            print(
+                f"[notifications] engagement persisted notification_sent_at "
+                f"conv={conv.id} msg_id={result.get('message_id')}",
+                flush=True,
+            )
+        except Exception as e:
+            db.rollback()
+            print(
+                f"[notifications] engagement commit FAILED after send "
+                f"conv={conv.id} err={type(e).__name__}: {e}",
+                flush=True,
+            )
+        return {"ok": True, "skipped": False, "error": None}
+    else:
+        try:
+            classification["notification_last_error"] = (result.get("error") or "")[:500]
+            conv.engagement_classification = classification
+            db.commit()
+        except Exception:
+            db.rollback()
+        return {"ok": False, "skipped": False, "error": result.get("error")}

@@ -1705,6 +1705,378 @@ def bulk_conversations(
     }
 
 
+# ============================================================================
+# v37 — engagement-approval gate endpoints
+#
+# When the Missive webhook's classifier returns a confidence below the
+# per-tenant threshold, the conversation is parked in
+# `pending_engagement_approval` and Justin gets a Resend email. He clicks
+# Approve → POST /approve-engagement → conversation flips, Craig replays
+# on the stashed inbound body and posts the Missive draft. He clicks
+# Don't engage → POST /reject-engagement → conversation flips and the
+# webhook silently drops all future inbound on this Missive thread.
+# ============================================================================
+
+
+def _replay_craig_on_engagement_approval(
+    db: Session,
+    org_slug: str,
+    conversation_id: int,
+) -> dict:
+    """v37 — ships the Craig reply once Justin has approved engagement.
+
+    v37.1 fast-path: the webhook already ran Craig at Tier-2 time and
+    parked the proposed reply on `engagement_classification`. So in
+    99% of cases we just post the cached HTML/subject to Missive — no
+    second LLM call, zero drift between what Justin saw in his email
+    and what the customer receives.
+
+    Fallback: for old (pre-v37.1) conversations or if the Tier-2 run
+    failed and stored no `proposed_reply`, we re-run chat_with_craig
+    here. Same code path as before; just the rare case now.
+
+    Returns {ok: bool, reply_len: int, error: Optional[str], drafted: bool}.
+    Never raises — the dashboard treats any failure as a soft warning
+    so Justin can retry from the row sidebar.
+    """
+    from pricing_engine import _get_setting
+    import missive  # missive.create_draft posts the draft back to the thread
+    import asyncio
+    import html as _html
+
+    conv = db.query(Conversation).filter_by(id=conversation_id).first()
+    if conv is None:
+        return {"ok": False, "drafted": False, "reply_len": 0, "error": "conversation_not_found"}
+
+    classification = dict(conv.engagement_classification or {})
+    missive_external_id = conv.external_id
+    if not missive_external_id:
+        # Flip status anyway so the row leaves the queue, but report
+        # we can't ship without a Missive thread. (Should never happen
+        # in practice — engagement gate only fires on Missive channel.)
+        conv.status = "engagement_approved"
+        db.commit()
+        return {"ok": False, "drafted": False, "reply_len": 0, "error": "no_missive_thread"}
+
+    # v37.1 — fast path. If the Tier-2 webhook stashed a proposed reply,
+    # ship that verbatim and skip the LLM round-trip.
+    proposed_reply = (classification.get("proposed_reply") or "").strip()
+    proposed_html = (classification.get("proposed_html") or "").strip()
+    proposed_subject = (classification.get("proposed_subject") or "").strip()
+    proposed_quote_id = classification.get("proposed_quote_id")
+
+    if proposed_reply and proposed_html:
+        # Status flip first so a follow-up webhook on this thread (rare,
+        # but possible — customer sent a second email while Justin
+        # decided) routes through the already-engaged branch instead of
+        # re-classifying.
+        conv.status = "engagement_approved"
+        db.commit()
+
+        token = _get_setting(db, "missive_api_token", "", organization_slug=org_slug)
+        from_addr = _get_setting(db, "missive_from_address", "", organization_slug=org_slug)
+        from_name = _get_setting(db, "missive_from_name", "Craig", organization_slug=org_slug)
+        enabled = _get_setting(db, "missive_enabled", "false", organization_slug=org_slug)
+        if not token or (enabled or "").lower() != "true":
+            return {
+                "ok": True, "drafted": False,
+                "reply_len": len(proposed_reply),
+                "error": "missive_disabled",
+            }
+
+        # Build the to-field from cached classification.
+        to_fields = []
+        sender_email = (classification.get("from") or "").strip()
+        if sender_email:
+            to_fields = [{
+                "address": sender_email,
+                "name": (conv.customer_name or sender_email),
+            }]
+
+        # If the Tier-2 turn produced a Quote, attach the PDF (parity
+        # with the Tier-3 webhook path).
+        attachments = None
+        if proposed_quote_id:
+            try:
+                from pdf_generator import generate_quote_pdf
+                import base64
+                quote_row = db.query(Quote).filter_by(id=proposed_quote_id).first()
+                if quote_row is not None:
+                    pdf_bytes = generate_quote_pdf(quote_row)
+                    attachments = [{
+                        "filename": f"JustPrint-Quote-JP-{quote_row.id:04d}.pdf",
+                        "base64_data": base64.b64encode(pdf_bytes).decode("ascii"),
+                    }]
+            except Exception as pdf_err:
+                # Non-fatal — ship the text reply without the PDF.
+                attachments = None
+                print(
+                    f"[admin_api] approve-engagement: PDF gen failed for "
+                    f"quote={proposed_quote_id} err={pdf_err}",
+                    flush=True,
+                )
+
+        reply_subject = proposed_subject or "Re: Your quote from Just Print"
+        try:
+            asyncio.run(missive.create_draft(
+                conversation_id=missive_external_id,
+                html_body=proposed_html,
+                from_address=from_addr or "",
+                from_name=from_name,
+                to_fields=to_fields,
+                token=token,
+                subject=reply_subject,
+                attachments=attachments,
+                send=bool(classification.get("proposed_should_send", True)),
+            ))
+        except Exception as e:
+            return {
+                "ok": False, "drafted": False,
+                "reply_len": len(proposed_reply),
+                "error": f"missive_draft_failed: {type(e).__name__}: {e}",
+            }
+
+        # If a quote was queued at Tier-2 time, fire the v33 approval
+        # notification now (the webhook deliberately suppressed it
+        # while we were in the engagement-approval limbo). This is the
+        # confirm_order path — a Stripe link / payment-required follow
+        # up still needs Justin's quote-approval click in the dashboard.
+        # Idempotent so harmless if it doesn't apply.
+        if proposed_quote_id:
+            try:
+                from notifications import trigger_approval_notification
+                trigger_approval_notification(db, org_slug, int(proposed_quote_id))
+            except Exception as notif_err:
+                print(
+                    f"[admin_api] approve-engagement: trigger_approval_notification "
+                    f"failed (non-fatal) quote={proposed_quote_id} err={notif_err}",
+                    flush=True,
+                )
+
+        return {
+            "ok": True, "drafted": True,
+            "reply_len": len(proposed_reply),
+            "error": None,
+        }
+
+    # ── Fallback path — pre-v37.1 conversations or Tier-2 LLM failure ──
+    # No cached reply. Run Craig now using the stashed inbound body.
+    from llm.craig_agent import chat_with_craig
+
+    body_text = ""
+    for m in reversed(conv.messages or []):
+        if isinstance(m, dict) and m.get("role") == "user" and (m.get("content") or "").strip():
+            body_text = m["content"]
+            break
+    if not body_text:
+        body_text = (classification.get("body_preview") or "").strip()
+    if not body_text:
+        return {"ok": False, "drafted": False, "reply_len": 0, "error": "no_inbound_body"}
+
+    # Pop the last user message if it's the same one (chat_with_craig
+    # will re-append it; otherwise we'd duplicate the turn).
+    if conv.messages and isinstance(conv.messages[-1], dict) and conv.messages[-1].get("role") == "user":
+        conv.messages = conv.messages[:-1]
+        db.flush()
+
+    conv.status = "engagement_approved"
+    db.flush()
+
+    result = chat_with_craig(
+        db=db,
+        conversation_id=conv.id,
+        user_message=body_text,
+        external_id=missive_external_id,
+        channel="missive",
+        organization_slug=org_slug,
+    )
+
+    reply_text = (result.get("reply") or "").strip()
+    if not reply_text:
+        return {"ok": True, "drafted": False, "reply_len": 0, "error": None}
+
+    reply_text = re.sub(
+        r"\[\s*(QUOTE[_\s]*READY|ARTWORK[_\s]*UPLOAD|ARTWORK[_\s]*CHOICE|CUSTOMER[_\s]*FORM)\s*\]",
+        "", reply_text, flags=re.IGNORECASE,
+    )
+    reply_text = re.sub(r"\n{3,}", "\n\n", reply_text).strip()
+
+    html_body = (
+        "<p>"
+        + _html.escape(reply_text).replace("\n\n", "</p><p>").replace("\n", "<br>")
+        + "</p>"
+    )
+
+    token = _get_setting(db, "missive_api_token", "", organization_slug=org_slug)
+    from_addr = _get_setting(db, "missive_from_address", "", organization_slug=org_slug)
+    from_name = _get_setting(db, "missive_from_name", "Craig", organization_slug=org_slug)
+    enabled = _get_setting(db, "missive_enabled", "false", organization_slug=org_slug)
+    if not token or (enabled or "").lower() != "true":
+        return {"ok": True, "drafted": False, "reply_len": len(reply_text), "error": "missive_disabled"}
+
+    original_subject = (classification.get("missive_subject") or "").strip()
+    if original_subject and not original_subject.lower().startswith(("re:", "re :")):
+        reply_subject = f"Re: {original_subject}"
+    elif original_subject:
+        reply_subject = original_subject
+    else:
+        reply_subject = "Re: Your quote from Just Print"
+
+    to_fields = []
+    sender_email = (classification.get("from") or "").strip()
+    if sender_email:
+        to_fields = [{
+            "address": sender_email,
+            "name": (conv.customer_name or sender_email),
+        }]
+
+    try:
+        asyncio.run(missive.create_draft(
+            conversation_id=missive_external_id,
+            html_body=html_body,
+            from_address=from_addr or "",
+            from_name=from_name,
+            to_fields=to_fields,
+            token=token,
+            subject=reply_subject,
+            attachments=None,
+            send=True,
+        ))
+    except Exception as e:
+        return {
+            "ok": False, "drafted": False, "reply_len": len(reply_text),
+            "error": f"missive_draft_failed: {type(e).__name__}: {e}",
+        }
+
+    return {"ok": True, "drafted": True, "reply_len": len(reply_text), "error": None}
+
+
+@router.post("/orgs/{org_slug}/conversations/{conv_id}/approve-engagement")
+def approve_engagement(
+    org_slug: str,
+    conv_id: int,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v37 — Justin approves engagement on a paused inbound. Replays
+    the deferred Craig run + posts the Missive draft. Idempotent: a
+    second call on an already-approved conversation just returns the
+    current state."""
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    conv = (
+        _scope(db.query(Conversation), Conversation, claims, org_slug)
+        .filter(Conversation.id == conv_id)
+        .first()
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="conversation_not_found")
+
+    if conv.status not in ("pending_engagement_approval", "engagement_approved"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"cannot approve engagement on status={conv.status!r}",
+        )
+
+    # Record who approved + when in the JSON blob.
+    classification = dict(conv.engagement_classification or {})
+    if "approved_at" not in classification:
+        classification["approved_at"] = datetime.utcnow().isoformat(timespec="seconds")
+        classification["approved_by"] = claims.email
+        conv.engagement_classification = classification
+        db.commit()
+
+    result = _replay_craig_on_engagement_approval(db, org_slug, conv.id)
+    db.refresh(conv)
+    return {
+        "ok": result.get("ok", False),
+        "drafted": result.get("drafted", False),
+        "reply_len": result.get("reply_len", 0),
+        "error": result.get("error"),
+        "conversation": {
+            "id": conv.id,
+            "status": conv.status,
+            "engagement_classification": conv.engagement_classification,
+        },
+    }
+
+
+@router.post("/orgs/{org_slug}/conversations/{conv_id}/reject-engagement")
+def reject_engagement(
+    org_slug: str,
+    conv_id: int,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v37 — Justin tells Craig not to engage with this Missive thread.
+    Future inbound on the same external_id is silently dropped by the
+    webhook (no LLM call, no notification). Idempotent."""
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    conv = (
+        _scope(db.query(Conversation), Conversation, claims, org_slug)
+        .filter(Conversation.id == conv_id)
+        .first()
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="conversation_not_found")
+
+    if conv.status not in (
+        "pending_engagement_approval", "engagement_rejected",
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"cannot reject engagement on status={conv.status!r}",
+        )
+
+    conv.status = "engagement_rejected"
+    classification = dict(conv.engagement_classification or {})
+    if "rejected_at" not in classification:
+        classification["rejected_at"] = datetime.utcnow().isoformat(timespec="seconds")
+        classification["rejected_by"] = claims.email
+
+    # v37.1 — if Tier-2 produced a Quote that's still pending, mark it
+    # rejected so it disappears from the operator queue (Justin doesn't
+    # need to act on a quote that was never sent to the customer).
+    quotes_rejected: list[int] = []
+    proposed_quote_id = classification.get("proposed_quote_id")
+    if proposed_quote_id:
+        try:
+            q = db.query(Quote).filter_by(id=int(proposed_quote_id)).first()
+            if q is not None and q.status in ("pending_approval", "needs_revision"):
+                q.status = "rejected"
+                quotes_rejected.append(q.id)
+        except Exception:
+            # Non-fatal — the conversation reject is the main action.
+            pass
+
+    # Also catch any other pending quote on this conversation (defensive
+    # against future flows that create more quotes).
+    other_pending = db.query(Quote).filter(
+        Quote.conversation_id == conv.id,
+        Quote.status.in_(("pending_approval", "needs_revision")),
+    ).all()
+    for q in other_pending:
+        if q.id not in quotes_rejected:
+            q.status = "rejected"
+            quotes_rejected.append(q.id)
+
+    conv.engagement_classification = classification
+    db.commit()
+
+    return {
+        "ok": True,
+        "quotes_rejected": quotes_rejected,
+        "conversation": {
+            "id": conv.id,
+            "status": conv.status,
+            "engagement_classification": conv.engagement_classification,
+        },
+    }
+
+
 # ----------------------------------------------------------------------------
 # Phase G — artwork file proxy endpoint
 #
@@ -2847,6 +3219,9 @@ def _conv_summary(c: Conversation) -> dict[str, Any]:
         "artwork_will_send_later": bool(getattr(c, "artwork_will_send_later", False)),
         # v35 — test-mode flag (sandbox conversation from dashboard Test Chat)
         "is_test": bool(getattr(c, "is_test", False)),
+        # v37 — engagement-approval gate. Carries the classifier verdict +
+        # audit fields when the conversation is paused awaiting Justin.
+        "engagement_classification": getattr(c, "engagement_classification", None),
     }
 
 

@@ -105,25 +105,50 @@ def obvious_junk(
     return None
 
 
+# v37 — confidence floor below which we treat the email as outright junk
+# (silent drop, same as `is_quote_inquiry=False`). Above this floor but
+# below the per-tenant `engagement_confidence_threshold` setting → the
+# webhook pauses Craig and notifies Justin to approve engagement.
+LOW_CONFIDENCE_FLOOR = 0.2
+
+
 _SYSTEM_PROMPT = (
     "You are a triage filter for an Irish print shop (Just Print). "
     "Decide whether the email below is from a real human asking about "
     "printing services, design, signage, or a quote / quote follow-up.\n"
     "\n"
-    "Return TRUE for: quote requests (cards, flyers, brochures, "
+    "TRUE (quote-related): quote requests (cards, flyers, brochures, "
     "letterheads, posters, signage, banners, NCR, stationery, "
     "booklets, etc), questions about pricing or turnaround, design "
-    "service inquiries, or replies to an in-progress quote.\n"
+    "service inquiries, replies to an in-progress quote.\n"
     "\n"
-    "Return FALSE for: cold sales pitches (someone selling US a "
-    "service), promotional / marketing emails, newsletters, "
+    "FALSE (not quote-related): cold sales pitches (someone selling US "
+    "a service), promotional / marketing emails, newsletters, "
     "automated notifications, mailing-list traffic, out-of-office "
     "replies, anything spammy.\n"
     "\n"
+    "Also return a CONFIDENCE score from 0.0 to 1.0 reflecting how "
+    "sure you are about your verdict. Calibration:\n"
+    "  >=0.95  obvious quote request with explicit product+qty, OR "
+    "obvious spam/sales pitch.\n"
+    "  0.85–0.94  clearly print-related but light on detail "
+    "(\"can you do business cards?\").\n"
+    "  0.50–0.84  ambiguous: vague greeting, asking generally about "
+    "services, could be a customer or a vendor pitch.\n"
+    "  0.20–0.49  probably not a quote but unsure (random question, "
+    "off-topic message from a real human).\n"
+    "  <0.20  almost certainly junk / spam / mailing list.\n"
+    "\n"
+    "If you're not 90%+ sure the sender wants a print quote, return a "
+    "confidence below 0.85 — Justin will be asked to approve before "
+    "Craig replies.\n"
+    "\n"
     "Respond with JSON ONLY in this exact shape:\n"
-    '  {"is_quote_inquiry": true, "reason": "short reason ≤15 words"}\n'
+    '  {"is_quote_inquiry": true, "confidence": 0.92, '
+    '"reason": "short reason ≤15 words"}\n'
     "or\n"
-    '  {"is_quote_inquiry": false, "reason": "short reason ≤15 words"}'
+    '  {"is_quote_inquiry": false, "confidence": 0.97, '
+    '"reason": "short reason ≤15 words"}'
 )
 
 
@@ -135,7 +160,7 @@ def classify_inbound_email(
     is_thread_reply: bool = False,
 ) -> dict[str, Any]:
     """
-    Returns {"is_quote_inquiry": bool, "reason": str}.
+    Returns {"is_quote_inquiry": bool, "confidence": float, "reason": str}.
 
     Args:
       from_address:    sender's email
@@ -145,16 +170,23 @@ def classify_inbound_email(
                        message to make this call)
       is_thread_reply: if True, this email is part of a Missive
                        conversation Craig already drafted in. We
-                       short-circuit to True without an LLM call —
-                       customers replying to Craig's drafts are by
-                       definition real customers.
+                       short-circuit to confidence=1.0 without an LLM
+                       call — customers replying to Craig's drafts are
+                       by definition real customers.
+
+    v37 — adds `confidence` (0.0–1.0). The webhook uses it for a
+    three-tier decision: <LOW_CONFIDENCE_FLOOR drop, <threshold pause +
+    notify Justin, ≥threshold respond as today.
 
     Failure modes (timeout, network, malformed JSON) → return
-    {"is_quote_inquiry": True, "reason": "classifier-error fail-open"}.
+    {"is_quote_inquiry": True, "confidence": 1.0,
+     "reason": "classifier-error fail-open"} so a real lead is never
+    silently swallowed.
     """
     if is_thread_reply:
         return {
             "is_quote_inquiry": True,
+            "confidence": 1.0,
             "reason": "thread reply (skip LLM)",
         }
 
@@ -163,6 +195,7 @@ def classify_inbound_email(
         # accidentally drop emails. Same fail-open posture.
         return {
             "is_quote_inquiry": True,
+            "confidence": 1.0,
             "reason": "no DEEPSEEK_API_KEY (fail-open)",
         }
 
@@ -193,21 +226,36 @@ def classify_inbound_email(
         content = (resp.choices[0].message.content or "").strip()
         parsed = json.loads(content)
         verdict = bool(parsed.get("is_quote_inquiry", True))
+        # v37 — confidence is float 0..1. Tolerate either a float or a
+        # 0..100 percentage from the LLM; clamp to [0,1] either way.
+        raw_conf = parsed.get("confidence", 1.0 if verdict else 0.0)
+        try:
+            conf = float(raw_conf)
+        except (TypeError, ValueError):
+            conf = 1.0 if verdict else 0.0
+        if conf > 1.5:  # the LLM returned 0..100 instead of 0..1
+            conf = conf / 100.0
+        conf = max(0.0, min(1.0, conf))
         reason = str(parsed.get("reason", ""))[:200]
-        result = {"is_quote_inquiry": verdict, "reason": reason}
+        result = {
+            "is_quote_inquiry": verdict,
+            "confidence": conf,
+            "reason": reason,
+        }
         print(
             f"[inbound_classifier] from={from_address!r} "
-            f"subject={subject[:60]!r} verdict={verdict} reason={reason!r}",
+            f"subject={subject[:60]!r} verdict={verdict} "
+            f"confidence={conf:.2f} reason={reason!r}",
             flush=True,
         )
         return result
     except Exception as e:
-        # Fail-open: any error returns True. Better a junk draft than
-        # a missed lead.
+        # Fail-open: any error returns True at full confidence. Better
+        # a junk draft than a missed lead.
         msg = f"classifier-error: {type(e).__name__}: {str(e)[:120]}"
         print(
             f"[inbound_classifier] from={from_address!r} "
             f"subject={subject[:60]!r} ERROR fail-open. {msg}",
             flush=True,
         )
-        return {"is_quote_inquiry": True, "reason": msg}
+        return {"is_quote_inquiry": True, "confidence": 1.0, "reason": msg}
