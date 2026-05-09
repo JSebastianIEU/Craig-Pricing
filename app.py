@@ -663,14 +663,45 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             )
             return
 
-        # Don't reply to ourselves. If the sender is the same address we're
-        # configured to draft from, it's almost certainly Justin's manual
-        # reply (or a previous Craig draft Justin hit send on). Skip.
+        # Don't reply to ourselves. If the sender is the same address
+        # we're configured to draft from, it's almost certainly Justin's
+        # manual reply (or a previous Craig draft Justin hit send on).
+        # v37.2 — also drop emails sent from `notification_sender_address`
+        # (the v33/v34 operator-notification mailer): when those land in
+        # the Missive-watched inbox, the webhook used to treat them as
+        # customer mail and Craig would happily try to "answer" the
+        # quote-approval email it just sent — bouncing off the notify
+        # mailbox (which often doesn't accept inbound). Subject-prefix
+        # check is a belt-and-braces second filter.
         from_addr = _get_setting(db, "missive_from_address", "", organization_slug=org_slug)
-        if from_addr and evt["from_address"].lower() == from_addr.lower():
+        notif_sender = _get_setting(
+            db, "notification_sender_address", "", organization_slug=org_slug,
+        )
+        loop_addrs = {
+            (a or "").strip().lower()
+            for a in (from_addr, notif_sender)
+            if a
+        }
+        sender_lc = (evt["from_address"] or "").strip().lower()
+        if sender_lc and sender_lc in loop_addrs:
             _mlog.info(
-                "%s: sender is our own from-address, skipping loop",
-                org_slug,
+                "%s: sender %r is one of our own addresses, skipping loop",
+                org_slug, sender_lc,
+            )
+            return
+
+        # Subject-prefix sniff for our own notification mail. If the
+        # notification sender setting was changed/deleted but a forward
+        # rule still drops the email into Missive, the subject is the
+        # last-ditch giveaway: '[Just Print — needs your eyes]', '[Just
+        # Print] Quote JP-XXXX ready', '[Just Print — Issue]', etc. —
+        # all start with '[Just Print'. Real customers don't open with
+        # a bracket-tag prefix, so this is a safe drop.
+        subj_lc = (evt.get("subject") or "").strip().lower()
+        if subj_lc.startswith("[just print"):
+            _mlog.info(
+                "%s: subject %r looks like an operator-notification email, "
+                "skipping loop", org_slug, evt.get("subject"),
             )
             return
 
