@@ -38,17 +38,44 @@ working without edits.
 """
 
 import io
+import os
 from datetime import datetime
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib.colors import HexColor, white, black
+from reportlab.lib.utils import ImageReader
 from reportlab.platypus import (
     BaseDocTemplate, PageTemplate, Frame,
     Table, TableStyle, Spacer, Paragraph,
 )
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
+
+
+# v36 — brand asset paths. When these PNGs exist, the page-frame draws
+# them via canvas.drawImage() instead of falling back to drawn
+# primitives. Lets Justin (or whoever owns the brand) drop in the
+# real artwork and get a pixel-perfect quote PDF without code edits.
+_ASSET_DIR = os.path.join(os.path.dirname(__file__), "static", "images")
+_ASSET_PATHS = {
+    "corner_top_right":   os.path.join(_ASSET_DIR, "quote-corner-top-right.png"),
+    "corner_bottom_left": os.path.join(_ASSET_DIR, "quote-corner-bottom-left.png"),
+    "payment_cards":      os.path.join(_ASSET_DIR, "quote-payment-cards.png"),
+    "logo":               os.path.join(_ASSET_DIR, "quote-logo.png"),
+}
+
+
+def _asset_or_none(name: str):
+    """Return an ImageReader if the asset exists, else None.
+    Cached the first time so repeated page renders don't re-read disk."""
+    path = _ASSET_PATHS.get(name)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        return ImageReader(path)
+    except Exception:
+        return None
 
 
 # ───────────────────────── brand ─────────────────────────
@@ -114,12 +141,31 @@ TERMS_BULLETS = [
 
 def _draw_payment_icons(canv, x, y):
     """
-    Draw small VISA / Mastercard / Laser card icons starting at (x, y).
+    Draw VISA / Mastercard / Laser card icons starting at (x, y).
     Returns the x position after the last icon so caller can continue drawing.
 
-    Each card is ~13mm wide × 8mm tall, drawn with reportlab primitives
-    (no external image assets). Good enough to read at PDF viewer zoom.
+    v36 — when static/images/quote-payment-cards.png exists, draw the
+    operator-supplied image instead of the primitive icons. The image
+    is sized so the row of three cards spans roughly the same width
+    as the original (~45mm) and 8mm tall.
+
+    Falls back to drawn primitives (rounded rects + brand-coloured marks)
+    when no asset is present, so dev environments still produce a
+    legible, branded preview.
     """
+    pay_asset = _asset_or_none("payment_cards")
+    if pay_asset is not None:
+        # Operator-supplied 'three cards in a row' artwork.
+        target_w = 47 * mm
+        iw, ih = pay_asset.getSize()
+        target_h = target_w * (ih / float(iw)) if iw else 9 * mm
+        canv.drawImage(
+            pay_asset, x, y,
+            width=target_w, height=target_h,
+            mask="auto", preserveAspectRatio=True,
+        )
+        return x + target_w
+
     icon_w = 13 * mm
     icon_h = 8 * mm
     gap = 2 * mm
@@ -187,82 +233,157 @@ def _draw_page_frame(canv, doc):
     """
     page_w, page_h = A4
 
-    # ── Orange vertical sidebar ──────────────────────────────────────
-    sidebar_w = 11 * mm
+    # ── Orange vertical sidebar with chat-bubble icon at top ──────────
+    # v36 — wider strip + chat-bubble icon to match Justin's canonical
+    # Quote Template. The bubble is drawn with primitives (white circle
+    # with three dark dots inside, in the same style as a chat-message
+    # icon). The QUOTATION text is rotated 90° and centered vertically.
+    sidebar_w = 14 * mm
     canv.setFillColor(ORANGE)
     canv.rect(0, 0, sidebar_w, page_h, fill=1, stroke=0)
+
+    # Chat-bubble icon at top of sidebar — Justin's template uses a
+    # white speech-bubble with three dots, anchored ~10mm from the top.
+    bubble_cx = sidebar_w / 2
+    bubble_cy = page_h - 12 * mm
+    bubble_r = 4.5 * mm
     canv.setFillColor(white)
-    canv.setFont("Helvetica-Bold", 20)
+    canv.circle(bubble_cx, bubble_cy, bubble_r, fill=1, stroke=0)
+    # Speech-bubble tail — small triangle pointing down-right
+    p = canv.beginPath()
+    p.moveTo(bubble_cx + 1.5 * mm, bubble_cy - bubble_r + 0.2 * mm)
+    p.lineTo(bubble_cx + 4.5 * mm, bubble_cy - bubble_r - 1.5 * mm)
+    p.lineTo(bubble_cx + 3.0 * mm, bubble_cy - bubble_r - 0.5 * mm)
+    p.close()
+    canv.drawPath(p, fill=1, stroke=0)
+    # Three dots inside the bubble — dark-orange / black to read on white
+    canv.setFillColor(NAVY)
+    dot_r = 0.7 * mm
+    canv.circle(bubble_cx - 2 * mm, bubble_cy, dot_r, fill=1, stroke=0)
+    canv.circle(bubble_cx,           bubble_cy, dot_r, fill=1, stroke=0)
+    canv.circle(bubble_cx + 2 * mm, bubble_cy, dot_r, fill=1, stroke=0)
+
+    # "QUOTATION" rotated text — heavier weight + larger, positioned
+    # roughly centered on the page (a bit above mid-height like Justin's).
+    canv.setFillColor(white)
+    canv.setFont("Helvetica-Bold", 22)
     canv.saveState()
-    canv.translate(sidebar_w / 2 + 2 * mm, page_h * 0.58)
+    canv.translate(sidebar_w / 2 + 3 * mm, page_h * 0.50)
     canv.rotate(90)
     canv.drawString(0, 0, "QUOTATION")
     canv.restoreState()
 
-    # ── Top-right decorative triangles ───────────────────────────────
-    # Bigger, more dramatic, overlapping rainbow — matches Justin's PDF
-    # where the triangles fill roughly the top-right quarter of the page.
+    # ── Top-right decorative artwork ──────────────────────────────────
+    # v36 — if the operator dropped the real brand PNG at
+    # static/images/quote-corner-top-right.png, use that. Otherwise
+    # fall back to drawn primitive triangles so dev / fresh deploys
+    # still produce a recognisable layout.
     def _tri(color, x1, y1, x2, y2, x3, y3):
         canv.setFillColor(color)
         p = canv.beginPath()
         p.moveTo(x1, y1); p.lineTo(x2, y2); p.lineTo(x3, y3); p.close()
         canv.drawPath(p, fill=1, stroke=0)
 
-    tr_right = page_w
-    tr_top = page_h
-    # Biggest: pink, from top-right corner down and left
-    _tri(PINK,
-         tr_right - 70 * mm, tr_top,
-         tr_right,            tr_top - 70 * mm,
-         tr_right,            tr_top)
-    # Middle: blue, overlapping pink
-    _tri(BLUE,
-         tr_right - 55 * mm, tr_top,
-         tr_right - 15 * mm, tr_top - 45 * mm,
-         tr_right - 15 * mm, tr_top)
-    # Smallest/front: yellow
-    _tri(YELLOW,
-         tr_right - 35 * mm, tr_top,
-         tr_right - 5 * mm,  tr_top - 32 * mm,
-         tr_right - 5 * mm,  tr_top)
+    tr_asset = _asset_or_none("corner_top_right")
+    if tr_asset is not None:
+        # Anchor at top-right corner. Width chosen to roughly match
+        # Justin's template (~80mm wide). preserveAspectRatio keeps the
+        # vector composition intact regardless of source dimensions.
+        tr_w = 85 * mm
+        iw, ih = tr_asset.getSize()
+        tr_h = tr_w * (ih / float(iw)) if iw else tr_w
+        canv.drawImage(
+            tr_asset,
+            page_w - tr_w, page_h - tr_h,
+            width=tr_w, height=tr_h,
+            mask="auto", preserveAspectRatio=True,
+        )
+    else:
+        tr_right = page_w
+        tr_top = page_h
+        # Biggest: pink, from top-right corner down and left
+        _tri(PINK,
+             tr_right - 70 * mm, tr_top,
+             tr_right,            tr_top - 70 * mm,
+             tr_right,            tr_top)
+        # Middle: blue, overlapping pink
+        _tri(BLUE,
+             tr_right - 55 * mm, tr_top,
+             tr_right - 15 * mm, tr_top - 45 * mm,
+             tr_right - 15 * mm, tr_top)
+        # Smallest/front: yellow
+        _tri(YELLOW,
+             tr_right - 35 * mm, tr_top,
+             tr_right - 5 * mm,  tr_top - 32 * mm,
+             tr_right - 5 * mm,  tr_top)
 
     # ── Logo + tagline ──────────────────────────────────────────────
-    logo_cx = (sidebar_w + page_w) / 2 - 20 * mm   # centered in main content area (a bit left of dead-center to balance the triangles)
+    # v36 — use static/images/quote-logo.png when present, else draw
+    # the text fallback. Anchored top-left of the content area.
+    logo_cx = (sidebar_w + page_w) / 2 - 20 * mm
     logo_y = page_h - 22 * mm
-    canv.setFillColor(NAVY)
-    canv.setFont("Helvetica-Bold", 24)
-    canv.drawCentredString(logo_cx, logo_y, "Just-Print.ie")
 
-    # Tagline: fully colored — each word in its own brand color.
-    # PRINT pink . DESIGN gold . SIGNAGE blue . &MORE... lime
-    tagline_y = logo_y - 5.5 * mm
-    canv.setFont("Helvetica-Bold", 8.5)
-    parts = [
-        ("PRINT", TAGLINE_PINK),
-        ("DESIGN", TAGLINE_GOLD),
-        ("SIGNAGE", TAGLINE_BLUE),
-        ("&MORE...", TAGLINE_LIME),
-    ]
-    dot_sep_w = 2.2 * mm   # visual space for the colored dot separator
-    total_w = sum(canv.stringWidth(t, "Helvetica-Bold", 8.5) for t, _ in parts)
-    total_w += dot_sep_w * (len(parts) - 1)
-    x = logo_cx - total_w / 2
-    for i, (txt, color) in enumerate(parts):
-        canv.setFillColor(color)
-        canv.drawString(x, tagline_y, txt)
-        x += canv.stringWidth(txt, "Helvetica-Bold", 8.5)
-        # Colored dot between words (use the next word's color as accent)
-        if i < len(parts) - 1:
-            next_color = parts[i + 1][1]
-            canv.setFillColor(next_color)
-            canv.circle(x + dot_sep_w / 2, tagline_y + 1.2 * mm, 0.7 * mm, fill=1, stroke=0)
-            x += dot_sep_w
+    logo_asset = _asset_or_none("logo")
+    if logo_asset is not None:
+        # Operator-supplied logo image. Width chosen to roughly match
+        # Justin's template; height auto-scales preserving aspect ratio.
+        lw = 60 * mm
+        iw, ih = logo_asset.getSize()
+        lh = lw * (ih / float(iw)) if iw else 14 * mm
+        canv.drawImage(
+            logo_asset,
+            logo_cx - lw / 2, logo_y - lh / 2,
+            width=lw, height=lh,
+            mask="auto", preserveAspectRatio=True,
+        )
+    else:
+        canv.setFillColor(NAVY)
+        canv.setFont("Helvetica-Bold", 24)
+        canv.drawCentredString(logo_cx, logo_y, "Just-Print.ie")
 
-    # ── Bottom-left decorative triangles ───────────────────────────
-    # Also bigger + more dramatic to mirror Justin's
-    _tri(PINK,    sidebar_w,           0,   sidebar_w + 35 * mm, 0,   sidebar_w,           35 * mm)
-    _tri(YELLOW,  sidebar_w + 20 * mm, 0,   sidebar_w + 50 * mm, 0,   sidebar_w + 20 * mm, 28 * mm)
-    _tri(BLUE,    sidebar_w + 40 * mm, 0,   sidebar_w + 62 * mm, 0,   sidebar_w + 40 * mm, 20 * mm)
+        # Tagline: each word in its own brand colour separated by dots.
+        # PRINT-pink . DESIGN-gold . SIGNAGE-blue . &MORE-lime
+        tagline_y = logo_y - 5.5 * mm
+        canv.setFont("Helvetica-Bold", 8.5)
+        parts = [
+            ("PRINT", TAGLINE_PINK),
+            ("DESIGN", TAGLINE_GOLD),
+            ("SIGNAGE", TAGLINE_BLUE),
+            ("&MORE...", TAGLINE_LIME),
+        ]
+        dot_sep_w = 2.2 * mm
+        total_w = sum(canv.stringWidth(t, "Helvetica-Bold", 8.5) for t, _ in parts)
+        total_w += dot_sep_w * (len(parts) - 1)
+        x = logo_cx - total_w / 2
+        for i, (txt, color) in enumerate(parts):
+            canv.setFillColor(color)
+            canv.drawString(x, tagline_y, txt)
+            x += canv.stringWidth(txt, "Helvetica-Bold", 8.5)
+            if i < len(parts) - 1:
+                next_color = parts[i + 1][1]
+                canv.setFillColor(next_color)
+                canv.circle(x + dot_sep_w / 2, tagline_y + 1.2 * mm, 0.7 * mm, fill=1, stroke=0)
+                x += dot_sep_w
+
+    # ── Bottom-left decorative artwork ────────────────────────────
+    # v36 — use the operator-supplied PNG if present, else fall back
+    # to drawn triangles. Anchored to bottom-left, just right of the
+    # orange sidebar.
+    bl_asset = _asset_or_none("corner_bottom_left")
+    if bl_asset is not None:
+        bl_w = 60 * mm
+        iw, ih = bl_asset.getSize()
+        bl_h = bl_w * (ih / float(iw)) if iw else bl_w
+        canv.drawImage(
+            bl_asset,
+            sidebar_w, 0,
+            width=bl_w, height=bl_h,
+            mask="auto", preserveAspectRatio=True,
+        )
+    else:
+        _tri(PINK,    sidebar_w,           0,   sidebar_w + 35 * mm, 0,   sidebar_w,           35 * mm)
+        _tri(YELLOW,  sidebar_w + 20 * mm, 0,   sidebar_w + 50 * mm, 0,   sidebar_w + 20 * mm, 28 * mm)
+        _tri(BLUE,    sidebar_w + 40 * mm, 0,   sidebar_w + 62 * mm, 0,   sidebar_w + 40 * mm, 20 * mm)
 
     # ── Footer block ──────────────────────────────────────────────
     # We draw from the bottom upward. The flowable frame stops above this.
@@ -478,7 +599,9 @@ def generate_quote_pdf(quote) -> bytes:
     # - left margin = sidebar (11mm) + breathing room (15mm)
     # - top margin leaves room for logo + tagline (~30mm)
     # - bottom margin leaves room for Terms + address + reg line (~95mm)
-    sidebar_w = 11 * mm
+    # v36 — wider orange sidebar (14mm) to fit the chat-bubble icon at
+    # the top. Frame margins follow.
+    sidebar_w = 14 * mm
     frame_left = sidebar_w + 15 * mm
     frame_right = 15 * mm
     frame_top = 30 * mm
