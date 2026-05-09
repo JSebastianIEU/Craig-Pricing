@@ -371,7 +371,11 @@ def migrate() -> None:
             "    manual_review_reason = :reason "
             "WHERE organization_slug = :org "
             "  AND key = :key "
-            "  AND COALESCE(manual_review_required, FALSE) = FALSE"
+            "  AND COALESCE(manual_review_required, FALSE) = FALSE "
+            # v37 — don't re-flip products that have moved to v36
+            # per_sqm / per_sheet strategies. See SQLite branch below
+            # for the full reasoning. Same fix, Postgres dialect.
+            "  AND COALESCE(pricing_strategy, '') NOT IN ('per_sqm', 'per_sheet')"
         )
     else:
         _SQL_FLIP_BY_KEY = (
@@ -380,7 +384,13 @@ def migrate() -> None:
             "    manual_review_reason = :reason "
             "WHERE organization_slug = :org "
             "  AND key = :key "
-            "  AND COALESCE(manual_review_required, 0) = 0"
+            "  AND COALESCE(manual_review_required, 0) = 0 "
+            # v37 — don't re-flip products that have moved to the v36
+            # per_sqm / per_sheet strategies. v36 added formulas so
+            # those products no longer NEED manual review; v34 keeps
+            # firing on every boot only because manual_review_required
+            # had been cleared by v37, which created a flip-flop.
+            "  AND COALESCE(pricing_strategy, '') NOT IN ('per_sqm', 'per_sheet')"
         )
 
     flipped = 0
