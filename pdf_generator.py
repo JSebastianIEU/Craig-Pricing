@@ -63,6 +63,11 @@ _ASSET_PATHS = {
     "corner_bottom_left": os.path.join(_ASSET_DIR, "quote-corner-bottom-left.png"),
     "payment_cards":      os.path.join(_ASSET_DIR, "quote-payment-cards.png"),
     "logo":               os.path.join(_ASSET_DIR, "quote-logo.png"),
+    # v36c — operator-supplied QUOTATION sidebar rectangle (orange tile
+    # with chat-bubble icon + rotated 'QUOTATION' text). When present
+    # we drop it as a discrete rectangle in the top-left instead of
+    # painting a full-page orange strip + drawn primitives.
+    "quotation_sidebar":  os.path.join(_ASSET_DIR, "quotation-sidebar-chatbubble.png"),
 }
 
 
@@ -88,14 +93,12 @@ ORANGE = HexColor("#f37021")
 MID_GREY = HexColor("#888888")
 BORDER_GREY = HexColor("#cccccc")
 
-# v36 — table header colours matching Justin's canonical Quote Template
-# (Quote 1519487-style PDF). The base header is lime-green and the PRICE
-# column gets a blue-pop, both with white text. These ARE Just Print's
-# brand colours from the tagline (PRINT-pink / DESIGN-gold / SIGNAGE-blue
-# / &MORE-lime); the template wins by using lime+blue rather than the
-# pink-on-navy our v1 spec assumed.
-TABLE_HEADER_BG = HexColor("#a8c01f")    # lime-green header
-TABLE_HEADER_PRICE_BG = HexColor("#1ea8d4")  # blue-pop on PRICE column
+# v36c — table header colour. Justin's canonical template uses a
+# uniform dark-grey header bar (no per-column accent), white text.
+# We keep TABLE_HEADER_PRICE_BG defined for backwards compat but
+# point it at the same grey so the visual ends up uniform.
+TABLE_HEADER_BG = HexColor("#3a3a3a")        # dark charcoal grey
+TABLE_HEADER_PRICE_BG = HexColor("#3a3a3a")  # same — no PRICE accent
 
 # Tagline colors — use DARKER alternates for words that would be unreadable
 # on white at small sizes (pure yellow vanishes). These are still brand-
@@ -238,40 +241,63 @@ def _draw_page_frame(canv, doc):
     # Quote Template. The bubble is drawn with primitives (white circle
     # with three dark dots inside, in the same style as a chat-message
     # icon). The QUOTATION text is rotated 90° and centered vertically.
-    sidebar_w = 14 * mm
-    canv.setFillColor(ORANGE)
-    canv.rect(0, 0, sidebar_w, page_h, fill=1, stroke=0)
+    # v36d — sidebar bumped to 18mm wide so the QUOTATION rectangle
+    # has the visual presence of Justin's canonical template (taller +
+    # wider). Aspect ratio of the supplied PNG drives the height.
+    sidebar_w = 18 * mm
 
-    # Chat-bubble icon at top of sidebar — Justin's template uses a
-    # white speech-bubble with three dots, anchored ~10mm from the top.
-    bubble_cx = sidebar_w / 2
-    bubble_cy = page_h - 12 * mm
-    bubble_r = 4.5 * mm
-    canv.setFillColor(white)
-    canv.circle(bubble_cx, bubble_cy, bubble_r, fill=1, stroke=0)
-    # Speech-bubble tail — small triangle pointing down-right
-    p = canv.beginPath()
-    p.moveTo(bubble_cx + 1.5 * mm, bubble_cy - bubble_r + 0.2 * mm)
-    p.lineTo(bubble_cx + 4.5 * mm, bubble_cy - bubble_r - 1.5 * mm)
-    p.lineTo(bubble_cx + 3.0 * mm, bubble_cy - bubble_r - 0.5 * mm)
-    p.close()
-    canv.drawPath(p, fill=1, stroke=0)
-    # Three dots inside the bubble — dark-orange / black to read on white
-    canv.setFillColor(NAVY)
-    dot_r = 0.7 * mm
-    canv.circle(bubble_cx - 2 * mm, bubble_cy, dot_r, fill=1, stroke=0)
-    canv.circle(bubble_cx,           bubble_cy, dot_r, fill=1, stroke=0)
-    canv.circle(bubble_cx + 2 * mm, bubble_cy, dot_r, fill=1, stroke=0)
+    # v36c — operator-supplied PNG drops the discrete QUOTATION
+    # rectangle into the top-left. We anchor at the top edge and let
+    # the image's natural height determine how far down it extends
+    # (typically ~150mm for the supplied artwork at 18mm width).
+    # When no asset exists, fall through to the legacy full-page
+    # primitives below.
+    sidebar_asset = _asset_or_none("quotation_sidebar")
+    if sidebar_asset is not None:
+        iw, ih = sidebar_asset.getSize()
+        sidebar_h = sidebar_w * (ih / float(iw)) if iw else 100 * mm
+        canv.drawImage(
+            sidebar_asset,
+            0, page_h - sidebar_h,
+            width=sidebar_w, height=sidebar_h,
+            mask="auto", preserveAspectRatio=True,
+        )
+        # Skip the primitive sidebar drawing below — we're done.
+        _SIDEBAR_DRAWN_FROM_ASSET = True
+    else:
+        _SIDEBAR_DRAWN_FROM_ASSET = False
 
-    # "QUOTATION" rotated text — heavier weight + larger, positioned
-    # roughly centered on the page (a bit above mid-height like Justin's).
-    canv.setFillColor(white)
-    canv.setFont("Helvetica-Bold", 22)
-    canv.saveState()
-    canv.translate(sidebar_w / 2 + 3 * mm, page_h * 0.50)
-    canv.rotate(90)
-    canv.drawString(0, 0, "QUOTATION")
-    canv.restoreState()
+    if not _SIDEBAR_DRAWN_FROM_ASSET:
+        canv.setFillColor(ORANGE)
+        canv.rect(0, 0, sidebar_w, page_h, fill=1, stroke=0)
+
+    if not _SIDEBAR_DRAWN_FROM_ASSET:
+        # Chat-bubble icon at top of sidebar — only used when the
+        # asset PNG is absent. White speech-bubble with three dots.
+        bubble_cx = sidebar_w / 2
+        bubble_cy = page_h - 12 * mm
+        bubble_r = 4.5 * mm
+        canv.setFillColor(white)
+        canv.circle(bubble_cx, bubble_cy, bubble_r, fill=1, stroke=0)
+        p = canv.beginPath()
+        p.moveTo(bubble_cx + 1.5 * mm, bubble_cy - bubble_r + 0.2 * mm)
+        p.lineTo(bubble_cx + 4.5 * mm, bubble_cy - bubble_r - 1.5 * mm)
+        p.lineTo(bubble_cx + 3.0 * mm, bubble_cy - bubble_r - 0.5 * mm)
+        p.close()
+        canv.drawPath(p, fill=1, stroke=0)
+        canv.setFillColor(NAVY)
+        dot_r = 0.7 * mm
+        canv.circle(bubble_cx - 2 * mm, bubble_cy, dot_r, fill=1, stroke=0)
+        canv.circle(bubble_cx,           bubble_cy, dot_r, fill=1, stroke=0)
+        canv.circle(bubble_cx + 2 * mm, bubble_cy, dot_r, fill=1, stroke=0)
+
+        canv.setFillColor(white)
+        canv.setFont("Helvetica-Bold", 22)
+        canv.saveState()
+        canv.translate(sidebar_w / 2 + 3 * mm, page_h * 0.50)
+        canv.rotate(90)
+        canv.drawString(0, 0, "QUOTATION")
+        canv.restoreState()
 
     # ── Top-right decorative artwork ──────────────────────────────────
     # v36 — if the operator dropped the real brand PNG at
@@ -286,10 +312,11 @@ def _draw_page_frame(canv, doc):
 
     tr_asset = _asset_or_none("corner_top_right")
     if tr_asset is not None:
-        # Anchor at top-right corner. Width chosen to roughly match
-        # Justin's template (~80mm wide). preserveAspectRatio keeps the
-        # vector composition intact regardless of source dimensions.
-        tr_w = 85 * mm
+        # v36e — 65mm wide. The 85mm version was too dominant and
+        # crowded the logo. 65mm sits cleanly in the corner, leaves
+        # room for a slightly narrower logo to the left, and
+        # matches the visual weight of the sidebar QUOTATION.
+        tr_w = 65 * mm
         iw, ih = tr_asset.getSize()
         tr_h = tr_w * (ih / float(iw)) if iw else tr_w
         canv.drawImage(
@@ -318,16 +345,16 @@ def _draw_page_frame(canv, doc):
              tr_right - 5 * mm,  tr_top)
 
     # ── Logo + tagline ──────────────────────────────────────────────
-    # v36 — use static/images/quote-logo.png when present, else draw
-    # the text fallback. Anchored top-left of the content area.
-    logo_cx = (sidebar_w + page_w) / 2 - 20 * mm
+    # v36e — logo width 75mm (was 90mm — slightly tighter so it
+    # doesn't fight with the corner triangles). Centre point pulled
+    # ~35mm left of mid-content so the logo sits LEFT of where the
+    # top-right triangles begin (~145mm from page-left).
+    logo_cx = (sidebar_w + page_w) / 2 - 35 * mm
     logo_y = page_h - 22 * mm
 
     logo_asset = _asset_or_none("logo")
     if logo_asset is not None:
-        # Operator-supplied logo image. Width chosen to roughly match
-        # Justin's template; height auto-scales preserving aspect ratio.
-        lw = 60 * mm
+        lw = 85 * mm
         iw, ih = logo_asset.getSize()
         lh = lw * (ih / float(iw)) if iw else 14 * mm
         canv.drawImage(
@@ -371,12 +398,18 @@ def _draw_page_frame(canv, doc):
     # orange sidebar.
     bl_asset = _asset_or_none("corner_bottom_left")
     if bl_asset is not None:
-        bl_w = 60 * mm
+        # v36c — anchored at the very LEFT edge (x=0) so the triangles
+        # extend all the way to the page border without leaving a
+        # white margin between them and the edge. The QUOTATION
+        # sidebar PNG only covers the top ~110mm so the triangles at
+        # y=0 don't overlap it. 50mm wide for a slightly more
+        # dramatic visual presence (matches Justin's template).
+        bl_w = 50 * mm
         iw, ih = bl_asset.getSize()
         bl_h = bl_w * (ih / float(iw)) if iw else bl_w
         canv.drawImage(
             bl_asset,
-            sidebar_w, 0,
+            0, 0,
             width=bl_w, height=bl_h,
             mask="auto", preserveAspectRatio=True,
         )
@@ -387,54 +420,113 @@ def _draw_page_frame(canv, doc):
 
     # ── Footer block ──────────────────────────────────────────────
     # We draw from the bottom upward. The flowable frame stops above this.
-    content_left = sidebar_w + 15 * mm
+    # v36e — content_left tightened (5mm gap past sidebar, was 15mm) so
+    # the main content block reads as visually centred on the page
+    # rather than shifted right by the orange QUOTATION sidebar.
+    content_left = sidebar_w + 5 * mm
 
-    # Contact line + address + reg/VAT (at the very bottom)
-    canv.setFillColor(NAVY)
+    # Contact line + address bar + reg/VAT (bottom of page)
+    # v36c — three layers, matching Justin's canonical Quote Template:
+    #   1. Contact line (y=22mm) with PINK T:/E:/W: labels and NAVY values
+    #   2. Black bar (y=10-19mm) with white address text
+    #   3. COMPANY REG / VAT line (y=5mm) tiny grey on white
+    contact_cx = (sidebar_w + page_w) / 2
+    # v36e — footer_left ONLY applies to the TERMS AND CONDITIONS
+    # block (modest shift so it clears the bottom-left triangle but
+    # the long bullet lines don't run off the page). All other footer
+    # items (Retention, Credit, payment row, IBAN/BIC) sit at
+    # content_left; T/E/W + address are centred; COMPANY REG is
+    # right-aligned — matching Justin's canonical template.
+    footer_left = content_left + 18 * mm
+
+    # 1. Contact line — T pink / E blue / W lime, matching Justin's
+    # canonical template. The three labels are clearly distinct at
+    # small sizes and align with the brand-tagline colour palette.
+    contact_y = 38 * mm
+    parts = [
+        ("T: ",                  PINK),    # magenta
+        (COMPANY_PHONE,           NAVY),
+        ("    E: ",              BLUE),    # cyan-blue
+        (COMPANY_EMAIL,           NAVY),
+        ("    W: ",              TAGLINE_LIME),  # yellow-green / lime
+        (COMPANY_WEB,             NAVY),
+    ]
     canv.setFont("Helvetica-Bold", 10)
-    canv.drawCentredString(page_w / 2 + sidebar_w / 2, 18 * mm,
-                           f"T: {COMPANY_PHONE}    E: {COMPANY_EMAIL}    W: {COMPANY_WEB}")
-    canv.setFont("Helvetica", 8.5)
-    canv.drawCentredString(page_w / 2 + sidebar_w / 2, 13 * mm, COMPANY_ADDRESS)
-    canv.setFont("Helvetica", 6.5)
-    canv.setFillColor(MID_GREY)
-    canv.drawCentredString(page_w / 2 + sidebar_w / 2, 9 * mm,
-                           f"COMPANY REG. No. {COMPANY_REG}    VAT No. {COMPANY_VAT}")
+    total_w = sum(canv.stringWidth(t, "Helvetica-Bold", 10) for t, _ in parts)
+    # v36e — contact line RIGHT-aligned to the right margin (matches
+    # the canonical template where T/E/W, address and COMPANY REG all
+    # end at the same right edge — the end of the divider line).
+    contact_right = page_w - 15 * mm
+    x = contact_right - total_w
+    for txt, color in parts:
+        canv.setFillColor(color)
+        canv.drawString(x, contact_y, txt)
+        x += canv.stringWidth(txt, "Helvetica-Bold", 10)
 
-    # Retention of Title + Credit Accounts  (top of footer zone)
+    # 2. Address line — plain text on white, centred. Width measured
+    # below so the separator above it can align with where the
+    # address actually starts (not the page margin).
+    addr_font_size = 10
+
+    # 3. Thin separator line above the address — RIGHT-aligned, with
+    # its right edge at the same right margin as the contact line so
+    # everything in the bottom-right block reads as one column.
+    addr_w = canv.stringWidth(COMPANY_ADDRESS, "Helvetica", addr_font_size)
+    canv.setStrokeColor(black)
+    canv.setLineWidth(0.5)
+    canv.line(contact_right - total_w, 33 * mm, contact_right, 33 * mm)
+
+    # Address text — RIGHT-aligned at the right margin.
+    canv.setFillColor(NAVY)
+    canv.setFont("Helvetica", addr_font_size)
+    canv.drawRightString(contact_right, 27 * mm, COMPANY_ADDRESS)
+
+    # 4. COMPANY REG / VAT — RIGHT-aligned at the right margin
+    # (matches the canonical placement and the rest of the column).
+    canv.setFillColor(MID_GREY)
+    canv.setFont("Helvetica", 6.5)
+    canv.drawRightString(contact_right, 21 * mm,
+                         f"COMPANY REG. No. {COMPANY_REG}    VAT No. {COMPANY_VAT}")
+
+    # v36b — footer block pushed up ~20mm so the bottom-left triangle
+    # asset (anchored at y=0, ~45mm tall) doesn't overlap the T&Cs.
+
+    # Retention of Title + Credit Accounts  (top of footer zone),
+    # pushed down so the table can use more of the page.
     canv.setFillColor(black)
     canv.setFont("Helvetica", 7.5)
-    canv.drawString(content_left, 85 * mm,
+    canv.drawString(content_left, 98 * mm,
                     "Retention of Title: The property of the goods shall not pass to the purchaser until payment is made in full")
     canv.setFont("Helvetica-Bold", 7.5)
-    canv.drawString(content_left, 80 * mm,
+    canv.drawString(content_left, 93 * mm,
                     "Credit Accounts Strictly 30 Days from Receipt of Invoice")
 
-    # Payment methods line + real card icons (VISA / Mastercard / Laser)
-    # Icons drawn at y=67 (height 8mm → top at 75mm), 5mm below the Credit
-    # Accounts line at 80mm so they don't overlap.
+    # Payment cards row — at content_left, BELOW the labels above.
+    _draw_payment_icons(canv, content_left, 80 * mm)
+
+    # IBAN / BIC stacked to the right of the payment block — IBAN
+    # aligned with the top of the cards row, BIC underneath.
+    iban_x = content_left + 70 * mm
+    canv.setFont("Helvetica-Bold", 7.5)
+    canv.setFillColor(NAVY)
+    canv.drawString(iban_x, 87 * mm, "IBAN:")
+    canv.drawString(iban_x, 82 * mm, "BIC:")
     canv.setFillColor(black)
     canv.setFont("Helvetica", 7.5)
-    canv.drawString(content_left, 72 * mm, "We also accept payment via:")
-    _text_w = canv.stringWidth("We also accept payment via:", "Helvetica", 7.5)
-    _draw_payment_icons(canv, content_left + _text_w + 3 * mm, 67 * mm)
+    canv.drawString(iban_x + 12 * mm, 87 * mm, COMPANY_IBAN)
+    canv.drawString(iban_x + 12 * mm, 82 * mm, COMPANY_BIC)
 
-    # IBAN / BIC below icons
-    canv.setFillColor(black)
-    canv.setFont("Helvetica-Bold", 7.5)
-    canv.drawString(content_left, 59 * mm,
-                    f"IBAN:  {COMPANY_IBAN}      BIC:  {COMPANY_BIC}")
-
-    # Terms and Conditions block
+    # Terms and Conditions — tight 3.3mm line height to look like
+    # Justin's template (was 2.5mm, felt cramped).
     canv.setFillColor(NAVY)
     canv.setFont("Helvetica-Bold", 7.5)
-    canv.drawString(content_left, 52 * mm, "TERMS AND CONDITIONS")
+    canv.drawString(footer_left, 68 * mm, "TERMS AND CONDITIONS")
     canv.setFillColor(black)
-    canv.setFont("Helvetica", 6.5)
-    y = 49 * mm
+    canv.setFont("Helvetica", 7)
+    y = 64 * mm
     for bullet in TERMS_BULLETS:
-        canv.drawString(content_left + 2 * mm, y, f"\u2022  {bullet}")
-        y -= 2.5 * mm
+        canv.drawString(footer_left + 2 * mm, y, f"\u2022  {bullet}")
+        y -= 3.0 * mm
 
 
 # ─────────────────── product description builder ───────────────────
@@ -599,13 +691,18 @@ def generate_quote_pdf(quote) -> bytes:
     # - left margin = sidebar (11mm) + breathing room (15mm)
     # - top margin leaves room for logo + tagline (~30mm)
     # - bottom margin leaves room for Terms + address + reg line (~95mm)
-    # v36 — wider orange sidebar (14mm) to fit the chat-bubble icon at
-    # the top. Frame margins follow.
-    sidebar_w = 14 * mm
-    frame_left = sidebar_w + 15 * mm
+    # v36f — frame_top 65mm: Job Reference row pulled higher up the
+    # page (was 80, still felt too far below the logo). With the
+    # 65mm triangles + 85mm logo, content can comfortably start
+    # at y=page_h-65mm without overlap.
+    sidebar_w = 18 * mm
+    # v36e — frame_left tightened to 5mm past the sidebar (was 15mm)
+    # so the main content block sits visually centred on the page
+    # rather than shifted right by the orange QUOTATION sidebar.
+    frame_left = sidebar_w + 5 * mm
     frame_right = 15 * mm
-    frame_top = 30 * mm
-    frame_bottom = 92 * mm
+    frame_top = 65 * mm
+    frame_bottom = 105 * mm
 
     doc = BaseDocTemplate(
         buf, pagesize=A4,
@@ -654,6 +751,19 @@ def generate_quote_pdf(quote) -> bytes:
                 cust_email = (conv.customer_email or "").strip()
                 cust_phone = (conv.customer_phone or "").strip()
 
+    # v36e — fall back to fields on the Quote row itself (some sources,
+    # like the Missive integration + form quotes, set these directly
+    # without a Conversation). Only fill the slots conversation lookup
+    # left empty.
+    if not cust_name:
+        cust_name = (getattr(quote, "customer_name", None) or "").strip()
+    if not cust_email:
+        cust_email = (getattr(quote, "customer_email", None) or "").strip()
+    if not cust_phone:
+        cust_phone = (getattr(quote, "customer_phone", None) or "").strip()
+    if not cust_company:
+        cust_company = (getattr(quote, "customer_company", None) or "").strip()
+
     # ── Job reference line (top of the flowable area) ──
     product_name_short = (quote.product_key or "").replace("_", " ").title()
     job_ref_text = f"{specs.get('quantity', '')} {product_name_short}".strip()
@@ -663,35 +773,83 @@ def generate_quote_pdf(quote) -> bytes:
         else datetime.now().strftime("%d/%m/%Y")
     )
 
-    # Header: left col has Job Ref / Date / To / Company, right col has Ref / Tel / Email
+    # Header: split into TWO tables to match Justin's canonical layout.
+    # First table is just the Job Reference row (full-width, with Ref
+    # right-aligned). Spacer. Second table has Date/To/Company on
+    # the left and Tel/Email on the right.
     def _line(label, value):
         if not value:
             value = ""
         return f"<b>{label}</b> {value}"
 
-    header_rows = [
-        [Paragraph(_line("Job Reference:", job_ref_text), body_style),
-         Paragraph(_line("Ref:", ref_str), body_style)],
-        [Paragraph(_line("Date:", date_str), body_style),
-         Paragraph(_line("Tel:", cust_phone), body_style)],
-        [Paragraph(_line("To:", cust_name), body_style),
-         Paragraph(_line("Email:", cust_email), body_style)],
-    ]
-    if cust_company:
-        header_rows.append([Paragraph(_line("Company:", cust_company), body_style), ""])
-
-    header_tbl = Table(
-        header_rows,
-        colWidths=[content_w * 0.58, content_w * 0.42],
+    body_right_style = ParagraphStyle(
+        "BodyR", parent=body_style, alignment=TA_RIGHT,
     )
-    header_tbl.setStyle(TableStyle([
+
+    # ── 1. Job Reference row ─────────────────────────────────────────
+    job_ref_table = Table(
+        [[
+            Paragraph(_line("Job Reference:", job_ref_text), body_style),
+            Paragraph(_line("Ref:", ref_str), body_right_style),
+        ]],
+        colWidths=[content_w * 0.7, content_w * 0.3],
+    )
+    job_ref_table.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
         ("RIGHTPADDING", (0, 0), (-1, -1), 0),
         ("TOPPADDING", (0, 0), (-1, -1), 1.5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
     ]))
-    elements.append(header_tbl)
+    elements.append(job_ref_table)
+    elements.append(Spacer(1, 8 * mm))
+
+    # ── 2. Date / To / Company  +  Tel / Email ──────────────────────
+    # v36f — 4-column layout (label | value | label | value) so the
+    # VALUES align vertically regardless of label width. With the
+    # old 2-column "<b>label</b> value" approach, "Company:" pushed
+    # its value further right than "Date:", so each row's value
+    # started at a different x.
+    label_style = ParagraphStyle(
+        "Label", parent=body_style, fontName="Helvetica-Bold",
+    )
+    value_style = body_style
+
+    def _lbl(t):
+        return Paragraph(t, label_style)
+
+    def _val(t):
+        return Paragraph(t or "", value_style)
+
+    contact_rows = [
+        [_lbl("Date:"),  _val(date_str),  _lbl("Tel:"),   _val(cust_phone)],
+        [_lbl("To:"),    _val(cust_name), _lbl("Email:"), _val(cust_email)],
+    ]
+    if cust_company:
+        contact_rows.append([
+            _lbl("Company:"), _val(cust_company), "", "",
+        ])
+
+    contact_tbl = Table(
+        contact_rows,
+        # Left label fixed wide enough for "Company:" so values align;
+        # right label fixed wide enough for "Email:". Remaining width
+        # split between the two value columns.
+        colWidths=[
+            22 * mm,                                    # left label
+            content_w * 0.58 - 22 * mm,                 # left value
+            18 * mm,                                    # right label
+            content_w * 0.42 - 18 * mm,                 # right value
+        ],
+    )
+    contact_tbl.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+    ]))
+    elements.append(contact_tbl)
     elements.append(Spacer(1, 6 * mm))
 
     # ── Main pricing table — iterates every quote in the conversation ──
@@ -799,25 +957,33 @@ def generate_quote_pdf(quote) -> bytes:
             content_w * 0.18,   # TOTAL
         ],
     )
+    # v36d — table styling per user feedback:
+    #   - body cells get a soft light-grey background
+    #   - borders set to WHITE with a wider line so the cells appear
+    #     to "float" with white gaps between them (modern card-table
+    #     look, matching Justin's canonical layout).
+    BODY_CELL_BG = HexColor("#f1f1f1")
     style_cmds = [
-        # Header row — v36 matches Justin's canonical Quote Template:
-        # lime-green base + blue pop on PRICE column. White text on
-        # both. Brand colours from the Just-Print tagline.
+        # Header row — uniform dark grey, white text (v36c).
         ("BACKGROUND", (0, 0), (-1, 0), TABLE_HEADER_BG),
         ("BACKGROUND", (2, 0), (2, 0), TABLE_HEADER_PRICE_BG),
         ("VALIGN", (0, 0), (-1, 0), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, 0), 3 * mm),
         ("BOTTOMPADDING", (0, 0), (-1, 0), 3 * mm),
-        # Body rows
+        # Body rows: soft light-grey fill so the WHITE borders read as
+        # visual gaps between cells. Without the fill, white borders
+        # on a white page would be invisible.
+        ("BACKGROUND", (0, 1), (-1, -1), BODY_CELL_BG),
         ("VALIGN", (0, 1), (-1, -1), "TOP"),
-        ("TOPPADDING", (0, 1), (-1, -1), 3.5 * mm),
-        ("BOTTOMPADDING", (0, 1), (-1, -1), 3.5 * mm),
-        # Padding on both axes
-        ("LEFTPADDING", (0, 0), (-1, -1), 3 * mm),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 3 * mm),
-        # Thin grid
-        ("BOX", (0, 0), (-1, -1), 0.4, BORDER_GREY),
-        ("LINEBELOW", (0, 0), (-1, -2), 0.4, BORDER_GREY),
+        ("TOPPADDING", (0, 1), (-1, -1), 4.5 * mm),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 4.5 * mm),
+        # Padding
+        ("LEFTPADDING", (0, 0), (-1, -1), 4 * mm),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4 * mm),
+        # WHITE borders, wider line — creates the "floating card"
+        # effect between cells the user asked for.
+        ("BOX", (0, 0), (-1, -1), 2.0, white),
+        ("INNERGRID", (0, 0), (-1, -1), 2.0, white),
     ]
     if has_multiple_lines:
         # Subtle background on the grand-total row
