@@ -61,6 +61,15 @@ ORANGE = HexColor("#f37021")
 MID_GREY = HexColor("#888888")
 BORDER_GREY = HexColor("#cccccc")
 
+# v36 — table header colours matching Justin's canonical Quote Template
+# (Quote 1519487-style PDF). The base header is lime-green and the PRICE
+# column gets a blue-pop, both with white text. These ARE Just Print's
+# brand colours from the tagline (PRINT-pink / DESIGN-gold / SIGNAGE-blue
+# / &MORE-lime); the template wins by using lime+blue rather than the
+# pink-on-navy our v1 spec assumed.
+TABLE_HEADER_BG = HexColor("#a8c01f")    # lime-green header
+TABLE_HEADER_PRICE_BG = HexColor("#1ea8d4")  # blue-pop on PRICE column
+
 # Tagline colors — use DARKER alternates for words that would be unreadable
 # on white at small sizes (pure yellow vanishes). These are still brand-
 # family but stay legible in print + PDF viewers.
@@ -309,41 +318,94 @@ def _draw_page_frame(canv, doc):
 
 # ─────────────────── product description builder ───────────────────
 
-def _build_description(quote) -> str:
-    """Turn a Quote row into a human-readable product description for the table."""
+def _build_description(quote, product=None) -> str:
+    """Turn a Quote row into a human-readable product description for the table.
+
+    v36 — when `product` (the Product DB row) is supplied AND has a
+    non-empty `description`, that description is used as the spec
+    line under the bold product name. This is Justin's "knowledge
+    base" surface — what he edits in Catalog → Products → Description
+    is what appears verbatim on the customer's quote PDF, matching
+    his canonical Quote 1519487 template ('85x55mm printed full
+    colour both sides on 350gsm silk').
+
+    Falls back to the legacy hardcoded specs when:
+      - no Product row is passed, or
+      - Product.description is null/empty
+    so test fixtures + tenants who haven't filled in descriptions
+    still get a sensible PDF.
+
+    The product NAME (first line) is always rendered bold via <b>...</b>.
+    Subsequent lines are plain. Dimensions in the request specs (v36
+    width_mm/height_mm/area_sqm for per-sq/m + per-sheet products)
+    get appended on their own line so the operator + customer see
+    exactly what was priced.
+    """
     specs = quote.specs or {}
     product_key = quote.product_key or ""
-    qty = specs.get("quantity")
 
+    # v36 — prefer the operator-edited description from the catalog.
+    if product is not None:
+        name = (getattr(product, "name", None) or product_key.replace("_", " ").title()).strip()
+        desc = (getattr(product, "description", None) or "").strip()
+        if desc:
+            lines = [f"<b>{name}</b>", desc]
+            # Append per-quote spec details (sides, finish, dimensions)
+            # below the catalog description so the customer sees the
+            # specifics of THIS order without hand-editing the catalog
+            # description on every variation.
+            spec_extras: list[str] = []
+            if specs.get("double_sided") is True:
+                spec_extras.append("Printed both sides")
+            elif specs.get("double_sided") is False and "double_sided" in specs:
+                spec_extras.append("Printed one side")
+            finish = specs.get("finish")
+            if finish:
+                spec_extras.append(str(finish).replace("-", " ").replace("_", " ").title())
+            # v36 — dimensions captured by the per-sqm / per-sheet engine
+            w = specs.get("width_mm")
+            h = specs.get("height_mm")
+            area = specs.get("area_sqm")
+            if w and h:
+                spec_extras.append(f"Size: {w} × {h} mm")
+            elif area:
+                spec_extras.append(f"Area: {area} m²")
+            if spec_extras:
+                lines.append(" · ".join(spec_extras))
+            return "<br/>".join(lines)
+
+    # ── Legacy fallback path ────────────────────────────────────────
+    # Used when no Product row is available (test fixtures) OR when
+    # the Product row exists but description is empty.
     lines: list[str] = []
 
     if "business_cards" in product_key:
-        lines.append("Business Cards")
+        lines.append("<b>Business Cards</b>")
         lines.append("85x55mm printed full colour")
         if specs.get("finish"):
             lines.append(f"{specs['finish'].replace('-', ' ').title()} finish, 400gsm silk")
         lines.append("Double-sided" if specs.get("double_sided") else "Single-sided")
     elif product_key.startswith("flyers_"):
         size = product_key.split("_")[1].upper()
-        lines.append(f"{size} flyers")
+        lines.append(f"<b>{size} flyers</b>")
         if specs.get("finish"):
             lines.append(f"170gsm {specs['finish'].replace('-', ' ')}")
         lines.append("Printed both sides" if specs.get("double_sided") else "Printed one side")
     elif "brochures" in product_key:
-        lines.append("A4 Brochure (folds to A5/DL)")
+        lines.append("<b>A4 Brochure (folds to A5/DL)</b>")
         if specs.get("finish"):
             lines.append(f"170gsm {specs['finish'].replace('-', ' ')}, bi-fold")
     elif "compliment_slips" in product_key:
-        lines.append("Compliment Slips")
+        lines.append("<b>Compliment Slips</b>")
         lines.append("DL (210x99mm), 120gsm uncoated")
         lines.append("Double-sided" if specs.get("double_sided") else "Single-sided")
     elif "letterheads" in product_key:
-        lines.append("Letterheads")
+        lines.append("<b>Letterheads</b>")
         lines.append("A4, 120gsm uncoated bond")
         lines.append("Double-sided" if specs.get("double_sided") else "Single-sided")
     elif "ncr_pads" in product_key:
         size = "A5" if "a5" in product_key else "A4"
-        lines.append(f"NCR Pads {size}")
+        lines.append(f"<b>NCR Pads {size}</b>")
         lines.append("Perforated & stitched, 50 sets per book")
         if specs.get("finish"):
             lines.append(specs["finish"].title())
@@ -352,14 +414,23 @@ def _build_description(quote) -> str:
         binding = (specs.get("binding") or "").replace("_", " ").title()
         pages = specs.get("pages")
         cover = (specs.get("cover_type") or "").replace("_", " ").title()
-        lines.append(f"{fmt} Booklet — {binding}")
+        lines.append(f"<b>{fmt} Booklet — {binding}</b>")
         if pages:
             lines.append(f"{pages}pp")
         if cover:
             lines.append(f"{cover}")
     else:
         # Large-format or unknown — fall back to prettified key
-        lines.append((product_key or "Item").replace("_", " ").title())
+        lines.append(f"<b>{(product_key or 'Item').replace('_', ' ').title()}</b>")
+
+    # v36 — append dimensions on the legacy path too, when present
+    w = specs.get("width_mm")
+    h = specs.get("height_mm")
+    area = specs.get("area_sqm")
+    if w and h:
+        lines.append(f"Size: {w} × {h} mm")
+    elif area:
+        lines.append(f"Area: {area} m²")
 
     return "<br/>".join(lines)
 
@@ -521,13 +592,31 @@ def generate_quote_pdf(quote) -> bytes:
     total_vat = 0.0
     total_inc = 0.0
 
+    # v36 \u2014 preload products by key so each row can show the operator-
+    # edited Catalog description verbatim. We keep this in a small
+    # dict keyed by product_key to avoid an N+1 SELECT inside the loop.
+    from db.models import Product as _Product
+    products_by_key: dict = {}
+    if sess is not None:
+        keys = sorted({q.product_key for q in all_quotes if q.product_key})
+        if keys:
+            org = quote.organization_slug
+            for p in (
+                sess.query(_Product)
+                .filter(_Product.organization_slug == org)
+                .filter(_Product.key.in_(keys))
+                .all()
+            ):
+                products_by_key[p.key] = p
+
     # One row per Quote row + one extra row if it carries artwork.
     for q in all_quotes:
         q_specs = q.specs or {}
         q_qty = int(q_specs.get("quantity", 1)) if q_specs.get("quantity") else 1
+        prod = products_by_key.get(q.product_key)
 
         rows.append([
-            Paragraph(_build_description(q), cell_style),
+            Paragraph(_build_description(q, product=prod), cell_style),
             Paragraph(str(q_qty), cell_center),
             Paragraph(f"\u20ac{q.final_price_ex_vat:.2f}", cell_right),
             Paragraph(f"\u20ac{q.vat_amount:.2f}", cell_right),
@@ -588,9 +677,11 @@ def generate_quote_pdf(quote) -> bytes:
         ],
     )
     style_cmds = [
-        # Header row
-        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-        ("BACKGROUND", (2, 0), (2, 0), PINK),   # pink pop on the PRICE column header
+        # Header row — v36 matches Justin's canonical Quote Template:
+        # lime-green base + blue pop on PRICE column. White text on
+        # both. Brand colours from the Just-Print tagline.
+        ("BACKGROUND", (0, 0), (-1, 0), TABLE_HEADER_BG),
+        ("BACKGROUND", (2, 0), (2, 0), TABLE_HEADER_PRICE_BG),
         ("VALIGN", (0, 0), (-1, 0), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, 0), 3 * mm),
         ("BOTTOMPADDING", (0, 0), (-1, 0), 3 * mm),
