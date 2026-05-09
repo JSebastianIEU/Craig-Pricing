@@ -1859,17 +1859,27 @@ def _replay_craig_on_engagement_approval(
                 "error": f"missive_draft_failed: {type(e).__name__}: {e}",
             }
         # v37.5 — log Missive's response so we can tell if it honoured
-        # the send=True flag or kept it as a draft. The .drafts object
-        # carries id, send (bool), sent_at, deleted, etc. — anything
-        # other than send=True + a recent sent_at means we have a
-        # delivery problem at the Missive layer (account misconfig,
-        # missing SMTP, etc.) rather than a Craig bug.
+        # the send=True flag or kept it as a draft.
         try:
             drafts_resp = (mresp or {}).get("drafts") if isinstance(mresp, dict) else mresp
         except Exception:
             drafts_resp = None
         _log(f"Missive response: drafts={drafts_resp!r}")
         _log(f"OK Missive draft posted+sent (reply_len={len(proposed_reply)})")
+
+        # v37.6 — persist the post so a second Approve click is a no-op.
+        # Even if the commit below races/fails, the dashboard's status
+        # flip to engagement_approved already happened above.
+        try:
+            classification["missive_drafted_at"] = datetime.utcnow().isoformat(timespec="seconds")
+            classification["missive_draft_id"] = (
+                (drafts_resp or {}).get("id") if isinstance(drafts_resp, dict) else None
+            )
+            conv.engagement_classification = classification
+            db.commit()
+        except Exception as commit_err:
+            db.rollback()
+            _log(f"WARN failed to persist missive_drafted_at: {commit_err}")
 
         # If a quote was queued at Tier-2 time, fire the v33 approval
         # notification now (the webhook deliberately suppressed it
@@ -2014,8 +2024,28 @@ def approve_engagement(
             detail=f"cannot approve engagement on status={conv.status!r}",
         )
 
-    # Record who approved + when in the JSON blob.
+    # v37.6 — strong idempotency. If a successful Missive draft was
+    # already posted for this conversation, NEVER re-post on a second
+    # click (browser retry, double-click, dashboard refresh) — that
+    # would send the same email twice to the customer. Gate on
+    # `missive_drafted_at` which the helper sets after the post
+    # succeeds.
     classification = dict(conv.engagement_classification or {})
+    if classification.get("missive_drafted_at"):
+        return {
+            "ok": True,
+            "drafted": False,
+            "skipped_duplicate": True,
+            "reply_len": 0,
+            "error": None,
+            "conversation": {
+                "id": conv.id,
+                "status": conv.status,
+                "engagement_classification": classification,
+            },
+        }
+
+    # First click — record who approved + when, then replay Craig.
     if "approved_at" not in classification:
         classification["approved_at"] = datetime.utcnow().isoformat(timespec="seconds")
         classification["approved_by"] = claims.email

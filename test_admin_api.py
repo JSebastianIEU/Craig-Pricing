@@ -469,6 +469,71 @@ def test_approve_engagement_runs_craig_and_drafts(monkeypatch):
     assert drafted["args"]["send"] is True
 
 
+def test_approve_engagement_double_click_idempotent_no_duplicate_send(monkeypatch):
+    """v37.6 — Critical idempotency: clicking Approve twice (browser
+    retry, double-click, dashboard refresh) must NOT post the Missive
+    draft twice. The customer would see the same email arrive twice."""
+    cid, ext_id = _make_pending_engagement_conversation()
+
+    # Stash a pre-rendered reply
+    from db import db_session
+    from db.models import Conversation, Setting
+
+    cached_reply = "Hey there, sure thing — what would you like printed?"
+    cached_html = f"<p>{cached_reply}</p>"
+    with db_session() as db:
+        conv = db.query(Conversation).filter_by(id=cid).first()
+        c = dict(conv.engagement_classification or {})
+        c.update({
+            "proposed_reply": cached_reply,
+            "proposed_html": cached_html,
+            "proposed_subject": "Re: Hi",
+            "proposed_should_send": True,
+        })
+        conv.engagement_classification = c
+        for k, v in (("missive_enabled", "true"), ("missive_api_token", "fake")):
+            row = db.query(Setting).filter_by(
+                organization_slug="just-print", key=k,
+            ).first()
+            if row:
+                row.value = v
+            else:
+                db.add(Setting(
+                    organization_slug="just-print", key=k, value=v,
+                    value_type="string",
+                ))
+        db.commit()
+
+    # Count Missive create_draft calls.
+    call_count = {"n": 0}
+
+    async def fake_create_draft(**kwargs):
+        call_count["n"] += 1
+        return {"drafts": {"id": f"draft-{call_count['n']}", "send": True}}
+
+    monkeypatch.setattr("missive.create_draft", fake_create_draft)
+
+    # First click
+    r1 = client.post(
+        f"/admin/api/orgs/just-print/conversations/{cid}/approve-engagement",
+        headers=_auth("client_owner"),
+    )
+    assert r1.status_code == 200
+    assert r1.json()["drafted"] is True
+    assert call_count["n"] == 1
+
+    # Second click — should NOT post Missive again
+    r2 = client.post(
+        f"/admin/api/orgs/just-print/conversations/{cid}/approve-engagement",
+        headers=_auth("client_owner"),
+    )
+    assert r2.status_code == 200
+    assert r2.json().get("skipped_duplicate") is True
+    assert r2.json()["drafted"] is False
+    # Critical: still only 1 Missive post
+    assert call_count["n"] == 1
+
+
 def test_approve_engagement_404_on_missing():
     r = client.post(
         "/admin/api/orgs/just-print/conversations/9999999/approve-engagement",
