@@ -293,3 +293,189 @@ class TestIsSelfSentEmail:
             missive_from_address="",
             notification_sender_address="",
         ) is None
+
+    # ── v37.7 — internal team allowlist ────────────────────────────
+
+    def test_blocks_internal_team_domain(self):
+        """Eva sends an internal-team email from eva@just-print.ie to a
+        customer thread in the Missive-watched inbox. Craig must see
+        the internal domain and drop the message — not classify it,
+        not Tier 2 it. This is the catastrophic bug v37.7 prevents."""
+        from app import _is_self_sent_email
+        r = _is_self_sent_email(
+            from_address="eva@just-print.ie",
+            subject="quick question about a job",
+            missive_from_address="info@just-print.ie",
+            notification_sender_address="craig@strategos-ai.com",
+            internal_team_domains=["just-print.ie"],
+        )
+        assert r is not None
+        assert "internal-team-domain" in r
+        assert "just-print.ie" in r
+
+    def test_blocks_internal_team_domain_case_insensitive(self):
+        from app import _is_self_sent_email
+        r = _is_self_sent_email(
+            from_address="EVA@JUST-PRINT.IE",
+            subject="hi",
+            missive_from_address="",
+            notification_sender_address="",
+            internal_team_domains=["just-print.ie"],
+        )
+        assert r is not None
+
+    def test_blocks_internal_team_address_for_personal_email(self):
+        """Team member uses a personal Gmail. Operator added them to
+        internal_team_addresses."""
+        from app import _is_self_sent_email
+        r = _is_self_sent_email(
+            from_address="eva.personal@gmail.com",
+            subject="anything",
+            missive_from_address="",
+            notification_sender_address="",
+            internal_team_addresses=["eva.personal@gmail.com"],
+        )
+        assert r is not None
+        assert "internal-team-address" in r
+
+    def test_empty_allowlists_still_pass_real_customers(self):
+        """Default state — no allowlists configured — must not break
+        real customer mail."""
+        from app import _is_self_sent_email
+        assert _is_self_sent_email(
+            from_address="alice@gmail.com",
+            subject="quote please",
+            internal_team_domains=[],
+            internal_team_addresses=[],
+        ) is None
+        assert _is_self_sent_email(
+            from_address="alice@gmail.com",
+            subject="quote please",
+            internal_team_domains=None,
+            internal_team_addresses=None,
+        ) is None
+
+    def test_customer_at_unrelated_domain_passes_through_team_check(self):
+        """A real customer at unrelated.com must still pass even when
+        a team-domain allowlist is configured."""
+        from app import _is_self_sent_email
+        assert _is_self_sent_email(
+            from_address="alice@unrelated.com",
+            subject="quote please",
+            internal_team_domains=["just-print.ie"],
+            internal_team_addresses=["eva.personal@gmail.com"],
+        ) is None
+
+    def test_team_domain_takes_priority_over_subject_sniff(self):
+        """If a team member emails with a '[Just Print' subject, the
+        domain check still fires first (and gives a more specific
+        reason in the log)."""
+        from app import _is_self_sent_email
+        r = _is_self_sent_email(
+            from_address="alfred@just-print.ie",
+            subject="[Just Print — needs your eyes] from Alfred",
+            internal_team_domains=["just-print.ie"],
+        )
+        assert r is not None
+        # Domain check runs before subject sniff in the helper
+        assert "internal-team-domain" in r
+
+
+# ---------------------------------------------------------------------------
+# v37.7 — webhook honours missive_enabled=false (kill switch contract)
+# ---------------------------------------------------------------------------
+
+
+class TestWebhookHonoursDisabledFlag:
+    """Critical kill-switch regression test. When `missive_enabled` is
+    `false` in Settings, the webhook handler MUST return early without
+    calling the LLM (no token burn) and without posting any drafts
+    (no customer noise) and without triggering Justin notifications
+    (no operator noise). This is the contract Justin relies on when
+    he flips the toggle OFF mid-day for emergencies."""
+
+    def _payload(self):
+        return {
+            "rule": {"id": "r1", "type": "webhook"},
+            "conversation": {"id": "conv-killswitch", "subject": "test"},
+            "message": {
+                "id": "msg-killswitch",
+                "type": "email",
+                "from_field": {"address": "bob@example.com", "name": "Bob"},
+                "to_fields": [{"address": "info@just-print.ie"}],
+                "preview": "Hi, 500 business cards please",
+                "body": "Hi, 500 business cards please",
+                "subject": "Quote please",
+                "headers": {},
+            },
+        }
+
+    def test_disabled_flag_short_circuits_no_llm_no_draft(self, monkeypatch):
+        """The kill switch core contract: handler enters, sees
+        missive_enabled=false, returns immediately. No LLM call. No
+        Missive draft post. No Justin Resend email."""
+        from app import _handle_missive_event
+        from unittest.mock import MagicMock, patch as _patch
+
+        # Capture any LLM / Missive / Resend call attempts.
+        chat_called = MagicMock()
+        create_draft_called = MagicMock()
+        trigger_notif_called = MagicMock()
+
+        # Stub _get_setting so we don't depend on the test DB's state.
+        # Returns missive_enabled=false; everything else returns a
+        # plausible value so the handler doesn't fail for unrelated
+        # reasons before reaching the enabled check.
+        def fake_get_setting(db, key, default="", organization_slug=None):
+            if key == "missive_enabled":
+                return "false"
+            if key == "missive_api_token":
+                return "fake-token-would-work-if-enabled"
+            return default
+
+        with _patch("pricing_engine._get_setting", side_effect=fake_get_setting), \
+             _patch("llm.craig_agent.chat_with_craig", chat_called), \
+             _patch("missive.create_draft", create_draft_called), \
+             _patch(
+                 "notifications.trigger_engagement_approval_notification",
+                 trigger_notif_called,
+             ):
+            _handle_missive_event("just-print", self._payload())
+
+        # The CORE assertions: kill switch held the line.
+        assert chat_called.call_count == 0, (
+            "chat_with_craig was called despite missive_enabled=false — kill switch leak"
+        )
+        assert create_draft_called.call_count == 0, (
+            "missive.create_draft was called despite missive_enabled=false — kill switch leak"
+        )
+        assert trigger_notif_called.call_count == 0, (
+            "engagement-approval notification fired despite missive_enabled=false"
+        )
+
+    def test_missing_token_also_short_circuits(self, monkeypatch):
+        """Belt + braces: even with missive_enabled=true, an empty
+        missive_api_token must short-circuit too. (Defensive — the
+        Switch in the dashboard requires a token before letting the
+        operator turn ON, but config drift / DB corruption could
+        produce this state and we don't want Craig leaking through.)"""
+        from app import _handle_missive_event
+        from unittest.mock import MagicMock, patch as _patch
+
+        chat_called = MagicMock()
+        create_draft_called = MagicMock()
+
+        def fake_get_setting(db, key, default="", organization_slug=None):
+            if key == "missive_enabled":
+                return "true"
+            if key == "missive_api_token":
+                return ""  # ← missing token
+            return default
+
+        with _patch("pricing_engine._get_setting", side_effect=fake_get_setting), \
+             _patch("llm.craig_agent.chat_with_craig", chat_called), \
+             _patch("missive.create_draft", create_draft_called):
+            _handle_missive_event("just-print", self._payload())
+
+        assert chat_called.call_count == 0
+        assert create_draft_called.call_count == 0

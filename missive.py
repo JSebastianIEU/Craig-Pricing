@@ -219,6 +219,8 @@ async def create_draft(
     subject: str | None = None,
     attachments: list[dict[str, str]] | None = None,
     send: bool = False,
+    add_shared_labels: list[str] | None = None,
+    remove_shared_labels: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Create a reply on an existing Missive conversation.
@@ -235,6 +237,15 @@ async def create_draft(
     `attachments`, if passed, should be a list of
         {"filename": "...", "base64_data": "<b64>", "content_type": "application/pdf"}
     Missive decodes base64 server-side and attaches the file to the draft.
+
+    v37.7 — `add_shared_labels` / `remove_shared_labels`: optional
+    list of label UUIDs to attach / detach on the conversation as
+    part of the same atomic POST. Labels MUST be referenced by UUID
+    (Missive's API doesn't accept names). The operator creates the
+    labels manually in Missive UI and pastes the UUIDs into the
+    `missive_label_*` Settings — see `_resolve_label_uuids()` in
+    `app.py` / `admin_api.py` for the resolver. Passing an empty
+    list / None for either is a no-op.
     """
     payload: dict[str, Any] = {
         "drafts": {
@@ -249,6 +260,10 @@ async def create_draft(
         payload["drafts"]["subject"] = subject
     if attachments:
         payload["drafts"]["attachments"] = attachments
+    if add_shared_labels:
+        payload["drafts"]["add_shared_labels"] = list(add_shared_labels)
+    if remove_shared_labels:
+        payload["drafts"]["remove_shared_labels"] = list(remove_shared_labels)
 
     async with httpx.AsyncClient(timeout=_REST_TIMEOUT) as client:
         r = await client.post(

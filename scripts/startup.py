@@ -122,6 +122,7 @@ def main() -> None:
     from scripts.v35_test_chat_and_issue_reports import migrate as v35_migrate
     from scripts.v36_per_sqm_per_sheet_pricing import migrate as v36_migrate
     from scripts.v37_engagement_approval import migrate as v37_migrate
+    from scripts.v37_7_cutover_safety import migrate as v37_7_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -156,6 +157,7 @@ def main() -> None:
     _run("v35 test-chat sandbox + issue reports + admin alerts", v35_migrate)
     _run("v36 per-sqm + per-sheet pricing strategies", v36_migrate)
     _run("v37 engagement-approval gate (Missive low-confidence pause)", v37_migrate)
+    _run("v37.7 cutover safety + internal-team allowlist seed", v37_7_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

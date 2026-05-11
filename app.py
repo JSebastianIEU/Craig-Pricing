@@ -602,18 +602,26 @@ def _is_self_sent_email(
     *, from_address: str, subject: str,
     missive_from_address: str = "",
     notification_sender_address: str = "",
+    internal_team_domains: list[str] | None = None,
+    internal_team_addresses: list[str] | None = None,
 ) -> str | None:
-    """v37.2 — return a non-None reason string if the inbound email was
-    sent by us (Missive draft sender OR notification sender) or sniffs
-    like one of our notification subjects. Returns None if it looks
-    like a legitimate external sender.
+    """v37.2 — return a non-None reason string if the inbound email
+    should be silently dropped (self-sent OR internal team OR
+    notification-subject). Returns None if it looks like a legitimate
+    external sender that should be classified.
 
     Pulled out of `_handle_missive_event` so it's unit-testable. The
-    real webhook reads the two settings from the DB and passes them in.
+    real webhook reads the relevant settings from the DB and passes
+    them in.
 
     Triggers:
       * sender == missive_from_address (Justin's own outbound identity)
       * sender == notification_sender_address (Craig's notification mailer)
+      * sender's DOMAIN matches `internal_team_domains` setting (v37.7;
+        e.g. emails from anyone @just-print.ie — team-to-team mail
+        landing in the watched inbox)
+      * sender's full address matches `internal_team_addresses` setting
+        (v37.7; for team members using personal Gmail / Outlook)
       * subject starts with '[Just Print' (operator-notification mark)
     """
     sender = (from_address or "").strip().lower()
@@ -624,6 +632,21 @@ def _is_self_sent_email(
     }
     if sender and sender in loop_addrs:
         return f"address-match: {sender!r}"
+
+    # v37.7 — internal team allowlist (configurable per-tenant). Domain
+    # match catches all `@just-print.ie` team members in one rule;
+    # address match handles team members on personal email.
+    if sender and "@" in sender:
+        sender_domain = sender.split("@", 1)[1]
+        if internal_team_domains:
+            domain_set = {(d or "").strip().lower() for d in internal_team_domains if d}
+            if sender_domain in domain_set:
+                return f"internal-team-domain: {sender_domain!r}"
+    if internal_team_addresses and sender:
+        addr_set = {(a or "").strip().lower() for a in internal_team_addresses if a}
+        if sender in addr_set:
+            return f"internal-team-address: {sender!r}"
+
     subj = (subject or "").strip().lower()
     if subj.startswith("[just print"):
         return f"notification-subject-prefix: {subject!r}"
@@ -709,11 +732,26 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
         notif_sender = _get_setting(
             db, "notification_sender_address", "", organization_slug=org_slug,
         )
+        # v37.7 — internal-team allowlist. Settings stored as JSON lists.
+        # `_get_setting` already parses value_type='json' into a Python
+        # list. Fall back to [] if unset / bad shape.
+        team_domains = _get_setting(
+            db, "internal_team_domains", [], organization_slug=org_slug,
+        )
+        if not isinstance(team_domains, list):
+            team_domains = []
+        team_addresses = _get_setting(
+            db, "internal_team_addresses", [], organization_slug=org_slug,
+        )
+        if not isinstance(team_addresses, list):
+            team_addresses = []
         loop_reason = _is_self_sent_email(
             from_address=evt.get("from_address", ""),
             subject=evt.get("subject", ""),
             missive_from_address=from_addr,
             notification_sender_address=notif_sender,
+            internal_team_domains=team_domains,
+            internal_team_addresses=team_addresses,
         )
         if loop_reason:
             _mlog.info(
@@ -1405,6 +1443,17 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
             )
             return  # skip Missive post
 
+        # v37.7 — Tier 3 label tagging. The operator creates a "Craig:
+        # Auto-Replied" label in Missive UI manually, then pastes its
+        # UUID into the Setting `missive_label_auto_replied`. Empty /
+        # missing setting = labelling skipped (graceful fallback so
+        # cutover doesn't depend on labels being configured).
+        label_auto_replied = _get_setting(
+            db, "missive_label_auto_replied", "",
+            organization_slug=org_slug,
+        )
+        add_labels = [label_auto_replied] if label_auto_replied else None
+
         try:
             asyncio.run(missive.create_draft(
                 conversation_id=evt["conversation_id"],
@@ -1416,12 +1465,15 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
                 subject=reply_subject,
                 attachments=attachments,
                 send=should_send,
+                add_shared_labels=add_labels,
             ))
             _mlog.info(
-                "%s: missive reply %s on conv %s (subject=%s, reason=%s)",
+                "%s: missive reply %s on conv %s (subject=%s, reason=%s, "
+                "label_auto_replied=%s)",
                 org_slug,
                 "sent" if should_send else "drafted",
                 evt["conversation_id"], reply_subject, gating_reason,
+                "applied" if add_labels else "skipped",
             )
         except Exception as draft_err:
             _mlog.error(

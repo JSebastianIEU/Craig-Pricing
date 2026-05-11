@@ -1834,10 +1834,24 @@ def _replay_craig_on_engagement_approval(
 
         reply_subject = proposed_subject or "Re: Your quote from Just Print"
         should_send = bool(classification.get("proposed_should_send", True))
+
+        # v37.7 — labels. Approve flow flips the conversation from
+        # "Awaiting Approval" to "Auto-Replied" in one atomic POST.
+        label_auto_replied = _get_setting(
+            db, "missive_label_auto_replied", "", organization_slug=org_slug,
+        )
+        label_awaiting = _get_setting(
+            db, "missive_label_awaiting_approval", "", organization_slug=org_slug,
+        )
+        add_labels = [label_auto_replied] if label_auto_replied else None
+        remove_labels = [label_awaiting] if label_awaiting else None
+
         _log(
             f"posting Missive draft external_id={missive_external_id!r} "
             f"subject={reply_subject!r} send={should_send} "
-            f"to_fields={to_fields} attachments={'yes' if attachments else 'no'}"
+            f"to_fields={to_fields} attachments={'yes' if attachments else 'no'} "
+            f"add_labels={'yes' if add_labels else 'skip'} "
+            f"remove_labels={'yes' if remove_labels else 'skip'}"
         )
         try:
             mresp = asyncio.run(missive.create_draft(
@@ -1850,6 +1864,8 @@ def _replay_craig_on_engagement_approval(
                 subject=reply_subject,
                 attachments=attachments,
                 send=should_send,
+                add_shared_labels=add_labels,
+                remove_shared_labels=remove_labels,
             ))
         except Exception as e:
             _log(f"ERROR missive_draft_failed: {type(e).__name__}: {e}")
