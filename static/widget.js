@@ -2816,6 +2816,17 @@
         // Fetch tenant branding BEFORE mounting so the initial paint uses the
         // right colors + font. If the fetch fails, defaults apply.
         await fetchWidgetConfig();
+        // v37.8 — operator kill switch. When `widget_enabled=false` is set
+        // on the tenant's Settings, /widget-config returns disabled:true.
+        // Bail out before mounting any DOM so the bubble never appears.
+        // The /widget-config fetch is `cache: 'no-store'`, so flipping
+        // the setting takes effect on the next page load. The widget.js
+        // bundle itself is cached for 60s — worst-case 60s delay before
+        // the disabled flag is honored.
+        if (WIDGET_CONFIG && WIDGET_CONFIG.disabled === true) {
+            console.log('[Craig widget] disabled by operator setting — skipping mount');
+            return;
+        }
         mount();
     }
 

@@ -204,8 +204,22 @@ def widget_config(client: str, db: Session = Depends(get_db)):
     if stripe_mode not in ("sections", "gradient", "solid"):
         stripe_mode = "sections"
 
+    # v37.8 \u2014 server-side kill switch for the embedded chat widget.
+    # When `widget_enabled` is "false" the bubble must NOT render on
+    # the client's website. The widget reads `disabled` on bootConfig
+    # and early-exits its mount() before injecting any DOM. Same
+    # operator-flippable Setting pattern as `missive_enabled`.
+    widget_enabled_raw = _get_setting(
+        db, "widget_enabled", "true", organization_slug=client,
+    )
+    widget_enabled = (str(widget_enabled_raw or "true").strip().lower() != "false")
+
     return {
         "organization_slug": client,
+        # v37.8 \u2014 operator kill switch. When False, the embedded widget
+        # script reads this and bails before mounting. No bubble, no
+        # /chat traffic, no token spend.
+        "disabled": not widget_enabled,
         "primary_color": primary_color,
         "logo_url": _get_setting(
             db, "widget_logo_url", None, organization_slug=client,
@@ -450,8 +464,23 @@ def index():
 
 @app.get("/widget.js", tags=["Frontend"])
 def widget_embed():
-    """Embeddable widget script — drop <script src=\"/widget.js\"> on any page."""
-    return FileResponse(os.path.join(STATIC_DIR, "widget.js"), media_type="application/javascript")
+    """Embeddable widget script — drop <script src=\"/widget.js\"> on any page.
+
+    v37.8 — short-cache headers (60s). The embedded script itself is
+    rarely changed, but when the operator flips `widget_enabled=false`
+    we want that change to propagate to live customer pages within a
+    minute, not after the next browser cache eviction. The /widget-config
+    fetch (called by the widget after load) is already no-store, so once
+    a customer's browser pulls the latest widget.js it picks up the
+    disabled flag immediately.
+    """
+    return FileResponse(
+        os.path.join(STATIC_DIR, "widget.js"),
+        media_type="application/javascript",
+        headers={
+            "Cache-Control": "public, max-age=60, must-revalidate",
+        },
+    )
 
 
 # ============================================================================
