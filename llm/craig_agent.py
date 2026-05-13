@@ -2345,71 +2345,70 @@ def chat_with_craig(
                 )
                 final_reply = kept[0]
 
-        # v26 — Replace Craig's free-text artwork question with our own
-        # canned copy and the [ARTWORK_CHOICE] marker. The widget renders
-        # two buttons (have-artwork / need-design) in place of the next
-        # text — removes ambiguity ("yes I have one" / "yeah" / etc.).
-        # Only emits on web (email/SMS can't render buttons).
-        #
-        # v38 — if the reply already contains a price (€ symbol), KEEP
-        # it and APPEND the marker so the customer sees the number
-        # before being asked about artwork. Fixes Bug 3 from the audit
-        # — old flow asked for artwork before pricing → 42% abandon.
-        if (channel or "").lower() in ("web", "") and "[ARTWORK_CHOICE]" not in final_reply:
-            # v38 — only auto-emit [ARTWORK_CHOICE] when a pricing
-            # tool has actually run (this turn or earlier). Without
-            # this guard, when the LLM is doing a spec-confirmation
-            # turn (e.g. "Just to confirm: 1m × 2m PVC banner?") we
-            # CLOBBER its message with the canned artwork question,
-            # forcing the old "artwork-before-price" flow that v38
-            # was supposed to eliminate. Let the LLM's spec-confirm
-            # pass through; the next turn will have a price + we
-            # append the artwork question to it.
-            #
-            # v38.3 — fix: `_had_prior_quote` is defined LATER in the
-            # function (in the hallucinated-quote gate at line ~2436),
-            # so referencing it here NameErrors. Compute the equivalent
-            # inline using `existing_quotes` (a list of prior quotes
-            # queried at function entry).
-            _any_quote_exists = bool(quote_generated or existing_quotes)
-            if _reply_has_price:
-                # Append the artwork-choice marker to the price reply.
-                final_reply = (
-                    final_reply.rstrip()
-                    + "\n\nQuick one before I wrap the full quote 👇 "
-                    "Do you have your own print-ready artwork, or would "
-                    "you like our design service (€65 ex VAT for one "
-                    "hour of design work)?\n\n[ARTWORK_CHOICE]"
-                )
-                print(
-                    f"[craig] APPENDED [ARTWORK_CHOICE] after price on conv "
-                    f"{conversation.id} (v38 — price-first flow).",
-                    flush=True,
-                )
-            elif _any_quote_exists:
-                # A price was given in a prior turn — replace with the
-                # canned artwork choice so the widget renders buttons.
-                final_reply = (
-                    "Quick question before I price it 👇 Do you have your "
-                    "own print-ready artwork, or would you like our design "
-                    "service?\n\n[ARTWORK_CHOICE]"
-                )
-                print(
-                    f"[craig] EMITTED [ARTWORK_CHOICE] on conv "
-                    f"{conversation.id} (prior quote exists).",
-                    flush=True,
-                )
-            else:
-                # No price yet anywhere in the conversation — don't
-                # clobber whatever the LLM said. It's probably a spec
-                # confirmation ("just to confirm: ... ?") which is
-                # exactly what Rule 3 calls for. Let it through.
-                print(
-                    f"[craig] SUPPRESSED [ARTWORK_CHOICE] auto-emit on conv "
-                    f"{conversation.id} — no price yet, letting LLM's "
-                    f"spec-confirm pass through (v38 — price-first flow).",
-                    flush=True,
-                )
+    # v38.7 — [ARTWORK_CHOICE] auto-emit. Restructured out of the
+    # spec-recap trim block above, where it was previously nested
+    # inside `if not _reply_has_price`. That nesting was the root
+    # cause of the production bug: when the LLM's reply ALREADY had
+    # a price (€), the outer block was skipped, the [ARTWORK_CHOICE]
+    # marker never fired, and the downstream [ARTWORK_UPLOAD] gate
+    # took over — trapping customers in an upload-only flow with no
+    # "design service" / "send later" buttons. Symptom: customer
+    # priced 100 vinyl labels at €13.84, widget showed only the
+    # upload area and refused to submit the form. Reported May 13.
+    #
+    # New behaviour: fire [ARTWORK_CHOICE] whenever artwork hasn't
+    # been answered, web channel, the marker isn't already present,
+    # and EITHER (a) this turn has a price OR (b) a prior quote
+    # exists. If neither, suppress (LLM is doing spec-confirm).
+    if (
+        (channel or "").lower() in ("web", "")
+        and conversation.customer_has_own_artwork is None
+        and "[ARTWORK_CHOICE]" not in final_reply
+        and "[ARTWORK_UPLOAD]" not in final_reply
+    ):
+        # v38.3 — `_had_prior_quote` is defined later in this fn,
+        # so compute the equivalent inline using `existing_quotes`.
+        _any_quote_exists = bool(quote_generated or existing_quotes)
+        if _reply_has_price:
+            # Append the artwork-choice marker to the price reply
+            # so the customer sees the number FIRST, then picks
+            # how to proceed (own artwork / design service / later).
+            final_reply = (
+                final_reply.rstrip()
+                + "\n\nQuick one before I wrap the full quote 👇 "
+                "Do you have your own print-ready artwork, or would "
+                "you like our design service (€65 ex VAT for one "
+                "hour of design work)?\n\n[ARTWORK_CHOICE]"
+            )
+            print(
+                f"[craig] APPENDED [ARTWORK_CHOICE] after price on conv "
+                f"{conversation.id} (v38.7 — price-first flow).",
+                flush=True,
+            )
+        elif _any_quote_exists:
+            # A price was given in a prior turn — replace with the
+            # canned artwork choice so the widget renders buttons.
+            final_reply = (
+                "Quick question before I price it 👇 Do you have your "
+                "own print-ready artwork, or would you like our design "
+                "service?\n\n[ARTWORK_CHOICE]"
+            )
+            print(
+                f"[craig] EMITTED [ARTWORK_CHOICE] on conv "
+                f"{conversation.id} (prior quote exists).",
+                flush=True,
+            )
+        else:
+            # No price yet anywhere in the conversation — don't
+            # clobber whatever the LLM said. It's probably a spec
+            # confirmation ("just to confirm: ... ?") which is
+            # exactly what Rule 3 calls for. Let it through.
+            print(
+                f"[craig] SUPPRESSED [ARTWORK_CHOICE] auto-emit on conv "
+                f"{conversation.id} — no price yet, letting LLM's "
+                f"spec-confirm pass through (v38.7 — price-first flow).",
+                flush=True,
+            )
 
     # Hallucinated-quote gate.
     #
@@ -2679,16 +2678,18 @@ def chat_with_craig(
         final_reply += "\n[QUOTE_READY]"
 
     # ── Phase F: auto-emit [ARTWORK_UPLOAD] when LLM forgets ──────────
-    # v25 — we fire this when customer_has_own_artwork is NOT False (i.e.
-    # True OR None). Rationale: if the field is None it means the LLM
-    # priced without ever properly asking the artwork question (the
-    # pricing-tool guard SHOULD prevent this, but bypasses happen — old
-    # conversations, prior-quote re-routes, etc). In that case showing
-    # the upload button is the safer fallback: the customer can upload
-    # if they have artwork (which auto-flips the flag to True via the
-    # upload endpoint), or ignore the button and just answer "I want
-    # design service" in chat (which sniffs to False). When the flag is
-    # explicitly False (design service), we never show the upload button.
+    # v38.7 — TIGHTENED. Old behaviour: fired when customer_has_own_artwork
+    # was NOT False (True OR None). The rationale was a safety fallback:
+    # if the LLM priced without asking artwork, show the upload box so the
+    # customer can either upload (auto-flips flag) or type "I want design".
+    #
+    # But the [ARTWORK_CHOICE] auto-emit above (v38.7) now ALWAYS fires
+    # when artwork is unanswered + we have a price (3 buttons: have /
+    # design / later). So this gate must ONLY fire for explicit True
+    # (customer chose "I have artwork" → time to upload). When None,
+    # the [ARTWORK_CHOICE] above wins and the customer gets buttons,
+    # not a bare upload area. When False (design service), we don't
+    # show the upload button at all.
     _pricing_called_this_turn = any(
         (tc.get("tool") or "").lower() in (
             "quote_small_format", "quote_large_format", "quote_booklet",
@@ -2735,7 +2736,7 @@ def chat_with_craig(
         )
     elif (
         _channel_needs_gate
-        and conversation.customer_has_own_artwork is not False  # True or None
+        and conversation.customer_has_own_artwork is True  # v38.7 — explicit only
         and _pricing_called_this_turn                       # quote just generated
         and not _quote_has_artwork                          # not uploaded yet
         and not _upload_marker_already

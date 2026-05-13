@@ -565,6 +565,147 @@ class TestPrematureQuoteReadyGateInjectsPrice:
         )
 
 
+class TestArtworkChoiceAppearsAfterPrice:
+    """v38.7 regression — production bug May 13: customer priced vinyl
+    labels (€13.84), widget showed only the bare [ARTWORK_UPLOAD] box
+    and the form refused to submit without an upload. Customer was
+    never offered the 3-button choice (own artwork / design service /
+    send later).
+
+    Root cause: my v38.1 fix nested the [ARTWORK_CHOICE] auto-emit
+    inside `if not _reply_has_price`. When the reply HAS a price (€),
+    that outer block was skipped, [ARTWORK_CHOICE] never fired, and
+    the downstream [ARTWORK_UPLOAD] gate took over.
+
+    Fix: [ARTWORK_CHOICE] auto-emit moved to its own independent
+    block, [ARTWORK_UPLOAD] gate tightened to require explicit True.
+
+    This test reproduces the exact production flow.
+    """
+
+    def test_vinyl_labels_priced_first_turn_emits_choice_not_upload(self):
+        """Customer arrives with full vinyl-labels specs. Craig prices
+        on turn 1 with needs_artwork=False (v38 price-first flow).
+        The reply MUST contain [ARTWORK_CHOICE] (3 buttons), NOT
+        [ARTWORK_UPLOAD] (bare upload area)."""
+        session = "flow-artwork-choice-after-price"
+
+        with patch("llm.craig_agent.OpenAI", return_value=_make_mock_llm(
+            _llm_tool_call("quote_large_format", {
+                "product_key": "vinyl_labels",
+                "quantity": 100,
+                "width_mm": 50,
+                "height_mm": 50,
+                "needs_artwork": False,
+            }),
+            _llm_reply(
+                "That'll be €13.84 for 100 vinyl labels at 50×50mm 👍"
+            ),
+        )):
+            r = _send_chat(
+                "100 vinyl labels 50x50mm please",
+                session_id=session,
+            )
+        body = r.json()
+        assert r.status_code == 200
+        assert body.get("quote_generated") is True, (
+            f"Pricing tool didn't fire: {body}"
+        )
+        reply = body["reply"]
+        # Customer must see a price — that's the v38 PRICE FIRST contract
+        assert "€" in reply, f"Price missing from reply: {reply!r}"
+        # CORE assertion: the 3-button choice marker must be present
+        assert "[ARTWORK_CHOICE]" in reply, (
+            f"v38.7 regression: [ARTWORK_CHOICE] missing after price. "
+            f"Customer is trapped with no 'design service' / 'send later' "
+            f"options. Reply: {reply!r}"
+        )
+        # And the bare upload marker must NOT be present (would mean
+        # the upload gate fired first and the customer is stuck)
+        assert "[ARTWORK_UPLOAD]" not in reply, (
+            f"v38.7 regression: [ARTWORK_UPLOAD] fired instead of "
+            f"[ARTWORK_CHOICE] when artwork was unanswered. "
+            f"Reply: {reply!r}"
+        )
+
+    def test_pvc_banner_priced_first_turn_emits_choice_not_upload(self):
+        """Same regression with the PVC banner path — the other product
+        flagged in the v38 widget audit."""
+        session = "flow-artwork-choice-pvc"
+
+        with patch("llm.craig_agent.OpenAI", return_value=_make_mock_llm(
+            _llm_tool_call("quote_large_format", {
+                "product_key": "pvc_banners",
+                "quantity": 1,
+                "width_mm": 1000,
+                "height_mm": 2000,
+                "needs_artwork": False,
+            }),
+            _llm_reply(
+                "That'll be €68.88 for 1 PVC banner at 1m × 2m 👍"
+            ),
+        )):
+            r = _send_chat(
+                "1 PVC banner 1m x 2m please",
+                session_id=session,
+            )
+        body = r.json()
+        assert r.status_code == 200
+        reply = body["reply"]
+        assert "€" in reply
+        assert "[ARTWORK_CHOICE]" in reply, (
+            f"v38.7 regression on PVC banner: choice marker missing. "
+            f"Reply: {reply!r}"
+        )
+        assert "[ARTWORK_UPLOAD]" not in reply
+
+    def test_after_customer_picks_own_artwork_then_upload_marker_fires(self):
+        """The OPPOSITE side of the regression — once the customer has
+        chosen 'I have artwork', the [ARTWORK_UPLOAD] gate SHOULD fire
+        on the next pricing turn. Locks the explicit-True path."""
+        session = "flow-after-choice-then-upload"
+
+        # Turn 1: price + [ARTWORK_CHOICE]
+        with patch("llm.craig_agent.OpenAI", return_value=_make_mock_llm(
+            _llm_tool_call("quote_small_format", {
+                "product_key": "business_cards",
+                "quantity": 500,
+                "double_sided": False,
+                "finish": "matte",
+                "needs_artwork": False,
+            }),
+            _llm_reply("That'll be €46.74 for 500 business cards 👍"),
+        )):
+            r = _send_chat(
+                "500 business cards matte single-sided",
+                session_id=session,
+            )
+        body = r.json()
+        conv_id = body["conversation_id"]
+        assert "[ARTWORK_CHOICE]" in body["reply"]
+
+        # Turn 2: customer picks "I have artwork" → artwork sniffer flips
+        # customer_has_own_artwork to True. Craig should ack and the
+        # upload widget should now surface.
+        with patch("llm.craig_agent.OpenAI", return_value=_make_mock_llm(
+            _llm_reply("Got it 👍 send your print-ready artwork over."),
+        )):
+            r2 = _send_chat(
+                "I have my own artwork",
+                session_id=session,
+                conversation_id=conv_id,
+            )
+        body2 = r2.json()
+        # Either [ARTWORK_UPLOAD] in the reply, or the conversation's
+        # customer_has_own_artwork is now True (sniffer fired). The
+        # exact UX may differ but the customer should NOT see the
+        # 3-button choice again.
+        assert "[ARTWORK_CHOICE]" not in body2["reply"], (
+            f"[ARTWORK_CHOICE] re-emitted after customer answered: "
+            f"{body2['reply']!r}"
+        )
+
+
 # ===========================================================================
 # SYSTEM PROMPT CONTRACTS — assert the v38 rules survive in production
 # ===========================================================================
