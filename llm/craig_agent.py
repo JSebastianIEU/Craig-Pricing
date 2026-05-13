@@ -2381,7 +2381,13 @@ def chat_with_craig(
             # was supposed to eliminate. Let the LLM's spec-confirm
             # pass through; the next turn will have a price + we
             # append the artwork question to it.
-            _any_quote_exists = bool(quote_generated or _had_prior_quote)
+            #
+            # v38.3 — fix: `_had_prior_quote` is defined LATER in the
+            # function (in the hallucinated-quote gate at line ~2436),
+            # so referencing it here NameErrors. Compute the equivalent
+            # inline using `existing_quotes` (a list of prior quotes
+            # queried at function entry).
+            _any_quote_exists = bool(quote_generated or existing_quotes)
             if _reply_has_price:
                 # Append the artwork-choice marker to the price reply.
                 final_reply = (
