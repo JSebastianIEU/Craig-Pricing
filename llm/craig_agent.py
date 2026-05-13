@@ -1415,38 +1415,22 @@ def _exec_tool(
     """Execute a tool call and return a dict the LLM can read. All pricing is
     scoped to `organization_slug` so Craig reads the right tenant's catalog."""
     try:
-        # Phase F refined — pricing tool guard. Refuse to price until the
-        # artwork question has been answered. Forces the LLM to ask the
-        # customer "do you have artwork or need design service?" first,
-        # since DeepSeek tends to skip that step otherwise. The widget
-        # then sniffs the answer and stamps the conversation flag, which
-        # unlocks pricing.
-        if name in ("quote_small_format", "quote_large_format", "quote_booklet"):
-            if conversation_id is not None:
-                _conv = db.query(Conversation).filter_by(id=conversation_id).first()
-                if (
-                    _conv is not None
-                    and _conv.customer_has_own_artwork is None
-                    and not bool(args.get("needs_artwork"))
-                ):
-                    return {
-                        "success": False,
-                        "escalate": False,
-                        "error": (
-                            "ARTWORK_QUESTION_REQUIRED: Before quoting, ask "
-                            "the customer this exact question: 'Do you have "
-                            "print-ready artwork, or would you like our "
-                            "design service? It's €65 ex VAT (€79.95 inc "
-                            "VAT) for one hour of design work.'. Wait for "
-                            "their answer, then call the pricing tool with "
-                            "the appropriate needs_artwork value. Do NOT "
-                            "proceed to quoting until they've answered. "
-                            "Always phrase the design service as 'one hour "
-                            "of design' so the customer knows what €65 "
-                            "buys them."
-                        ),
-                        "needs_artwork_question": True,
-                    }
+        # v38 — Phase F's "artwork-question required before pricing"
+        # guard has been REMOVED. The audit showed it caused 42% of
+        # widget customers to abandon (they wanted to see a price
+        # BEFORE committing to send artwork). New flow is the inverse:
+        # the LLM calls the tool with needs_artwork=False (default)
+        # and the reply contains BOTH the price AND the artwork
+        # question. If the customer picks the design service, the
+        # LLM re-calls the tool with needs_artwork=True to add the
+        # €65/hr line item.
+        #
+        # The old guard text is preserved here as a comment so future
+        # readers know why we deleted it:
+        #     "ARTWORK_QUESTION_REQUIRED: Before quoting, ask the
+        #      customer 'Do you have print-ready artwork, or design
+        #      service?'. Wait for answer, then re-call the tool."
+        # — removed in v38 (price-first flow).
 
         if name == "quote_small_format":
             result = quote_small_format(
