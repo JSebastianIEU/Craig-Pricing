@@ -2372,6 +2372,16 @@ def chat_with_craig(
         # before being asked about artwork. Fixes Bug 3 from the audit
         # — old flow asked for artwork before pricing → 42% abandon.
         if (channel or "").lower() in ("web", "") and "[ARTWORK_CHOICE]" not in final_reply:
+            # v38 — only auto-emit [ARTWORK_CHOICE] when a pricing
+            # tool has actually run (this turn or earlier). Without
+            # this guard, when the LLM is doing a spec-confirmation
+            # turn (e.g. "Just to confirm: 1m × 2m PVC banner?") we
+            # CLOBBER its message with the canned artwork question,
+            # forcing the old "artwork-before-price" flow that v38
+            # was supposed to eliminate. Let the LLM's spec-confirm
+            # pass through; the next turn will have a price + we
+            # append the artwork question to it.
+            _any_quote_exists = bool(quote_generated or _had_prior_quote)
             if _reply_has_price:
                 # Append the artwork-choice marker to the price reply.
                 final_reply = (
@@ -2386,7 +2396,9 @@ def chat_with_craig(
                     f"{conversation.id} (v38 — price-first flow).",
                     flush=True,
                 )
-            else:
+            elif _any_quote_exists:
+                # A price was given in a prior turn — replace with the
+                # canned artwork choice so the widget renders buttons.
                 final_reply = (
                     "Quick question before I price it 👇 Do you have your "
                     "own print-ready artwork, or would you like our design "
@@ -2394,7 +2406,18 @@ def chat_with_craig(
                 )
                 print(
                     f"[craig] EMITTED [ARTWORK_CHOICE] on conv "
-                    f"{conversation.id}.",
+                    f"{conversation.id} (prior quote exists).",
+                    flush=True,
+                )
+            else:
+                # No price yet anywhere in the conversation — don't
+                # clobber whatever the LLM said. It's probably a spec
+                # confirmation ("just to confirm: ... ?") which is
+                # exactly what Rule 3 calls for. Let it through.
+                print(
+                    f"[craig] SUPPRESSED [ARTWORK_CHOICE] auto-emit on conv "
+                    f"{conversation.id} — no price yet, letting LLM's "
+                    f"spec-confirm pass through (v38 — price-first flow).",
                     flush=True,
                 )
 
