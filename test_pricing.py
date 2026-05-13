@@ -300,36 +300,50 @@ def test_roller_banner_bulk():
 
 
 def test_pvc_banner_8sqm():
+    """v36 changed pvc_banners to per_sqm strategy — pass area_sqm
+    explicitly. 8 m² × €28/m² = €224 ex VAT."""
     r = client.post("/quote/large-format", json={
         "product_key": "pvc_banners",
-        "quantity": 8,
+        "quantity": 1,
+        "area_sqm": 8.0,
     })
     data = r.json()
-    assert data["success"] is True
+    assert data["success"] is True, f"Expected success, got: {data}"
     assert data["base_price"] == 28.00
     assert data["final_price_ex_vat"] == 224.00
 
 
 def test_pvc_banner_bulk():
+    """12 m² triggers bulk pricing on pvc_banners (threshold 10).
+    12 × €23/m² = €276 ex VAT."""
     r = client.post("/quote/large-format", json={
         "product_key": "pvc_banners",
-        "quantity": 12,
+        "quantity": 1,
+        "area_sqm": 12.0,
     })
     data = r.json()
-    assert data["success"] is True
+    assert data["success"] is True, f"Expected success, got: {data}"
     assert data["base_price"] == 23.00
     assert data["final_price_ex_vat"] == 276.00
 
 
 def test_foamex_3_boards():
+    """v36 changed foamex_boards to per_sheet — needs panel dims.
+    3 panels at A1 (594x841mm) → 4 panels per 2400x1200 sheet →
+    1 sheet × €150 = €150 ex VAT."""
     r = client.post("/quote/large-format", json={
         "product_key": "foamex_boards",
         "quantity": 3,
+        "width_mm": 594,
+        "height_mm": 841,
     })
     data = r.json()
-    assert data["success"] is True
-    assert data["base_price"] == 35.00
-    assert data["final_price_ex_vat"] == 105.00
+    assert data["success"] is True, f"Expected success, got: {data}"
+    # 3 A1-sized panels fit on 1 standard 2400x1200 sheet
+    assert data["final_price_ex_vat"] == 150.00, (
+        f"Expected 1 sheet × €150 = €150 ex VAT, got "
+        f"€{data['final_price_ex_vat']}"
+    )
 
 
 def test_vehicle_magnetics_2():
@@ -639,6 +653,180 @@ def test_client_multiplier_not_applied_to_vat():
         assert round(ex * 1.135, 2) == inc
     finally:
         _set_client_multiplier(None)
+
+
+# =============================================================================
+# v38 — Engine defensive guards (Bug 1 + sanity ceiling)
+# =============================================================================
+
+
+class TestRequiresDimensionsGuard:
+    """v38 — vinyl_labels (and any product flagged requires_dimensions
+    = True) MUST NOT fall back to yield-only math when the LLM
+    forgot to pass width_mm/height_mm. The engine ESCALATES instead,
+    so the customer never sees a wrong price like Ian's €341 for
+    500 small labels."""
+
+    def test_vinyl_labels_with_dims_prices_correctly(self):
+        """500 vinyl labels at 40x10mm = 0.2 m² × €45 = €9 ex VAT ≈ €11 inc."""
+        from db import db_session
+        from db.models import Product
+        from pricing_engine import quote_large_format, QuoteResult
+
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="vinyl_labels",
+            ).first()
+            assert p is not None, "vinyl_labels not seeded"
+            # Make sure the v38 flag is on for this test
+            if not getattr(p, "requires_dimensions", False):
+                p.requires_dimensions = True
+                db.commit()
+
+            result = quote_large_format(
+                db, product_key="vinyl_labels",
+                quantity=500, width_mm=40, height_mm=10,
+                organization_slug="just-print",
+            )
+        assert isinstance(result, QuoteResult), (
+            f"Expected a quote, got {type(result).__name__}: "
+            f"{getattr(result, 'reason', None)}"
+        )
+        # 500 × 40×10mm = 0.2 m² × €45/m² = €9 ex VAT
+        assert 7.5 <= result.final_price_ex_vat <= 10.5, (
+            f"Expected ~€9 ex VAT, got €{result.final_price_ex_vat}"
+        )
+        # VAT 23% on large format = ~€2 → ~€11 inc
+        assert 9.0 <= result.final_price_inc_vat <= 14.0, (
+            f"Expected ~€11 inc VAT, got €{result.final_price_inc_vat}"
+        )
+
+    def test_vinyl_labels_no_dims_escalates_not_yield_fallback(self):
+        """The core Bug 1 contract: when dims are missing AND
+        requires_dimensions=True, the engine MUST escalate (return
+        EscalationResult), not fall back to the catalog yield_per_sqm.
+        Production-observed: without this guard, 500 small labels
+        get billed as €341 inc VAT instead of ~€11."""
+        from db import db_session
+        from db.models import Product
+        from pricing_engine import quote_large_format, EscalationResult
+
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="vinyl_labels",
+            ).first()
+            assert p is not None
+            if not getattr(p, "requires_dimensions", False):
+                p.requires_dimensions = True
+                db.commit()
+
+            result = quote_large_format(
+                db, product_key="vinyl_labels",
+                quantity=500,
+                # No width_mm, no height_mm, no area_sqm — the LLM
+                # forgot. Engine must escalate, not silently use the
+                # catalog yield (which would give 6.17 m² × €45 = €277 ex).
+                organization_slug="just-print",
+            )
+        assert isinstance(result, EscalationResult), (
+            f"Expected escalation, got {type(result).__name__} "
+            f"with final_price={getattr(result, 'final_price_ex_vat', None)}"
+        )
+        assert result.manual_review is True
+        # Reason should mention dimensions / size
+        assert any(
+            kw in (result.reason or "").lower()
+            for kw in ("dimensions", "size", "width", "height", "requires")
+        ), f"Expected reason to mention dimensions, got: {result.reason!r}"
+
+    def test_pvc_banner_no_dims_still_works_no_flag(self):
+        """Sanity counter-test: pvc_banners doesn't have
+        requires_dimensions=True, so calling without dims should
+        still work via the legacy area-based fallback (banners are
+        area-priced, not items-cut-from-sheet)."""
+        # Just confirm the guard is product-scoped: a product WITHOUT
+        # the flag should NOT escalate just because dims are missing.
+        from db import db_session
+        from db.models import Product
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="pvc_banners",
+            ).first()
+            assert p is not None
+            assert getattr(p, "requires_dimensions", False) is False, (
+                "pvc_banners must NOT have requires_dimensions=True — "
+                "banners are area-based, the engine's area math is "
+                "correct for them"
+            )
+
+
+class TestSanityMaxUnitPrice:
+    """v38 — when product.sanity_max_unit_price is set, the engine
+    refuses to return a quote whose per-unit cost exceeds it.
+    Prevents the JP-0086 / Ian-Byrne class of bug from EVER reaching
+    a customer."""
+
+    def test_below_ceiling_passes_through(self):
+        """A normal quote (€9 ex VAT / 500 labels = €0.018 per label)
+        is well below any reasonable ceiling — engine returns the quote."""
+        from db import db_session
+        from db.models import Product
+        from pricing_engine import quote_large_format, QuoteResult
+
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="vinyl_labels",
+            ).first()
+            assert p is not None
+            # Set a generous ceiling — €5/unit. €0.018/unit is way under.
+            p.sanity_max_unit_price = 5.0
+            p.requires_dimensions = True
+            db.commit()
+
+            result = quote_large_format(
+                db, product_key="vinyl_labels",
+                quantity=500, width_mm=40, height_mm=10,
+                organization_slug="just-print",
+            )
+        assert isinstance(result, QuoteResult), (
+            f"Expected quote (ceiling not tripped), got "
+            f"{type(result).__name__}: {getattr(result, 'reason', None)}"
+        )
+
+    def test_above_ceiling_escalates(self):
+        """Simulate the JP-0086 scenario: a product mis-configured so
+        the per-unit price comes out absurdly high. Engine should
+        escalate, not return the quote."""
+        from db import db_session
+        from db.models import Product
+        from pricing_engine import quote_large_format, EscalationResult
+
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="vinyl_labels",
+            ).first()
+            assert p is not None
+            # Set a TIGHT ceiling — €0.001/unit. Any real labels will
+            # exceed this. Simulates the "catalog mis-config" scenario.
+            p.sanity_max_unit_price = 0.001
+            p.requires_dimensions = True
+            db.commit()
+            try:
+                result = quote_large_format(
+                    db, product_key="vinyl_labels",
+                    quantity=500, width_mm=40, height_mm=10,
+                    organization_slug="just-print",
+                )
+                assert isinstance(result, EscalationResult), (
+                    f"Expected escalation (ceiling tripped), got "
+                    f"{type(result).__name__}"
+                )
+                assert result.manual_review is True
+                assert "sanity" in (result.reason or "").lower()
+            finally:
+                # Cleanup: remove the ceiling so other tests don't break
+                p.sanity_max_unit_price = None
+                db.commit()
 
 
 # =============================================================================

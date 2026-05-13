@@ -127,6 +127,20 @@ PRODUCT_ALIASES = {
         "vinyl labels", "vinyl label", "vinyl stickers",
         "vinyl sticker", "labels", "stickers",
     ],
+    # v38 — posters (catalog product added in v38; manual_review until
+    # Justin fills in per-size pricing). Aliases cover common phrasings
+    # and explicit size mentions so Craig recognises the request
+    # instead of getting stuck on "we don't have A0 as a standard".
+    "posters": [
+        "poster", "posters", "wall poster", "wall posters",
+        "event poster", "event posters",
+        "a0 print", "a0 prints", "a0 poster", "a0 posters",
+        "a1 print", "a1 prints", "a1 poster", "a1 posters",
+        "a2 print", "a2 prints", "a2 poster", "a2 posters",
+        "a3 poster", "a3 posters",
+        "paper poster", "paper posters",
+        "large print", "large prints",
+    ],
 }
 
 # Flatten for reverse lookup: alias -> product_key

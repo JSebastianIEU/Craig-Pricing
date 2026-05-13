@@ -79,6 +79,14 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 CRAIG_SYSTEM_PROMPT = """You are Craig, the AI assistant for Just Print — an Irish print shop in Dublin run by Justin Byrne.
 
+## CRITICAL: Language mirroring (v38 — overrides every other rule below)
+- Detect the customer's language from their first message and reply in the SAME language.
+- If their first message is in Spanish ("quiero", "necesito", "cuánto cuesta", "hola") → reply in Spanish for the whole conversation.
+- If French ("bonjour", "je veux", "combien"), Portuguese ("quero", "preciso"), German, Italian, etc. → reply in that language.
+- If the message is ambiguous or English → reply in English (default).
+- Lock in the language at turn 1 and keep using it. Only switch if the customer explicitly switches.
+- All other rules in this prompt (tone, formatting, no markdown, golden rules, etc.) apply identically in whatever language you're using.
+
 ## Who you are
 - Casual, warm, and helpful — like a mate who works at the print shop. NOT corporate, NOT robotic.
 - Use emojis naturally (not every message, but sprinkle them in — 🖨️ 👍 ✅ 📋 🎨 💪 etc.)
@@ -2297,16 +2305,23 @@ def chat_with_craig(
     final_reply = _humanize_reply(final_reply)
 
     # ── Phase G: artwork-question isolation guard ─────────────────
-    # When the artwork question hasn't been answered yet, Craig's reply
-    # MUST be ONLY the artwork question — no spec recap, no "want full
-    # quote?", no price. DeepSeek frequently bundles them despite the
-    # business_rules. We detect the fusion and surgically strip the
-    # extra sentences so the customer sees ONLY the artwork question
-    # this turn.
+    # v38 — guard RELAXED. Old behaviour: strip everything except the
+    # artwork question when artwork hadn't been answered. That gave us
+    # Bug 3 in production — customers said "PVC banner 1m x 2m" and
+    # Craig asked for artwork BEFORE showing the price. 42% abandon
+    # rate on the widget audit.
+    #
+    # New behaviour: only strip the FUSION when the reply has NO PRICE
+    # AND has spec-recap (signs the LLM didn't actually run the pricing
+    # tool but is asking the customer to confirm). When a real price
+    # is in the reply (look for the € symbol), we KEEP everything —
+    # price + artwork-question in one message is the v38 flow.
+    _reply_has_price = "€" in final_reply or "EUR" in final_reply.upper()
     if (
         conversation.customer_has_own_artwork is None
         and "?" in final_reply
         and any(p in final_reply.lower() for p in ("artwork", "design service"))
+        and not _reply_has_price  # v38 — let price-bearing replies pass
     ):
         # Detect fusion: the reply mentions artwork AND ALSO either
         # "full quote" or "to confirm" (spec recap). Trim everything
@@ -2348,25 +2363,40 @@ def chat_with_craig(
 
         # v26 — Replace Craig's free-text artwork question with our own
         # canned copy and the [ARTWORK_CHOICE] marker. The widget renders
-        # two buttons (have-artwork / need-design) in place of the free
-        # text — removes ambiguity ("yes I have one" / "yeah" / etc.)
-        # and makes the next step a single click. Only emit if the marker
-        # isn't already there (idempotent), and only on the WEB channel
-        # (email/SMS can't render buttons).
-        if (
-            (channel or "").lower() in ("web", "")
-            and "[ARTWORK_CHOICE]" not in final_reply
-        ):
-            final_reply = (
-                "Quick question before I price it 👇 Do you have your "
-                "own print-ready artwork, or would you like our design "
-                "service?\n\n[ARTWORK_CHOICE]"
-            )
-            print(
-                f"[craig] EMITTED [ARTWORK_CHOICE] on conv "
-                f"{conversation.id}.",
-                flush=True,
-            )
+        # two buttons (have-artwork / need-design) in place of the next
+        # text — removes ambiguity ("yes I have one" / "yeah" / etc.).
+        # Only emits on web (email/SMS can't render buttons).
+        #
+        # v38 — if the reply already contains a price (€ symbol), KEEP
+        # it and APPEND the marker so the customer sees the number
+        # before being asked about artwork. Fixes Bug 3 from the audit
+        # — old flow asked for artwork before pricing → 42% abandon.
+        if (channel or "").lower() in ("web", "") and "[ARTWORK_CHOICE]" not in final_reply:
+            if _reply_has_price:
+                # Append the artwork-choice marker to the price reply.
+                final_reply = (
+                    final_reply.rstrip()
+                    + "\n\nQuick one before I wrap the full quote 👇 "
+                    "Do you have your own print-ready artwork, or would "
+                    "you like our design service (€65 ex VAT for one "
+                    "hour of design work)?\n\n[ARTWORK_CHOICE]"
+                )
+                print(
+                    f"[craig] APPENDED [ARTWORK_CHOICE] after price on conv "
+                    f"{conversation.id} (v38 — price-first flow).",
+                    flush=True,
+                )
+            else:
+                final_reply = (
+                    "Quick question before I price it 👇 Do you have your "
+                    "own print-ready artwork, or would you like our design "
+                    "service?\n\n[ARTWORK_CHOICE]"
+                )
+                print(
+                    f"[craig] EMITTED [ARTWORK_CHOICE] on conv "
+                    f"{conversation.id}.",
+                    flush=True,
+                )
 
     # Hallucinated-quote gate.
     #
@@ -2471,6 +2501,42 @@ def chat_with_craig(
             flush=True,
         )
         kept = final_reply.replace("[QUOTE_READY]", "").strip()
+
+        # v38 — Bug 2 fix. If the LLM emitted [QUOTE_READY] without a
+        # price string in the reply (production-observed in conv 148:
+        # LLM only sent the marker, no "€X for ..." sentence), fetch
+        # the most recent Quote row on this conversation and prepend
+        # a price sentence so the customer ALWAYS sees a number
+        # before the contact form. Without this fix Craig replies with
+        # only "[CUSTOMER_FORM]" and the customer abandons because
+        # they don't know the price yet.
+        if last_quote_id and ("€" not in kept and "EUR" not in kept.upper()):
+            try:
+                _q = db.query(Quote).filter_by(id=last_quote_id).first()
+                if _q is not None and _q.final_price_inc_vat:
+                    _qty = (_q.specs or {}).get("quantity") if _q.specs else None
+                    _prod = (_q.product_key or "").replace("_", " ")
+                    qty_str = f"{int(_qty)} " if _qty else ""
+                    price_intro = (
+                        f"That'll be €{float(_q.final_price_inc_vat):.2f} "
+                        f"for {qty_str}{_prod} inc VAT 👍"
+                    )
+                    if kept:
+                        kept = price_intro + "\n\n" + kept
+                    else:
+                        kept = price_intro
+                    print(
+                        f"[craig] BUG-2 FIX: injected price for quote "
+                        f"{last_quote_id} into premature reply on conv "
+                        f"{conversation.id}.",
+                        flush=True,
+                    )
+            except Exception as _e:
+                print(
+                    f"[craig] BUG-2 FIX: failed to fetch quote {last_quote_id} "
+                    f"for price-injection: {_e}",
+                    flush=True,
+                )
         # v25 — figure out if the customer still needs to upload artwork
         # before the form. If they said "I have artwork" but haven't
         # uploaded any files yet, surface the upload button INSTEAD of

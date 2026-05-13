@@ -109,6 +109,23 @@ class Product(Base):
     # this. Null = config missing -> escalate.
     sheet_price = Column(Float, nullable=True)
 
+    # v38 — defensive scaffolding. When True, the pricing engine MUST
+    # NOT fall back to yield-only math when the LLM forgot to pass
+    # width_mm/height_mm — it ESCALATES instead. Prevents the JP-0086
+    # /Ian-Byrne class of bug: 500 small 40x10mm vinyl labels billed
+    # as if they were 110x110mm because the LLM dropped the dims.
+    # Default False; flipped True on vinyl_labels in v38 migration.
+    requires_dimensions = Column(
+        Boolean, nullable=False, default=False, server_default="0",
+    )
+    # v38 — sanity ceiling on per-quote price. If the engine's
+    # computed final_price_ex_vat exceeds this number, it ESCALATES
+    # to manual review instead of returning a customer-facing quote.
+    # Null = no ceiling (legacy behaviour). Set per-product based on
+    # the highest plausible price for that product. Catches the
+    # "€24,600 vinyl labels" / yield-fallback-runaway class of bug.
+    sanity_max_unit_price = Column(Float, nullable=True)
+
     # v34 — manual-review escalation flag. When True, Craig refuses to
     # auto-quote this product and instead creates a Quote with
     # status='needs_revision' so Justin prices it manually from the

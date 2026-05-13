@@ -174,5 +174,25 @@
     "pricing_unit": "per sq/m",
     "min_qty": 1,
     "notes": "Die-cut POA."
+  },
+  "posters": {
+    "name": "Posters",
+    "description": "Flat paper posters — full colour digital print on 170gsm or 200gsm silk paper, sizes A4 through A0. Common uses: event posters, wall posters, exhibition graphics.",
+    "sizes": [
+      "A4 (210x297mm)",
+      "A3 (297x420mm)",
+      "A2 (420x594mm)",
+      "A1 (594x841mm)",
+      "A0 (841x1189mm)"
+    ],
+    "unit_price": null,
+    "bulk_price": null,
+    "bulk_threshold": null,
+    "pricing_unit": "per poster",
+    "min_qty": 1,
+    "notes": "Pricing varies by size and paper weight — Justin will quote manually. Aliases: poster, posters, wall poster, event poster, A0 print, A1 print, A2 print, A3 poster.",
+    "pricing_strategy": "manual_review",
+    "manual_review_required": true,
+    "manual_review_reason": "Poster pricing varies by size, paper weight, finish — needs Justin's quote"
   }
 }

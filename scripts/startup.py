@@ -76,6 +76,14 @@ def main() -> None:
     )
     _run("v37 pre-DDL (Conversation.engagement_classification column)", v37_ddl_only)
 
+    # v38 pre-DDL — adds Product.requires_dimensions + .sanity_max_unit_price.
+    # The model declares these; older ORM migrations select Product, so
+    # the columns need to exist first.
+    from scripts.v38_widget_fixes import (
+        migrate_ddl_only as v38_ddl_only,
+    )
+    _run("v38 pre-DDL (Product.requires_dimensions + sanity_max_unit_price)", v38_ddl_only)
+
     # Only bootstrap pricing data if the DB is empty — otherwise this wipes
     # everything the user has edited since first deploy (system_prompt,
     # business_rules, catalog edits, etc.).
@@ -123,6 +131,7 @@ def main() -> None:
     from scripts.v36_per_sqm_per_sheet_pricing import migrate as v36_migrate
     from scripts.v37_engagement_approval import migrate as v37_migrate
     from scripts.v37_7_cutover_safety import migrate as v37_7_migrate
+    from scripts.v38_widget_fixes import migrate as v38_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -158,6 +167,7 @@ def main() -> None:
     _run("v36 per-sqm + per-sheet pricing strategies", v36_migrate)
     _run("v37 engagement-approval gate (Missive low-confidence pause)", v37_migrate)
     _run("v37.7 cutover safety + internal-team allowlist seed", v37_7_migrate)
+    _run("v38 widget bug-fix pass (requires_dimensions + posters + price-first rules)", v38_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

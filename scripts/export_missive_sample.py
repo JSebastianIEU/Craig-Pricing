@@ -95,49 +95,99 @@ def _get_with_retry(client: httpx.Client, url: str, params: dict | None = None,
 
 
 def _iter_conversations(
-    client: httpx.Client, account: str, since_iso: str,
+    client: httpx.Client,
+    mailbox_param: str,
+    since_unix: int,
+    label: str,
 ) -> Iterator[dict]:
-    """Paginate `/conversations` filtered by account + since. Missive's
-    pagination uses cursor-based `until` query param; if absent, returns
-    the most recent page."""
-    until: float | None = None
+    """Paginate `/conversations` with Missive's required mailbox filter.
+
+    `mailbox_param` is the literal query string fragment, e.g. "all=true"
+    or "team_inbox=<uuid>". Missive requires exactly one of these to
+    avoid the "You need to paginate at least one mailbox" 400.
+
+    Cursor pagination uses `until=<unix_timestamp>` based on the oldest
+    `last_activity_at` we've seen. Stops when:
+      * the page has < limit results (last page), OR
+      * the oldest conversation's last_activity_at is older than
+        `since_unix` (we've walked past the lookback window), OR
+      * the cursor doesn't move (no progress / API quirk)
+    """
+    # Parse mailbox_param ("all=true" or "team_inbox=<uuid>") into a
+    # proper dict so httpx doesn't strip it when params= is passed.
+    # httpx behaviour: client.get(url, params=...) REPLACES any
+    # query string already on the URL — including the mailbox filter.
+    # We assemble ALL params into one dict instead.
+    mailbox_dict: dict[str, str] = {}
+    for kv in mailbox_param.split("&"):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            mailbox_dict[k.strip()] = v.strip()
+        elif kv.strip():
+            mailbox_dict[kv.strip()] = "true"
+
+    until: int | None = None
     page = 0
+    seen_ids: set[str] = set()
     while True:
+        # Missive's /conversations endpoint enforces a hard max of 10
+        # per page (their docs claim 50; observed behaviour: 400 above 10).
         params: dict[str, Any] = {
-            "account": account,
-            "since": since_iso,
-            "limit": 50,
+            **mailbox_dict,
+            "limit": 10,
         }
         if until is not None:
-            params["until"] = int(until)
+            params["until"] = until
         page += 1
-        print(f"page {page}  fetching conversations...", file=sys.stderr)
-        body = _get_with_retry(client, f"{MISSIVE_BASE}/conversations", params)
+        print(
+            f"[{label}] page {page} until={until} fetching conversations...",
+            file=sys.stderr,
+        )
+        body = _get_with_retry(
+            client, f"{MISSIVE_BASE}/conversations", params,
+        )
         time.sleep(RATE_LIMIT_DELAY)
         if not body:
             break
         convs = body.get("conversations") or []
         if not convs:
             break
+        new_count = 0
         for c in convs:
+            cid = c.get("id")
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            new_count += 1
             yield c
-        # Cursor: the oldest message's last_activity_at (Unix epoch)
+        # Cursor: the oldest conversation's last_activity_at.
         oldest = convs[-1]
         next_until = oldest.get("last_activity_at")
         if not next_until or next_until == until:
-            # No progress — bail out
             break
-        until = next_until
+        if next_until < since_unix:
+            # We've paginated past the lookback window.
+            print(
+                f"[{label}] reached cutoff at {next_until} < {since_unix}, stopping",
+                file=sys.stderr,
+            )
+            break
+        if new_count == 0:
+            # All results were dupes from a previous page — bail out.
+            break
+        until = int(next_until)
 
 
 def _list_messages(
-    client: httpx.Client, conversation_id: str, limit: int = 20,
+    client: httpx.Client, conversation_id: str, limit: int = 10,
 ) -> list[dict]:
-    """Fetch the latest N messages in a conversation."""
+    """Fetch the latest N messages in a conversation. Missive caps
+    `limit` at 10 per page; we don't bother paginating since we
+    only need the most recent inbound for triage simulation."""
     body = _get_with_retry(
         client,
         f"{MISSIVE_BASE}/conversations/{conversation_id}/messages",
-        params={"limit": limit},
+        params={"limit": min(limit, 10)},
     )
     time.sleep(RATE_LIMIT_DELAY)
     if not body:
@@ -181,16 +231,41 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Export inbound Missive emails for Craig audit.",
     )
-    parser.add_argument("--account", required=True, help="Watched inbox, e.g. info@just-print.ie")
+    parser.add_argument(
+        "--account", required=True,
+        help="Watched inbox label (only used for filename + log; "
+             "actual pagination is by mailbox/team — see --mailbox)",
+    )
+    parser.add_argument(
+        "--mailbox",
+        default="all=true",
+        help=(
+            "Missive mailbox filter (REQUIRED by their API). Examples:\n"
+            "  --mailbox 'all=true'                   (every conv the token can see)\n"
+            "  --mailbox 'inbox=true'                 (user's personal inbox)\n"
+            "  --mailbox 'team_inbox=<team-uuid>'     (specific team inbox)\n"
+            "  --mailbox 'team_all=<team-uuid>'       (specific team all-mailbox)\n"
+            "Default: all=true"
+        ),
+    )
+    parser.add_argument(
+        "--team-ids",
+        default="",
+        help=(
+            "Comma-separated team UUIDs. When set, ignore --mailbox and "
+            "iterate team_all=<uuid> for each team in turn — captures "
+            "everything across multiple team mailboxes."
+        ),
+    )
     parser.add_argument("--days", type=int, default=90, help="Lookback window (default 90)")
     parser.add_argument("--out", required=True, help="Output path (.jsonl)")
     parser.add_argument(
-        "--max-conversations", type=int, default=2000,
-        help="Safety cap on conversations scanned (default 2000)",
+        "--max-conversations", type=int, default=5000,
+        help="Safety cap on conversations scanned (default 5000)",
     )
     parser.add_argument(
-        "--max-messages-per-conv", type=int, default=20,
-        help="Max messages pulled per conversation (default 20)",
+        "--max-messages-per-conv", type=int, default=10,
+        help="Max messages pulled per conversation (default 10 — Missive's hard cap)",
     )
     args = parser.parse_args()
 
@@ -204,61 +279,83 @@ def main() -> int:
         return 2
 
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=args.days)
-    cutoff_iso = cutoff_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+    cutoff_unix = int(cutoff_dt.timestamp())
     print(
-        f"Fetching inbound emails for {args.account} since {cutoff_iso} "
-        f"(last {args.days} days)...",
+        f"Fetching inbound emails for {args.account} (last {args.days} days, "
+        f"since unix {cutoff_unix})...",
         file=sys.stderr,
     )
+
+    # Build the list of mailbox filters to iterate.
+    mailbox_filters: list[tuple[str, str]] = []  # (label, filter_string)
+    if args.team_ids:
+        for team_id in [t.strip() for t in args.team_ids.split(",") if t.strip()]:
+            mailbox_filters.append((f"team={team_id[:8]}", f"team_all={team_id}"))
+    else:
+        # Single filter passed via --mailbox
+        mailbox_filters.append(("all", args.mailbox))
 
     n_convs = 0
     n_inbound = 0
     n_outbound = 0
     n_nonmail = 0
+    n_too_old = 0
+    seen_thread_ids: set[str] = set()
     with httpx.Client(headers=_headers(token), timeout=DEFAULT_TIMEOUT) as client, \
          open(args.out, "w", encoding="utf-8") as out:
-        for conv in _iter_conversations(client, args.account, cutoff_iso):
-            n_convs += 1
-            if n_convs > args.max_conversations:
-                print(
-                    f"reached --max-conversations cap ({args.max_conversations}), stopping",
-                    file=sys.stderr,
-                )
-                break
-            conv_id = conv.get("id")
-            if not conv_id:
-                continue
-            labels = [
-                (lbl.get("name") or "")
-                for lbl in (conv.get("shared_labels") or conv.get("labels") or [])
-                if isinstance(lbl, dict)
-            ]
-            messages = _list_messages(
-                client, conv_id, limit=args.max_messages_per_conv,
-            )
-            for msg in messages:
-                rec = _extract_inbound(msg, args.account)
-                if rec is None:
-                    msg_type = (msg.get("type") or "").lower()
-                    if msg_type == "email":
-                        n_outbound += 1
-                    else:
-                        n_nonmail += 1
+        for label, mbox in mailbox_filters:
+            print(f"\n==== mailbox filter: {mbox} ====", file=sys.stderr)
+            for conv in _iter_conversations(client, mbox, cutoff_unix, label):
+                n_convs += 1
+                if n_convs > args.max_conversations:
+                    print(
+                        f"reached --max-conversations cap ({args.max_conversations}), stopping",
+                        file=sys.stderr,
+                    )
+                    break
+                conv_id = conv.get("id")
+                if not conv_id or conv_id in seen_thread_ids:
                     continue
-                rec["thread_id"] = conv_id
-                rec["labels"] = labels
-                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                n_inbound += 1
-            if n_convs % 50 == 0:
-                print(
-                    f"  progress: {n_convs} conversations / "
-                    f"{n_inbound} inbound emails so far",
-                    file=sys.stderr,
+                # Skip conversations whose latest activity is older
+                # than the cutoff — saves wasted message fetches.
+                last_activity = conv.get("last_activity_at") or 0
+                if last_activity < cutoff_unix:
+                    n_too_old += 1
+                    continue
+                seen_thread_ids.add(conv_id)
+                conv_labels = [
+                    (lbl.get("name") or "")
+                    for lbl in (conv.get("shared_labels") or conv.get("labels") or [])
+                    if isinstance(lbl, dict)
+                ]
+                messages = _list_messages(
+                    client, conv_id, limit=args.max_messages_per_conv,
                 )
+                for msg in messages:
+                    rec = _extract_inbound(msg, args.account)
+                    if rec is None:
+                        msg_type = (msg.get("type") or "").lower()
+                        if msg_type == "email":
+                            n_outbound += 1
+                        else:
+                            n_nonmail += 1
+                        continue
+                    rec["thread_id"] = conv_id
+                    rec["labels"] = conv_labels
+                    rec["mailbox_filter"] = mbox
+                    out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    n_inbound += 1
+                if n_convs % 50 == 0:
+                    print(
+                        f"  progress: {n_convs} conversations / "
+                        f"{n_inbound} inbound emails so far",
+                        file=sys.stderr,
+                    )
 
     print(file=sys.stderr)
     print(
-        f"Done. {n_convs} conversations scanned, "
+        f"Done. {n_convs} conversations scanned "
+        f"({n_too_old} older than cutoff, skipped), "
         f"{n_inbound} inbound emails exported, "
         f"{n_outbound} outbound skipped, "
         f"{n_nonmail} non-email events skipped.",

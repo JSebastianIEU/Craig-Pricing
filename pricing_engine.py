@@ -908,8 +908,17 @@ def _quote_per_sqm(
                         f"= {total_m2:.2f} m²"
                     )
 
-        # Last resort: pure yield-based math (no per-item area)
-        if total_m2 is None and yield_value and yield_value > 0:
+        # Last resort: pure yield-based math (no per-item area).
+        # v38 — products flagged `requires_dimensions=True` MUST NOT
+        # fall back to yield-only. Their item sizes vary too widely
+        # (vinyl labels: 40x10mm to 200x200mm — same yield gives a
+        # 30x wrong price). When the LLM forgot to pass dims, escalate
+        # instead so the customer never sees a "crazy" price.
+        if (
+            total_m2 is None
+            and yield_value and yield_value > 0
+            and not getattr(product, "requires_dimensions", False)
+        ):
             total_m2 = round(quantity / yield_value, 4)
             breakdown_note = (
                 f"{quantity} / {yield_value:.0f} per m² "
@@ -918,21 +927,40 @@ def _quote_per_sqm(
 
     if total_m2 is None or total_m2 <= 0:
         # Couldn't compute area from any input. Escalate.
-        return EscalationResult(
-            reason=(
+        # v38 — distinct reason when the product requires_dimensions
+        # so the LLM (and operator dashboard) sees WHY the yield-only
+        # fallback was refused.
+        if getattr(product, "requires_dimensions", False):
+            reason = (
+                f"{product.key} requires per-unit dimensions (width_mm "
+                f"+ height_mm). Item sizes vary too widely for the "
+                f"yield-only fallback to be safe. Refusing to quote "
+                f"without dims."
+            )
+            message = (
+                "Ask the customer for the size of each item in mm "
+                "(width × height). Don't quote without it — small "
+                "labels priced via yield-only get billed as if they "
+                "were 10× bigger."
+            )
+        else:
+            reason = (
                 f"Per-sq/m product needs dimensions or area. Pass "
                 f"width_mm + height_mm, or area_sqm directly. "
                 f"Configure default_unit_size_mm / yield_per_sqm on "
                 f"{product.key} in the catalog if you want a fallback."
-            ),
-            product_name=product.name,
-            manual_review=True,
-            message=(
+            )
+            message = (
                 "Ask the customer for the size of each item in mm "
                 "(width × height), then re-quote with width_mm + "
                 "height_mm. If the customer gave overall area instead, "
                 "pass area_sqm."
-            ),
+            )
+        return EscalationResult(
+            reason=reason,
+            product_name=product.name,
+            manual_review=True,
+            message=message,
         )
 
     # 2. Pick price per m² (bulk if total_m² ≥ threshold)
@@ -954,6 +982,35 @@ def _quote_per_sqm(
         )
 
     total_ex = round(total_m2 * unit_price, 2)
+
+    # v38 — sanity ceiling. If a per-unit price exceeds the
+    # `sanity_max_unit_price` column, the catalog config is probably
+    # mis-set OR the engine took a wrong-path branch (e.g. yield
+    # fallback for a product that shouldn't have one). Escalate
+    # instead of returning a customer-facing nonsense quote. Catches
+    # the JP-0086 €24,600 vinyl-labels / yield-runaway class of bug.
+    if (
+        getattr(product, "sanity_max_unit_price", None)
+        and quantity > 0
+    ):
+        per_unit_ex = total_ex / quantity
+        max_unit = float(product.sanity_max_unit_price)
+        if per_unit_ex > max_unit:
+            return EscalationResult(
+                reason=(
+                    f"sanity-ceiling tripped: computed €{per_unit_ex:.2f}/unit "
+                    f"on {product.key} (cap €{max_unit:.2f}/unit). "
+                    f"Total ex VAT would have been €{total_ex:.2f}. "
+                    f"Escalating instead of sending a probably-wrong quote."
+                ),
+                product_name=product.name,
+                manual_review=True,
+                message=(
+                    "The per-unit price came out higher than the catalog's "
+                    "sanity-max ceiling — Justin to verify the inputs / "
+                    "catalog config before this goes to the customer."
+                ),
+            )
 
     # Client multiplier (after surcharges, before VAT)
     client_mult = _get_client_multiplier(db, organization_slug=organization_slug)
