@@ -119,6 +119,13 @@ def migrate(organization_slug: str = DEFAULT_ORG_SLUG) -> None:
         print("Loading large format products...")
         large_format = _load_json("large_format.json")
         for key, data in large_format.items():
+            # v38 — some products (e.g. `posters`) are manual_review
+            # with no auto-pricing. Their unit_price / bulk_price /
+            # bulk_threshold are JSON-null. Map None → None on the
+            # ORM (nullable=True on those columns) instead of
+            # crashing the migration with float(None).
+            def _num_or_none(v, cast):
+                return cast(v) if v is not None else None
             product = Product(
                 organization_slug=organization_slug,
                 key=key,
@@ -129,11 +136,15 @@ def migrate(organization_slug: str = DEFAULT_ORG_SLUG) -> None:
                 finishes=[],
                 price_per=data.get("pricing_unit", ""),
                 notes=data.get("notes", ""),
-                unit_price=float(data["unit_price"]),
-                bulk_price=float(data["bulk_price"]),
-                bulk_threshold=int(data["bulk_threshold"]),
+                unit_price=_num_or_none(data.get("unit_price"), float),
+                bulk_price=_num_or_none(data.get("bulk_price"), float),
+                bulk_threshold=_num_or_none(data.get("bulk_threshold"), int),
                 pricing_unit=data.get("pricing_unit", ""),
                 min_qty=int(data.get("min_qty", 1)),
+                # v38 — manual_review fields straight from JSON
+                manual_review_required=bool(data.get("manual_review_required", False)),
+                manual_review_reason=data.get("manual_review_reason"),
+                pricing_strategy=data.get("pricing_strategy", "bulk_break"),
             )
             db.add(product)
         print(f"  -> {len(large_format)} large format products")

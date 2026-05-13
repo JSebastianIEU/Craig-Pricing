@@ -3,6 +3,9 @@
 # (auto-deploys to Cloud Run in project just-print-craig, region europe-west1)
 #
 # Steps:
+#   0. Run the critical tests (chat smoke + flow + pricing engine).
+#      If any fail, the build STOPS — nothing reaches Cloud Run.
+#      v38.5 — added after the v38.3 NameError shipped to prod silently.
 #   1. Build the Docker image from the repo root.
 #   2. Push it to Artifact Registry (same repository Cloud Run uses for
 #      its automatic `--source` deploys, so permissions are already set).
@@ -21,10 +24,57 @@ substitutions:
     _REPO: cloud-run-source-deploy
 
 steps:
+    # 0. TESTS — run the critical defensive suite BEFORE building / pushing.
+    #    If any of these fail, Cloud Build aborts and no deploy happens.
+    #    Added after v38's bug parade — pre-v38.5, every code regression
+    #    shipped to production because there was no gate.
+    #
+    #    Covers:
+    #      * test_chat_smoke.py — POST /chat round-trip (catches NameError
+    #        / import / migration / response-shape breakage)
+    #      * test_craig_flow.py — multi-turn conversation contracts +
+    #        the 6 production bug regressions
+    #      * test_pricing_edge_cases.py — engine boundary conditions
+    #      * test_pricing.py — full pricing engine math
+    #      * test_cutover_safety.py — v37.7 migration safety
+    #      * test_inbound_classifier.py — confidence-tier triage
+    #      * test_missive.py — webhook loop-prevention + kill-switch
+    #
+    #    Tests run against a fresh local SQLite (CRAIG_DB_PATH=/tmp/...)
+    #    seeded by scripts.startup. ~2-3 min total.
+    - name: python:3.11-slim
+      id: tests
+      entrypoint: bash
+      env:
+          - STRATEGOS_JWT_SECRET=ci-test-secret-32-bytes-padded-enough
+          - CRAIG_DB_PATH=/tmp/craig-ci.db
+          - DEEPSEEK_API_KEY=ci-fake-key-no-network-calls-made
+      args:
+          - -c
+          - |
+            set -eu
+            echo "== Installing deps =="
+            pip install --no-cache-dir -r requirements.txt
+            pip install --no-cache-dir pytest pytest-cov httpx respx
+            echo "== Seeding test DB =="
+            python -m scripts.startup
+            echo "== Running critical test suite =="
+            pytest \
+                test_chat_smoke.py \
+                test_craig_flow.py \
+                test_pricing_edge_cases.py \
+                test_pricing.py \
+                test_cutover_safety.py \
+                test_inbound_classifier.py \
+                test_missive.py \
+                -q --no-header --tb=short --maxfail=5
+            echo "== All tests passed — proceeding to build =="
+
     # 1. Build — tagged with the short SHA so every commit is immutable +
     #    traceable from the Cloud Run revision list.
     - name: gcr.io/cloud-builders/docker
       id: build
+      waitFor: ['tests']
       args:
           - build
           - -t
@@ -65,4 +115,4 @@ options:
     logging: CLOUD_LOGGING_ONLY
     machineType: E2_HIGHCPU_8
 
-timeout: 900s   # 15 min — our Docker build takes ~3-5, headroom is cheap.
+timeout: 1500s  # 25 min — tests ~3, build ~5, push ~2, deploy ~2; rest is headroom.
