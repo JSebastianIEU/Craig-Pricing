@@ -126,6 +126,15 @@ class Product(Base):
     # "€24,600 vinyl labels" / yield-fallback-runaway class of bug.
     sanity_max_unit_price = Column(Float, nullable=True)
 
+    # v39 — minimum billable area for per_sqm products. When set, an
+    # order whose computed total_m2 falls BELOW this value is billed
+    # as if it were exactly this many m². Justin's ask: vinyl labels
+    # under 1 m² should be charged a full square metre (there's a
+    # real physical minimum cut / sheet usage). Null = no minimum
+    # (legacy behaviour — banners etc. bill the exact area). Only the
+    # per_sqm engine path reads it.
+    min_billable_sqm = Column(Float, nullable=True)
+
     # v34 — manual-review escalation flag. When True, Craig refuses to
     # auto-quote this product and instead creates a Quote with
     # status='needs_revision' so Justin prices it manually from the
@@ -387,6 +396,23 @@ class Conversation(Base):
     # Stored as JSON (Postgres JSONB / SQLite TEXT) so we don't have
     # to ALTER TABLE every time we want to add an audit field.
     engagement_classification = Column(JSON, nullable=True)
+
+    # v40 — marketing attribution. Captured by the widget from the
+    # landing-page URL (UTMs + ad click IDs) and merged in on every
+    # /chat + customer-info call. Shape:
+    #   {
+    #     "first_touch": { utm_source, utm_medium, utm_campaign,
+    #        utm_term, utm_content, gclid, gbraid, wbraid, fbclid,
+    #        fbc, fbp, ttclid, msclkid, li_fat_id, landing_page,
+    #        referrer, captured_at },   # write-once
+    #     "last_touch":  { ...same keys... },   # always updated
+    #     "merged_from": ["<external_id of a stitched prior session>"]
+    #   }
+    # Only keys actually present on the click are stored. first_touch
+    # is write-once server-side so a cleared/forged client can't
+    # overwrite a genuine first touch. JSON (Postgres JSONB / SQLite
+    # TEXT) so new ad platforms never need an ALTER TABLE.
+    attribution = Column(JSON, nullable=True)
 
     quotes = relationship("Quote", back_populates="conversation", cascade="all, delete-orphan")
 

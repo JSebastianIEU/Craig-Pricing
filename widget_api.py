@@ -142,6 +142,12 @@ class CustomerInfoForm(BaseModel):
     # Required ONLY when delivery_method='delivery'. We re-check in code
     # because Pydantic conditional required-ness is awkward.
     delivery_address: Optional[_DeliveryAddressIn] = None
+    # v40 — marketing attribution from the widget. The model is
+    # extra="forbid" so this MUST be declared to be accepted. Redundant
+    # with /chat (covers the case where a customer fills the form
+    # without chatting), and the first reliable point we have email +
+    # phone for identity backfill.
+    attribution: Optional[dict] = None
 
     @field_validator("email")
     @classmethod
@@ -239,6 +245,21 @@ def submit_customer_info(
     conv.delivery_method = method
     conv.delivery_address = addr_dict or None
     db.flush()
+
+    # v40 — merge attribution from the form payload, then attempt an
+    # identity backfill now that we reliably have email + phone (links
+    # this conversation to a prior attributed web session if one exists).
+    # Defensive: attribution must never break the form submit.
+    try:
+        from attribution import (
+            merge_attribution, backfill_attribution_by_identity,
+        )
+        if body.attribution:
+            merge_attribution(conv, body.attribution)
+        backfill_attribution_by_identity(db, conv)
+        db.flush()
+    except Exception as _attr_err:  # pragma: no cover - defensive
+        print(f"[widget] attribution merge/backfill failed: {_attr_err}", flush=True)
 
     # Find the most-recent pending Quote on this conversation and
     # apply shipping. If there is no quote yet (edge case: form submitted

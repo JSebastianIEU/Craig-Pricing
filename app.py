@@ -108,6 +108,12 @@ class ChatRequest(BaseModel):
         description="Which tenant's catalog + system prompt Craig should use. "
                     "Widgets pass their client slug here (from data-client on the embed).",
     )
+    # v40 — marketing attribution captured by the widget from the
+    # landing-page URL (UTMs + ad click IDs). Merged into the
+    # conversation server-side. Shape: {first_touch:{...}, last_touch:{...}}.
+    attribution: Optional[dict] = Field(
+        None, description="UTM + ad click-ID attribution from the widget"
+    )
 
 
 class QuoteSmallFormatRequest(BaseModel):
@@ -256,6 +262,7 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
             external_id=req.session_id,
             channel=req.channel,
             organization_slug=req.organization_slug,
+            attribution=req.attribution,
         )
     except Exception as e:
         # Surface a friendly error to the frontend
@@ -1242,6 +1249,14 @@ def _handle_missive_event(org_slug: str, payload: dict) -> None:
                 conv.customer_email = evt["from_address"]
                 if evt["from_name"] and not (conv.customer_name or "").strip():
                     conv.customer_name = evt["from_name"]
+                # v40 — an email lead carries no UTM/click IDs of its own,
+                # but if this person clicked an ad + landed on the site
+                # earlier, we can attribute them by identity (email match).
+                try:
+                    from attribution import backfill_attribution_by_identity
+                    backfill_attribution_by_identity(db, conv)
+                except Exception as _attr_err:  # pragma: no cover - defensive
+                    _mlog.warning("attribution backfill failed: %s", _attr_err)
                 db.commit()
 
         # ── v29: persist inbound artwork attachments onto the Quote ──

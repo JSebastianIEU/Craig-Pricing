@@ -84,6 +84,21 @@ def main() -> None:
     )
     _run("v38 pre-DDL (Product.requires_dimensions + sanity_max_unit_price)", v38_ddl_only)
 
+    # v39 pre-DDL — adds Product.min_billable_sqm. The model declares it;
+    # older ORM migrations SELECT Product, so the column must exist first.
+    from scripts.v39_min_billable_area import (
+        migrate_ddl_only as v39_ddl_only,
+    )
+    _run("v39 pre-DDL (Product.min_billable_sqm)", v39_ddl_only)
+
+    # v40 pre-DDL — adds Conversation.attribution (JSONB). The model
+    # declares it; older ORM migrations SELECT Conversation, so the
+    # column must exist first.
+    from scripts.v40_attribution import (
+        migrate_ddl_only as v40_ddl_only,
+    )
+    _run("v40 pre-DDL (Conversation.attribution)", v40_ddl_only)
+
     # Only bootstrap pricing data if the DB is empty — otherwise this wipes
     # everything the user has edited since first deploy (system_prompt,
     # business_rules, catalog edits, etc.).
@@ -132,6 +147,8 @@ def main() -> None:
     from scripts.v37_engagement_approval import migrate as v37_migrate
     from scripts.v37_7_cutover_safety import migrate as v37_7_migrate
     from scripts.v38_widget_fixes import migrate as v38_migrate
+    from scripts.v39_min_billable_area import migrate as v39_migrate
+    from scripts.v40_attribution import migrate as v40_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -168,6 +185,8 @@ def main() -> None:
     _run("v37 engagement-approval gate (Missive low-confidence pause)", v37_migrate)
     _run("v37.7 cutover safety + internal-team allowlist seed", v37_7_migrate)
     _run("v38 widget bug-fix pass (requires_dimensions + posters + price-first rules)", v38_migrate)
+    _run("v39 minimum billable area (per-sq/m floor)", v39_migrate)
+    _run("v40 marketing attribution column", v40_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

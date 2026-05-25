@@ -284,6 +284,8 @@ def _product_to_dict(p: Product, tiers: list[PriceTier]) -> dict[str, Any]:
         "default_unit_size_mm": getattr(p, "default_unit_size_mm", None),
         "sheet_size_mm": getattr(p, "sheet_size_mm", None),
         "sheet_price": getattr(p, "sheet_price", None),
+        # v39 — minimum billable area (per-sq/m floor)
+        "min_billable_sqm": getattr(p, "min_billable_sqm", None),
         "tiers": [
             {"id": t.id, "spec_key": t.spec_key, "quantity": t.quantity, "price": t.price}
             for t in tiers
@@ -351,6 +353,8 @@ class CreateProductRequest(BaseModel):
     default_unit_size_mm: Optional[str] = Field(default=None, max_length=20)
     sheet_size_mm: Optional[str] = Field(default=None, max_length=20)
     sheet_price: Optional[float] = Field(default=None, ge=0)
+    # v39 — minimum billable area for per-sq/m products
+    min_billable_sqm: Optional[float] = Field(default=None, ge=0)
 
     @field_validator("pricing_strategy")
     @classmethod
@@ -451,6 +455,8 @@ class UpdateProductRequest(BaseModel):
     default_unit_size_mm: Optional[str] = Field(default=None, max_length=20)
     sheet_size_mm: Optional[str] = Field(default=None, max_length=20)
     sheet_price: Optional[float] = Field(default=None, ge=0)
+    # v39 — minimum billable area for per-sq/m products
+    min_billable_sqm: Optional[float] = Field(default=None, ge=0)
 
     @field_validator("pricing_strategy")
     @classmethod
@@ -3303,6 +3309,9 @@ def _conv_summary(c: Conversation) -> dict[str, Any]:
         # v37 — engagement-approval gate. Carries the classifier verdict +
         # audit fields when the conversation is paused awaiting Justin.
         "engagement_classification": getattr(c, "engagement_classification", None),
+        # v40 — marketing attribution (first/last touch UTMs + click IDs).
+        # Lets the Conversations module show a source chip per lead.
+        "attribution": getattr(c, "attribution", None),
     }
 
 
@@ -3599,6 +3608,159 @@ def get_metrics(
             {"date": str(day), "count": int(cnt), "value": round(float(val), 2)}
             for day, cnt, val in by_day_rows
         ],
+    }
+
+
+# ============================================================================
+# v40 — Marketing attribution report
+# ----------------------------------------------------------------------------
+# Joins each lead's captured ad source (Conversation.attribution) to its
+# quotes (value) and paid quotes (revenue), so the ads agency can see
+# which campaigns actually turn into paid jobs — not just lead volume.
+# Bucketed in Python after the join because the attribution lives in a
+# JSON column and SQLite/Postgres JSON access differs; single-shop
+# volume makes portability worth more than SQL cleverness.
+# ============================================================================
+
+_ATTR_GROUP_KEYS = ("utm_source", "utm_medium", "utm_campaign")
+
+
+@router.get("/orgs/{org_slug}/attribution-report")
+def attribution_report(
+    org_slug: str,
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = Query(None),
+    group_by: str = Query("utm_source"),
+    touch: str = Query("last", pattern=r"^(first|last)$"),
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    access_guard(org_slug, claims)
+    # Financial data — owner only, same bar as metrics/quotes.
+    require_role(claims, "client_owner")
+
+    if group_by not in _ATTR_GROUP_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"group_by must be one of {_ATTR_GROUP_KEYS}",
+        )
+
+    end = _parse_iso(to) or datetime.now(timezone.utc)
+    start = _parse_iso(from_) or (end - timedelta(days=30))
+    touch_key = f"{touch}_touch"
+
+    convs = (
+        _scope(db.query(Conversation), Conversation, claims, org_slug)
+        .filter(
+            Conversation.created_at >= start,
+            Conversation.created_at <= end,
+            Conversation.is_test.isnot(True),
+        )
+        .order_by(Conversation.created_at.desc())
+        .all()
+    )
+    conv_ids = [c.id for c in convs]
+
+    # One query for all quotes on those conversations.
+    quotes_by_conv: dict[int, list[Quote]] = {}
+    if conv_ids:
+        for q in (
+            db.query(Quote)
+            .filter(Quote.conversation_id.in_(conv_ids))
+            .all()
+        ):
+            quotes_by_conv.setdefault(q.conversation_id, []).append(q)
+
+    def _bucket_label(c: Conversation) -> Optional[str]:
+        attr = c.attribution or {}
+        t = attr.get(touch_key) or {}
+        val = (t.get(group_by) or "").strip() if isinstance(t, dict) else ""
+        return val or None
+
+    # bucket -> aggregated counters
+    agg: dict[str, dict[str, float]] = {}
+    unattributed = {
+        "leads": 0, "quotes": 0, "quotes_value": 0.0,
+        "accepted": 0, "won": 0, "revenue": 0.0,
+    }
+    journeys: list[dict[str, Any]] = []
+
+    for c in convs:
+        qs = quotes_by_conv.get(c.id, [])
+        has_quote = len(qs) > 0
+        quotes_value = sum(float(q.total or 0.0) for q in qs)
+        accepted = any(getattr(q, "client_confirmed_at", None) for q in qs)
+        paid_quotes = [
+            q for q in qs
+            if (getattr(q, "stripe_payment_status", None) or "") == "paid"
+        ]
+        won = len(paid_quotes) > 0
+        revenue = sum(float(q.total or 0.0) for q in paid_quotes)
+
+        label = _bucket_label(c)
+        target = agg.setdefault(label, {
+            "leads": 0, "quotes": 0, "quotes_value": 0.0,
+            "accepted": 0, "won": 0, "revenue": 0.0,
+        }) if label is not None else unattributed
+
+        target["leads"] += 1
+        target["quotes"] += 1 if has_quote else 0
+        target["quotes_value"] += quotes_value
+        target["accepted"] += 1 if accepted else 0
+        target["won"] += 1 if won else 0
+        target["revenue"] += revenue
+
+        # Per-lead drill-down (audit source -> revenue).
+        attr = c.attribution or {}
+        journeys.append({
+            "conversation_id": c.id,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "channel": c.channel,
+            "customer_email": c.customer_email,
+            "first_touch": attr.get("first_touch"),
+            "last_touch": attr.get("last_touch"),
+            "quotes": [
+                {
+                    "id": q.id,
+                    "created_at": q.created_at.isoformat() if q.created_at else None,
+                    "product_key": q.product_key,
+                    "total": round(float(q.total or 0.0), 2),
+                    "paid": (getattr(q, "stripe_payment_status", None) or "") == "paid",
+                    "stripe_paid_at": (
+                        q.stripe_paid_at.isoformat()
+                        if getattr(q, "stripe_paid_at", None) else None
+                    ),
+                }
+                for q in qs
+            ],
+        })
+
+    def _row(label: str, d: dict[str, float]) -> dict[str, Any]:
+        leads = d["leads"] or 0
+        quotes = d["quotes"] or 0
+        return {
+            "source": label,
+            "leads": int(leads),
+            "quotes": int(quotes),
+            "quotes_value": round(d["quotes_value"], 2),
+            "accepted": int(d["accepted"]),
+            "won": int(d["won"]),
+            "revenue": round(d["revenue"], 2),
+            "lead_to_quote": round(quotes / leads, 4) if leads else 0.0,
+            "quote_to_won": round(d["won"] / quotes, 4) if quotes else 0.0,
+        }
+
+    rows = [_row(label, d) for label, d in agg.items()]
+    rows.sort(key=lambda r: r["revenue"], reverse=True)
+
+    return {
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "group_by": group_by,
+        "touch": touch,
+        "rows": rows,
+        "unattributed": _row("(unattributed)", unattributed),
+        "journeys": journeys,
     }
 
 

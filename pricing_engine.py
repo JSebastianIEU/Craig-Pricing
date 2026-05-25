@@ -963,6 +963,21 @@ def _quote_per_sqm(
             message=message,
         )
 
+    # v39 — minimum billable area. If the order's computed area falls
+    # below the product's configured floor, bill it as the floor. Done
+    # BEFORE bulk-price selection (so a floored area can legitimately
+    # cross a bulk threshold) and the note is mutated so the customer
+    # sees why the price is what it is. No-op when the column is unset
+    # (getattr guard keeps legacy products + non-per_sqm paths safe).
+    _min_sqm = getattr(product, "min_billable_sqm", None)
+    if _min_sqm and total_m2 < float(_min_sqm):
+        _actual_m2 = total_m2
+        total_m2 = float(_min_sqm)
+        breakdown_note = (
+            f"{breakdown_note} (min {float(_min_sqm):g} m² applied; "
+            f"actual {_actual_m2:.2f} m²)"
+        )
+
     # 2. Pick price per m² (bulk if total_m² ≥ threshold)
     surcharges_applied: list[str] = [breakdown_note]
     threshold = product.bulk_threshold or 0

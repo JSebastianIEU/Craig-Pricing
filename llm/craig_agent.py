@@ -1812,6 +1812,7 @@ def chat_with_craig(
     organization_slug: str = "just-print",
     extra_system_messages: Optional[list[dict]] = None,
     is_test: bool = False,
+    attribution: Optional[dict] = None,
 ) -> dict:
     """
     Main entry point. Handles one turn of conversation.
@@ -1877,6 +1878,21 @@ def chat_with_craig(
     if conversation.is_test and conversation.customer_has_own_artwork is None:
         conversation.customer_has_own_artwork = True
         db.flush()
+
+    # v40 — merge marketing attribution from the widget (first-touch
+    # write-once, last-touch always). Wrapped so an attribution hiccup
+    # can never break the chat turn.
+    if attribution:
+        try:
+            from attribution import merge_attribution
+            if merge_attribution(conversation, attribution):
+                db.flush()
+        except Exception as _attr_err:  # pragma: no cover - defensive
+            print(
+                f"[craig] attribution merge failed on conv "
+                f"{conversation.id}: {_attr_err}",
+                flush=True,
+            )
 
     # Load this tenant's system prompt from the Setting table; fall back to the
     # code-level default if no custom prompt has been configured yet.
@@ -2883,6 +2899,7 @@ def chat_with_craig(
     # the widget can render the dynamic shipping label and show the
     # artwork upload state without an extra round trip.
     quote_total_inc_vat: float | None = None
+    quote_product_key: str | None = None
     artwork_files_count = 0
     if last_quote_id is not None:
         latest_q = db.query(Quote).filter_by(id=last_quote_id).first()
@@ -2891,6 +2908,7 @@ def chat_with_craig(
                 quote_total_inc_vat = float(latest_q.final_price_inc_vat or 0)
             except Exception:
                 quote_total_inc_vat = None
+            quote_product_key = latest_q.product_key
             artwork_files_count = len(parse_artwork_files(getattr(latest_q, "artwork_files", None)))
 
     return {
@@ -2899,6 +2917,8 @@ def chat_with_craig(
         "quote_generated": quote_generated,
         "quote_id": last_quote_id,
         "quote_total_inc_vat": quote_total_inc_vat,
+        # v40 — product key for the GTM quote_generated event payload.
+        "product_key": quote_product_key,
         "artwork_files_count": artwork_files_count,
         "customer_has_own_artwork": getattr(conversation, "customer_has_own_artwork", None),
         "escalated": escalated,

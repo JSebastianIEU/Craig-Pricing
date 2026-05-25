@@ -52,6 +52,129 @@
         accent_blue: '#3e8fcd',
     };
 
+    // ───────────────────────────────────────────────────────────────
+    // v40 — Marketing attribution capture.
+    //
+    // Read UTM params + ad click IDs from the landing-page URL, persist
+    // them to localStorage (first-touch write-once, last-touch always
+    // updated), and send on every /chat + customer-info call. The
+    // backend (attribution.py) does the authoritative merge — this is
+    // just capture + transport. All storage access is wrapped so a
+    // private-mode browser (no localStorage) degrades to in-memory.
+    // ───────────────────────────────────────────────────────────────
+    var ATTR_KEY = 'jp_attribution';
+    var SESSION_KEY = 'jp_session_id';
+    var ATTR_PARAMS = [
+        'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+        'gclid', 'gbraid', 'wbraid',
+        'fbclid', 'ttclid', 'msclkid', 'li_fat_id',
+    ];
+    var _memStore = {}; // in-memory fallback when localStorage is blocked
+
+    function _lsGet(key) {
+        try { return window.localStorage.getItem(key); }
+        catch (e) { return _memStore[key] != null ? _memStore[key] : null; }
+    }
+    function _lsSet(key, val) {
+        try { window.localStorage.setItem(key, val); }
+        catch (e) { _memStore[key] = val; }
+    }
+
+    function _readCookie(name) {
+        try {
+            var m = document.cookie.match(
+                '(?:^|; )' + name.replace(/([.$?*|{}()[\]\\/+^])/g, '\\$1') + '=([^;]*)'
+            );
+            return m ? decodeURIComponent(m[1]) : '';
+        } catch (e) { return ''; }
+    }
+
+    /** Pull attribution params from the current URL + Meta cookies. */
+    function readAttributionFromUrl() {
+        var touch = {};
+        try {
+            var qs = new URLSearchParams(window.location.search);
+            ATTR_PARAMS.forEach(function (k) {
+                var v = qs.get(k);
+                if (v) touch[k] = String(v).slice(0, 512);
+            });
+        } catch (e) { /* no URLSearchParams — skip */ }
+        // Meta Pixel browser identifiers, if the pixel set them.
+        var fbc = _readCookie('_fbc');
+        var fbp = _readCookie('_fbp');
+        if (fbc) touch.fbc = fbc.slice(0, 512);
+        if (fbp) touch.fbp = fbp.slice(0, 512);
+        // Only attach landing context if we actually captured ad params,
+        // so an organic visit doesn't create a noisy "touch" every load.
+        if (Object.keys(touch).length) {
+            try { touch.landing_page = String(window.location.href).slice(0, 512); } catch (e) {}
+            try { if (document.referrer) touch.referrer = String(document.referrer).slice(0, 512); } catch (e) {}
+            touch.captured_at = new Date().toISOString();
+        }
+        return touch;
+    }
+
+    /** Merge a fresh touch into localStorage: first-touch write-once,
+     *  last-touch always updated. No-op if the touch is empty. */
+    function persistAttribution(touch) {
+        if (!touch || !Object.keys(touch).length) return;
+        var stored = {};
+        try { stored = JSON.parse(_lsGet(ATTR_KEY) || '{}') || {}; }
+        catch (e) { stored = {}; }
+        if (!stored.first_touch) stored.first_touch = touch;
+        stored.last_touch = touch;
+        _lsSet(ATTR_KEY, JSON.stringify(stored));
+    }
+
+    /** Return the stored {first_touch, last_touch} object (or {}). */
+    function getAttribution() {
+        try { return JSON.parse(_lsGet(ATTR_KEY) || '{}') || {}; }
+        catch (e) { return {}; }
+    }
+
+    /** Stable session id persisted across page loads so a returning
+     *  visitor's later quote attaches to the same first-touch
+     *  conversation on this device. */
+    function getOrCreateSessionId() {
+        var sid = _lsGet(SESSION_KEY);
+        if (!sid) {
+            sid = 'web-' + Math.random().toString(36).slice(2, 11);
+            _lsSet(SESSION_KEY, sid);
+        }
+        return sid;
+    }
+
+    // Capture on every page load (records last-touch + first-touch once).
+    persistAttribution(readAttributionFromUrl());
+
+    // ───────────────────────────────────────────────────────────────
+    // v40 — GTM data layer.
+    //
+    // We only PUSH events to window.dataLayer; the agency owns the GTM
+    // container + tags + platform pixels. Each event carries a unique
+    // event_id so the browser event can be de-duplicated against any
+    // server-side conversion the agency fires for the same action.
+    // ───────────────────────────────────────────────────────────────
+    function genEventId() {
+        try {
+            if (window.crypto && window.crypto.randomUUID) {
+                return window.crypto.randomUUID();
+            }
+        } catch (e) { /* fall through */ }
+        return 'evt-' + Date.now().toString(36) + '-' +
+            Math.random().toString(36).slice(2, 10);
+    }
+
+    function pushDataLayer(eventName, payload) {
+        try {
+            window.dataLayer = window.dataLayer || [];
+            window.dataLayer.push(Object.assign(
+                { event: eventName, organization_slug: CLIENT_SLUG },
+                payload || {}
+            ));
+        } catch (e) { /* never let analytics break the widget */ }
+    }
+
     /** Build a CSS `background` value for the rainbow stripe. */
     function buildStripeBackground(accents, mode, primary) {
         var colors = (accents && accents.length) ? accents.slice() : [];
@@ -1515,7 +1638,9 @@
     // ======================================================================
 
     let conversationId = null;
-    const sessionId = 'web-' + Math.random().toString(36).slice(2, 11);
+    // v40 — persisted across page loads (was random per load) so a
+    // returning visitor's later quote links to the same conversation.
+    const sessionId = getOrCreateSessionId();
     let chatBooted = false;
 
     function attachBehavior() {
@@ -1832,6 +1957,7 @@
                     is_returning_customer: fd.get('is_returning_customer') === 'true',
                     past_customer_email: (fd.get('past_customer_email') || '').trim() || null,
                     delivery_method: method,
+                    attribution: getAttribution(),
                 };
                 if (method === 'delivery') {
                     body.delivery_address = {
@@ -2263,6 +2389,7 @@
                         session_id: sessionId,
                         channel: 'web',
                         organization_slug: CLIENT_SLUG,
+                        attribution: getAttribution(),
                     }),
                 });
                 // 5xx → server is unhealthy; 429 → rate limited; both surface
@@ -2301,6 +2428,11 @@
         let artworkChoiceShown = false;
         let uploadedArtwork = null;  // { url, filename, size }
 
+        // v40 — GTM dedup state. Fire lead_created once per conversation
+        // and quote_generated once per quote_id.
+        let leadEventFired = false;
+        const quoteEventsFired = {};
+
         async function sendMessage(messageOverride) {
             const text = messageOverride !== undefined ? messageOverride : input.value.trim();
             if (!text && messageOverride === undefined) return;
@@ -2330,6 +2462,31 @@
                 // was generated.
                 lastQuoteData = data;
                 if (data.quote_id) lastQuoteId = data.quote_id;
+            }
+
+            // v40 — GTM events. lead_created the first time a conversation
+            // id materialises; quote_generated once per new quote (with
+            // value + a dedup event_id the agency's server-side conversion
+            // can reuse). Authoritative "sale" stays server-side (Stripe).
+            if (!leadEventFired && conversationId) {
+                leadEventFired = true;
+                const lt = (getAttribution() || {}).last_touch || {};
+                pushDataLayer('lead_created', Object.assign({
+                    event_id: genEventId(),
+                    conversation_id: conversationId,
+                }, lt));
+            }
+            if (data.quote_generated && data.quote_id && !quoteEventsFired[data.quote_id]) {
+                quoteEventsFired[data.quote_id] = true;
+                pushDataLayer('quote_generated', {
+                    event_id: genEventId(),
+                    conversation_id: conversationId,
+                    quote_id: data.quote_id,
+                    value: typeof data.quote_total_inc_vat === 'number'
+                        ? data.quote_total_inc_vat : undefined,
+                    currency: 'EUR',
+                    product_key: data.product_key || undefined,
+                });
             }
 
             const rawReply = data.reply || '';

@@ -146,6 +146,104 @@ class TestPerSqmBulkTippingPoint:
         assert result.base_price == 40.0
 
 
+class TestPerSqmMinBillableArea:
+    """v39 — per-product minimum billable area. Justin's ask: vinyl
+    labels under 1 m² should bill a full square metre. The engine
+    clamps total_m2 up to product.min_billable_sqm BEFORE bulk-price
+    selection. These tests set the floor explicitly on vinyl_labels
+    and reset it after so the rest of the suite is unaffected."""
+
+    def _set_floor(self, db, value):
+        p = db.query(Product).filter_by(
+            organization_slug=ORG, key="vinyl_labels",
+        ).first()
+        p.min_billable_sqm = value
+        db.commit()
+
+    def test_below_floor_is_clamped_to_floor(self):
+        """0.2 m² with a 1 m² floor → billed as 1 m² (= 1 × €45)."""
+        with db_session() as db:
+            self._set_floor(db, 1.0)
+            try:
+                result = quote_large_format(
+                    db, product_key="vinyl_labels",
+                    quantity=1, area_sqm=0.2,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, QuoteResult), f"got {result}"
+                # Floored to 1 m² × €45 = €45 ex VAT (NOT 0.2 × €45 = €9).
+                assert result.final_price_ex_vat >= 40.0, (
+                    f"floor not applied: ex VAT €{result.final_price_ex_vat} "
+                    f"(expected ~€45 for the 1 m² floor, not ~€9)"
+                )
+                # The customer-facing breakdown explains the floor.
+                joined = " ".join(result.surcharges_applied).lower()
+                assert "min 1" in joined and "applied" in joined, (
+                    f"floor note missing from breakdown: "
+                    f"{result.surcharges_applied}"
+                )
+            finally:
+                self._set_floor(db, None)
+
+    def test_at_or_above_floor_is_unchanged(self):
+        """2 m² with a 1 m² floor → billed as the actual 2 m², no note."""
+        with db_session() as db:
+            self._set_floor(db, 1.0)
+            try:
+                result = quote_large_format(
+                    db, product_key="vinyl_labels",
+                    quantity=1, area_sqm=2.0,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, QuoteResult)
+                # 2 m² × €45 = €90 ex VAT (unit price, under 10 m² bulk).
+                assert 88.0 <= result.final_price_ex_vat <= 92.0, (
+                    f"above-floor price changed: €{result.final_price_ex_vat}"
+                )
+                joined = " ".join(result.surcharges_applied).lower()
+                assert "min " not in joined, (
+                    f"floor note wrongly applied above floor: "
+                    f"{result.surcharges_applied}"
+                )
+            finally:
+                self._set_floor(db, None)
+
+    def test_floor_can_trip_bulk_threshold(self):
+        """Floor is applied BEFORE bulk selection, so a 12 m² floor on a
+        tiny order crosses the 10 m² bulk threshold → bulk_price (€40)."""
+        with db_session() as db:
+            self._set_floor(db, 12.0)
+            try:
+                result = quote_large_format(
+                    db, product_key="vinyl_labels",
+                    quantity=1, area_sqm=0.2,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, QuoteResult)
+                # 0.2 → floored to 12 m² ≥ 10 m² threshold → bulk_price 40.
+                assert result.base_price == 40.0, (
+                    f"floor didn't trip bulk: base_price={result.base_price}"
+                )
+            finally:
+                self._set_floor(db, None)
+
+    def test_no_floor_is_legacy_behaviour(self):
+        """With min_billable_sqm=None (the default), 0.2 m² bills as
+        0.2 m² × €45 = €9 — unchanged from before v39."""
+        with db_session() as db:
+            self._set_floor(db, None)
+            result = quote_large_format(
+                db, product_key="vinyl_labels",
+                quantity=1, area_sqm=0.2,
+                organization_slug=ORG,
+            )
+            assert isinstance(result, QuoteResult)
+            # 0.2 × €45 = €9 ex VAT — no floor applied.
+            assert result.final_price_ex_vat <= 12.0, (
+                f"legacy no-floor price changed: €{result.final_price_ex_vat}"
+            )
+
+
 class TestPerSqmZeroOrNegativeQuantity:
     """Defensive — zero / negative inputs should escalate, not crash."""
 
