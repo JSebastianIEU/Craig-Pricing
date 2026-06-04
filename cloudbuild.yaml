@@ -41,6 +41,9 @@ steps:
     #      * test_missive.py — webhook loop-prevention + kill-switch
     #      * test_attribution.py — v40 UTM/click-ID capture + merge +
     #        identity backfill + revenue report
+    #      * test_notifications.py — v33 operator emails (approval +
+    #        manual review) + v40.1 multi-recipient `notification_to_address`
+    #        comma-separated parsing
     #
     #    Tests run against a fresh local SQLite (CRAIG_DB_PATH=/tmp/...)
     #    seeded by scripts.startup. ~2-3 min total.
@@ -70,6 +73,7 @@ steps:
                 test_inbound_classifier.py \
                 test_missive.py \
                 test_attribution.py \
+                test_notifications.py \
                 -q --no-header --tb=short --maxfail=5
             echo "== All tests passed — proceeding to build =="
 

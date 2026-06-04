@@ -275,3 +275,185 @@ class TestTriggerIdempotency:
             r = trigger_approval_notification(db, DEFAULT_ORG_SLUG, 999999)
         assert r["ok"] is False
         assert r["error"] == "quote_not_found"
+
+
+# ---------------------------------------------------------------------------
+# Multi-recipient support — comma-separated `notification_to_address`
+# ---------------------------------------------------------------------------
+#
+# The operator may store a single email (legacy) OR a comma-separated
+# list (`"alice@x.com,bob@y.com"`) so a single notification fans out
+# to multiple inboxes — used so Justin (the print shop owner) can be
+# CC'd alongside Sebastian (the agency operator) without a settings
+# schema change. The send path parses the value through
+# `_parse_recipients` and passes the resulting list straight to
+# Resend's `to` field.
+# ---------------------------------------------------------------------------
+
+
+class TestParseRecipients:
+    """Pure-function tests of the comma-separated splitter."""
+
+    def test_single_recipient(self):
+        from notifications import _parse_recipients
+        assert _parse_recipients("alice@example.com") == ["alice@example.com"]
+
+    def test_two_recipients(self):
+        from notifications import _parse_recipients
+        assert _parse_recipients(
+            "alice@example.com,bob@example.com"
+        ) == ["alice@example.com", "bob@example.com"]
+
+    def test_three_recipients_preserves_order(self):
+        from notifications import _parse_recipients
+        assert _parse_recipients(
+            "a@x.com,b@x.com,c@x.com"
+        ) == ["a@x.com", "b@x.com", "c@x.com"]
+
+    def test_whitespace_around_addresses_stripped(self):
+        from notifications import _parse_recipients
+        assert _parse_recipients(
+            "  alice@x.com  ,  bob@y.com  "
+        ) == ["alice@x.com", "bob@y.com"]
+
+    def test_empty_entries_dropped(self):
+        # Operator might leave a trailing comma or double comma by accident.
+        from notifications import _parse_recipients
+        assert _parse_recipients(
+            "alice@x.com,,bob@y.com,"
+        ) == ["alice@x.com", "bob@y.com"]
+
+    def test_none_returns_empty_list(self):
+        from notifications import _parse_recipients
+        assert _parse_recipients(None) == []
+
+    def test_empty_string_returns_empty_list(self):
+        from notifications import _parse_recipients
+        assert _parse_recipients("") == []
+
+    def test_whitespace_only_returns_empty_list(self):
+        # Treat `"   "` and `"  ,  "` the same as "no recipient configured"
+        # so the caller's `if not to_addr` empty-check still fires.
+        from notifications import _parse_recipients
+        assert _parse_recipients("   ") == []
+        assert _parse_recipients("  ,  ,  ") == []
+
+
+class TestSendQuoteReadyMultiRecipient:
+    """Integration: comma-separated setting flows through to Resend `to`."""
+
+    def test_two_recipients_csv_setting_sent_as_list(self, fresh_settings):
+        """Operator stores `notification_to_address` as `a@x.com,b@y.com`
+        → Resend receives BOTH addresses in its `to` list."""
+        from notifications import send_quote_ready_for_approval
+
+        with db_session() as db:
+            row = db.query(Setting).filter_by(
+                organization_slug=DEFAULT_ORG_SLUG,
+                key="notification_to_address",
+            ).first()
+            row.value = "sebastian@strategos-ai.com,justprintie@gmail.com"
+            db.commit()
+
+        _, quote_id = _new_conv_and_quote()
+        captured: dict = {}
+
+        def _fake_send(params):
+            captured["params"] = params
+            return {"id": "msg_multi"}
+
+        with patch.dict(os.environ, {"RESEND_API_KEY": "re_test_key"}):
+            with patch("resend.Emails") as mock_emails:
+                mock_emails.send = MagicMock(side_effect=_fake_send)
+                with db_session() as db:
+                    quote = db.query(Quote).filter_by(id=quote_id).first()
+                    result = send_quote_ready_for_approval(
+                        db, quote, DEFAULT_ORG_SLUG,
+                    )
+
+        assert result["ok"] is True
+        assert captured["params"]["to"] == [
+            "sebastian@strategos-ai.com",
+            "justprintie@gmail.com",
+        ]
+
+    def test_whitespace_around_csv_addresses_normalised(self, fresh_settings):
+        """Whitespace around commas is tolerated — operator may save
+        the value with spaces for readability."""
+        from notifications import send_quote_ready_for_approval
+
+        with db_session() as db:
+            row = db.query(Setting).filter_by(
+                organization_slug=DEFAULT_ORG_SLUG,
+                key="notification_to_address",
+            ).first()
+            row.value = "  alice@x.com  ,  bob@y.com  "
+            db.commit()
+
+        _, quote_id = _new_conv_and_quote()
+        captured: dict = {}
+
+        def _fake_send(params):
+            captured["params"] = params
+            return {"id": "msg_ws"}
+
+        with patch.dict(os.environ, {"RESEND_API_KEY": "re_test_key"}):
+            with patch("resend.Emails") as mock_emails:
+                mock_emails.send = MagicMock(side_effect=_fake_send)
+                with db_session() as db:
+                    quote = db.query(Quote).filter_by(id=quote_id).first()
+                    result = send_quote_ready_for_approval(
+                        db, quote, DEFAULT_ORG_SLUG,
+                    )
+
+        assert result["ok"] is True
+        assert captured["params"]["to"] == ["alice@x.com", "bob@y.com"]
+
+    def test_whitespace_only_setting_behaves_as_missing(self, fresh_settings):
+        """`"   ,  ,   "` should fail with the same error as `""` so
+        operators don't get silent drops on a typo."""
+        from notifications import send_quote_ready_for_approval
+
+        with db_session() as db:
+            row = db.query(Setting).filter_by(
+                organization_slug=DEFAULT_ORG_SLUG,
+                key="notification_to_address",
+            ).first()
+            row.value = "   ,  ,   "
+            db.commit()
+
+        _, quote_id = _new_conv_and_quote()
+        with patch.dict(os.environ, {"RESEND_API_KEY": "re_test_key"}):
+            with db_session() as db:
+                quote = db.query(Quote).filter_by(id=quote_id).first()
+                result = send_quote_ready_for_approval(
+                    db, quote, DEFAULT_ORG_SLUG,
+                )
+
+        assert result["ok"] is False
+        assert result["error"] == "missing_notification_to_address"
+
+    def test_single_recipient_setting_still_works(self, fresh_settings):
+        """Existing tenants with a single-address setting see no
+        behaviour change — Resend still gets a 1-element list."""
+        from notifications import send_quote_ready_for_approval
+
+        # fresh_settings seeds "info@just-print.ie" — no change needed
+        _, quote_id = _new_conv_and_quote()
+        captured: dict = {}
+
+        def _fake_send(params):
+            captured["params"] = params
+            return {"id": "msg_single"}
+
+        with patch.dict(os.environ, {"RESEND_API_KEY": "re_test_key"}):
+            with patch("resend.Emails") as mock_emails:
+                mock_emails.send = MagicMock(side_effect=_fake_send)
+                with db_session() as db:
+                    quote = db.query(Quote).filter_by(id=quote_id).first()
+                    result = send_quote_ready_for_approval(
+                        db, quote, DEFAULT_ORG_SLUG,
+                    )
+
+        assert result["ok"] is True
+        assert captured["params"]["to"] == ["info@just-print.ie"]
