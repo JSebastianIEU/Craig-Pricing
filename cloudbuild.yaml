@@ -44,6 +44,12 @@ steps:
     #      * test_notifications.py — v33 operator emails (approval +
     #        manual review) + v40.1 multi-recipient `notification_to_address`
     #        comma-separated parsing
+    #      * test_bulk_catalog_import.py — v40.2 bulk product + tier +
+    #        surcharge import endpoints: per-row SAVEPOINT semantics,
+    #        skip/update/fail conflict policies, dry_run, category-slug
+    #        normalization (mixed-case merge), v38 fields round-trip,
+    #        X-Known-Keys header for cross-validating just-created
+    #        products against surcharges in the same upload.
     #
     #    Tests run against a fresh local SQLite (CRAIG_DB_PATH=/tmp/...)
     #    seeded by scripts.startup. ~2-3 min total.
@@ -74,6 +80,7 @@ steps:
                 test_missive.py \
                 test_attribution.py \
                 test_notifications.py \
+                test_bulk_catalog_import.py \
                 -q --no-header --tb=short --maxfail=5
             echo "== All tests passed — proceeding to build =="
 

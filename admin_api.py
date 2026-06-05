@@ -76,6 +76,42 @@ def _slugify(s: str) -> str:
     return s.strip("_")
 
 
+def _ensure_category_by_slug(
+    db: Session,
+    *,
+    organization_slug: str,
+    slug: str,
+    display_name: Optional[str] = None,
+) -> tuple[Category, bool]:
+    """v40.2 — find-or-create a Category by slug. Returns
+    `(category, created)` so the caller can track which slugs were
+    newly created (e.g. to populate `categories_created[]` in the
+    bulk-import response).
+
+    Used by both the single-product create handler and the bulk
+    import endpoint so the auto-create rule is centralised. The
+    `display_name` is only consulted when the slug is missing — if a
+    category with that slug already exists, we never rename it
+    (avoids surprising operators who chose a friendlier name in the
+    Categories tab).
+    """
+    existing = (
+        db.query(Category)
+        .filter_by(organization_slug=organization_slug, slug=slug)
+        .first()
+    )
+    if existing:
+        return (existing, False)
+    cat = Category(
+        organization_slug=organization_slug,
+        slug=slug,
+        name=(display_name or _humanize(slug)),
+    )
+    db.add(cat)
+    db.flush()
+    return (cat, True)
+
+
 # ============================================================================
 # /me
 # ============================================================================
@@ -286,6 +322,12 @@ def _product_to_dict(p: Product, tiers: list[PriceTier]) -> dict[str, Any]:
         "sheet_price": getattr(p, "sheet_price", None),
         # v39 — minimum billable area (per-sq/m floor)
         "min_billable_sqm": getattr(p, "min_billable_sqm", None),
+        # v38 — defensive scaffolding for per-sq/m products. When
+        # `requires_dimensions=True`, the pricing engine refuses to
+        # fall back to yield-only math; `sanity_max_unit_price` caps
+        # per-unit price and escalates above it.
+        "requires_dimensions": bool(getattr(p, "requires_dimensions", False)),
+        "sanity_max_unit_price": getattr(p, "sanity_max_unit_price", None),
         "tiers": [
             {"id": t.id, "spec_key": t.spec_key, "quantity": t.quantity, "price": t.price}
             for t in tiers
@@ -355,6 +397,18 @@ class CreateProductRequest(BaseModel):
     sheet_price: Optional[float] = Field(default=None, ge=0)
     # v39 — minimum billable area for per-sq/m products
     min_billable_sqm: Optional[float] = Field(default=None, ge=0)
+    # v38 — defensive scaffolding for per-sq/m products. When
+    # `requires_dimensions=True`, the engine refuses to fall back to
+    # yield-only math (small labels under-billed because the LLM
+    # forgot dims would have been priced 10× too low). When
+    # `sanity_max_unit_price` is set, the engine escalates instead
+    # of returning a customer-facing nonsense quote if the per-unit
+    # computed price exceeds that ceiling. Both columns exist in the
+    # schema since v38; this PR exposes them on the CRUD surface so
+    # operators can flip them per-product from the dashboard and the
+    # bulk-import endpoint can set them on creation.
+    requires_dimensions: Optional[bool] = False
+    sanity_max_unit_price: Optional[float] = Field(default=None, ge=0)
 
     @field_validator("pricing_strategy")
     @classmethod
@@ -385,16 +439,12 @@ def create_product(
     if existing:
         raise HTTPException(status_code=409, detail=f"Product with key '{key}' already exists")
 
-    # Auto-create category row if missing so it shows up in the UI
-    existing_cat = db.query(Category).filter_by(
-        organization_slug=target_org, slug=body.category,
-    ).first()
-    if not existing_cat:
-        db.add(Category(
-            organization_slug=target_org,
-            slug=body.category,
-            name=_humanize(body.category),
-        ))
+    # Auto-create category row if missing so it shows up in the UI.
+    # v40.2 — uses the shared `_ensure_category_by_slug` helper so
+    # the single-create + bulk-import paths share one implementation.
+    _ensure_category_by_slug(
+        db, organization_slug=target_org, slug=body.category,
+    )
 
     p = Product(
         organization_slug=target_org,
@@ -421,6 +471,11 @@ def create_product(
         default_unit_size_mm=body.default_unit_size_mm,
         sheet_size_mm=body.sheet_size_mm,
         sheet_price=body.sheet_price,
+        # v39 — minimum billable area (per-sq/m floor)
+        min_billable_sqm=body.min_billable_sqm,
+        # v38 — defensive scaffolding (newly exposed in v40.2)
+        requires_dimensions=bool(body.requires_dimensions),
+        sanity_max_unit_price=body.sanity_max_unit_price,
     )
     db.add(p)
     db.commit()
@@ -457,6 +512,9 @@ class UpdateProductRequest(BaseModel):
     sheet_price: Optional[float] = Field(default=None, ge=0)
     # v39 — minimum billable area for per-sq/m products
     min_billable_sqm: Optional[float] = Field(default=None, ge=0)
+    # v38 — defensive scaffolding (newly exposed on the CRUD surface in v40.2)
+    requires_dimensions: Optional[bool] = None
+    sanity_max_unit_price: Optional[float] = Field(default=None, ge=0)
 
     @field_validator("pricing_strategy")
     @classmethod
@@ -587,6 +645,396 @@ def delete_tier(
         raise HTTPException(status_code=404, detail="Tier not found")
     db.delete(tier)
     db.commit()
+
+
+# ============================================================================
+# v40.2 — Bulk product import
+# ----------------------------------------------------------------------------
+# Operator pastes a workbook of products + tiers into the dashboard's
+# Bulk import dialog. The dashboard parses + previews client-side, then
+# POSTs a JSON batch here. We re-validate every row through Pydantic
+# (inheriting from CreateProductRequest so all existing field-level
+# checks fire unchanged), then commit per-row with SAVEPOINTs so a
+# single bad row doesn't abort the whole batch.
+#
+# Mirror of the bulk_quotes (admin_api.py:1521) partial-success
+# pattern: returns `{ok[], failed[], categories_created[], summary{}}`
+# with one entry per submitted row indexed by `row` so the dashboard
+# can highlight the offending Excel row.
+# ============================================================================
+
+
+class BulkProductTierRow(BaseModel):
+    """A tier nested inside a `BulkProductRow`. Same shape as
+    `CreateTierRequest` but lives on the row so the product+tiers
+    commit atomically (same SAVEPOINT)."""
+    model_config = ConfigDict(extra="forbid")
+    spec_key: str = ""
+    quantity: int = Field(gt=0)
+    price: float = Field(ge=0)
+
+
+class BulkProductRow(CreateProductRequest):
+    """A single product row in a bulk-import payload. Inherits every
+    field + `extra="forbid"` + `pricing_strategy` enum validation
+    from `CreateProductRequest`, then adds its tier list."""
+    model_config = ConfigDict(extra="forbid")
+    tiers: list[BulkProductTierRow] = Field(default_factory=list, max_length=100)
+
+
+class BulkProductImportRequest(BaseModel):
+    """Top-level payload for `POST /products/bulk`. Caps the batch
+    at 500 products × 100 tiers each (= 50k tier-rows worst case),
+    well within FastAPI / Postgres tolerance. The dashboard's
+    preview surfaces both caps before commit."""
+    model_config = ConfigDict(extra="forbid")
+    products: list[BulkProductRow] = Field(min_length=1, max_length=500)
+    conflict_policy: str = Field(
+        default="skip", pattern=r"^(skip|update|fail)$",
+        description=(
+            "What to do when a row's `key` already exists in the org's "
+            "catalog. `skip` (default) leaves the existing product "
+            "untouched. `update` PATCHes fields and REPLACES the tier "
+            "table for that product. `fail` records the row as failed."
+        ),
+    )
+    dry_run: bool = Field(
+        default=False,
+        description=(
+            "When True, the endpoint validates + simulates the commit "
+            "but rolls back at the end. Used by the dashboard preview to "
+            "ask the server for an authoritative dry-run. Response shape "
+            "is identical to the real-commit one."
+        ),
+    )
+
+
+def _normalize_category_slug(raw: Optional[str]) -> str:
+    """v40.2 — collapse a free-text category cell to a stable slug so
+    `Small Format`, `small format`, `SMALL_FORMAT`, `small-format`
+    all match the same row. Used on every Products.category cell and
+    every Surcharges.applies_to_category cell during bulk import.
+
+    Returns empty string for empty / None input so the caller can
+    short-circuit (a missing category cell is a row error)."""
+    if not raw:
+        return ""
+    s = str(raw).strip().lower()
+    # Replace runs of whitespace + hyphens with one underscore.
+    s = re.sub(r"[\s\-]+", "_", s)
+    # Drop anything that isn't alphanumeric or underscore.
+    s = re.sub(r"[^a-z0-9_]", "", s)
+    # Collapse repeated underscores from the strip-then-replace order.
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+def _bulk_product_per_strategy_check(row: BulkProductRow) -> Optional[str]:
+    """v40.2 — runtime check mirroring the per-strategy required-field
+    rules the ProductFormDialog shows the operator. Returns an error
+    string (suitable for the `failed[].error` field) or None if the
+    row's strategy fields are sufficient.
+
+    The single-product create endpoint doesn't enforce these today
+    (the form prevents the bad combos client-side). For bulk import
+    where the operator pastes raw Excel cells, we MUST guard at the
+    boundary or the engine returns escalation results instead of
+    quotes at runtime — confusing for Justin chasing 'why won't this
+    product price?'."""
+    strat = (row.pricing_strategy or "").lower()
+    if strat == "per_unit" and row.unit_price is None:
+        return "pricing_strategy 'per_unit' requires unit_price"
+    if strat == "bulk_break":
+        if row.unit_price is None or row.bulk_price is None or row.bulk_threshold is None:
+            return (
+                "pricing_strategy 'bulk_break' requires unit_price, "
+                "bulk_price, and bulk_threshold"
+            )
+    if strat in ("per_sqm", "per_unit_metric") and row.unit_price is None:
+        return "pricing_strategy 'per_sqm' requires unit_price (€/m²)"
+    if strat == "per_sheet":
+        if not row.sheet_size_mm or row.sheet_price is None:
+            return (
+                "pricing_strategy 'per_sheet' requires sheet_size_mm "
+                "(WIDTHxHEIGHT) and sheet_price"
+            )
+    # `tiered` + `per_job` carry their prices in the `tiers` array —
+    # an empty tier list is allowed (operator may upload products
+    # first then tiers in a follow-up) but flagged in the response.
+    return None
+
+
+@router.post("/orgs/{org_slug}/products/bulk")
+def bulk_import_products(
+    org_slug: str,
+    body: BulkProductImportRequest,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v40.2 — bulk-create or update products + tiers + auto-create
+    missing categories in one round-trip. See the section docstring
+    above for design rationale.
+
+    Response shape mirrors `bulk_quotes` at admin_api.py:1521 so the
+    dashboard can reuse the partial-success toast pattern from
+    ConversationsModule.tsx:122-131. `row` indexes are zero-based
+    into the submitted `products[]`.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    target_org = (
+        org_slug if claims.role == "strategos_admin" else claims.org_slug
+    )
+
+    ok: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    summary = {"created": 0, "updated": 0, "skipped": 0, "failed": 0}
+    categories_created: list[str] = []
+
+    # ── Step 1: pre-flight, no DB writes ─────────────────────────────
+    # Reject rows whose `key` (or auto-slugged name) collides with
+    # another row in the same payload. Catching this BEFORE the loop
+    # avoids spurious "unique constraint" failures mid-batch.
+    #
+    # Two-pass approach so BOTH the first row and any subsequent dups
+    # get flagged — operator sees every Excel line involved in the
+    # conflict, not just the duplicate.
+    pre_failed: set[int] = set()
+    derived_keys: list[str] = []
+    for idx, row in enumerate(body.products):
+        k = (row.key or _slugify(row.name)).strip().lower()
+        derived_keys.append(k)
+        if not k:
+            failed.append({
+                "row": idx, "key": "",
+                "error": "missing name (cannot derive key)",
+                "field": "name",
+            })
+            pre_failed.add(idx)
+    # Count occurrences and flag every row whose key appears > 1 times.
+    from collections import Counter
+    key_counts = Counter(k for k in derived_keys if k)
+    for idx, k in enumerate(derived_keys):
+        if idx in pre_failed or not k:
+            continue
+        if key_counts[k] > 1:
+            other_rows = [
+                str(i) for i, x in enumerate(derived_keys)
+                if x == k and i != idx
+            ]
+            failed.append({
+                "row": idx, "key": k,
+                "error": (
+                    f"duplicate_within_upload: same key as row(s) "
+                    f"{', '.join(other_rows)}"
+                ),
+                "field": "key",
+            })
+            pre_failed.add(idx)
+
+    # ── Step 2: resolve categories (one query for the lot) ───────────
+    raw_to_slug: dict[str, str] = {}     # display-name → slug
+    for row in body.products:
+        slug = _normalize_category_slug(row.category)
+        if slug and row.category not in raw_to_slug:
+            raw_to_slug[row.category] = slug
+    distinct_slugs = sorted(set(raw_to_slug.values()))
+    if distinct_slugs:
+        existing_slugs = {
+            r.slug for r in db.query(Category.slug).filter(
+                Category.organization_slug == target_org,
+                Category.slug.in_(distinct_slugs),
+            ).all()
+        }
+        for display_name, slug in raw_to_slug.items():
+            if slug in existing_slugs:
+                continue
+            # Display name is the operator-typed string, title-cased
+            # so the Categories tab shows "Small Format" rather than
+            # the slug. _ensure_category_by_slug is idempotent in
+            # case two display-name variants normalize to the same
+            # slug (we only create once).
+            _, created = _ensure_category_by_slug(
+                db,
+                organization_slug=target_org,
+                slug=slug,
+                display_name=str(display_name).strip().title(),
+            )
+            if created and slug not in categories_created:
+                categories_created.append(slug)
+
+    # ── Step 3: per-row commit with SAVEPOINT ────────────────────────
+    for idx, row in enumerate(body.products):
+        if idx in pre_failed:
+            summary["failed"] += 1
+            continue
+
+        # Per-strategy completeness check (see helper docstring).
+        strat_err = _bulk_product_per_strategy_check(row)
+        if strat_err:
+            failed.append({
+                "row": idx,
+                "key": (row.key or _slugify(row.name)),
+                "error": strat_err,
+                "field": "pricing_strategy",
+            })
+            summary["failed"] += 1
+            continue
+
+        key = (row.key or _slugify(row.name)).strip().lower()
+        category_slug = _normalize_category_slug(row.category)
+        if not category_slug:
+            failed.append({
+                "row": idx, "key": key,
+                "error": "missing category",
+                "field": "category",
+            })
+            summary["failed"] += 1
+            continue
+
+        # SAVEPOINT — isolates this row's writes. On exception we
+        # rollback only this savepoint and other rows survive.
+        savepoint = db.begin_nested()
+        try:
+            existing = (
+                db.query(Product)
+                .filter_by(organization_slug=target_org, key=key)
+                .first()
+            )
+            if existing is not None:
+                if body.conflict_policy == "skip":
+                    savepoint.rollback()
+                    ok.append({
+                        "row": idx, "key": key,
+                        "product_id": existing.id,
+                        "action": "skipped",
+                        "tier_count": 0,
+                    })
+                    summary["skipped"] += 1
+                    continue
+                if body.conflict_policy == "fail":
+                    savepoint.rollback()
+                    failed.append({
+                        "row": idx, "key": key,
+                        "error": "product key already exists",
+                        "field": "key",
+                    })
+                    summary["failed"] += 1
+                    continue
+                # conflict_policy == "update": patch fields, replace tiers
+                for fld in (
+                    "name", "description", "notes", "internal_notes",
+                    "price_per", "pricing_unit", "metric_unit",
+                    "image_url", "pricing_strategy", "min_qty",
+                    "unit_price", "bulk_price", "bulk_threshold",
+                    "yield_per_sqm", "default_unit_size_mm",
+                    "sheet_size_mm", "sheet_price", "min_billable_sqm",
+                    "manual_review_reason",
+                    "requires_dimensions", "sanity_max_unit_price",
+                ):
+                    val = getattr(row, fld, None)
+                    if val is not None:
+                        setattr(existing, fld, val)
+                # Booleans need explicit handling (None means "don't touch",
+                # False means "set to false")
+                if row.double_sided_surcharge is not None:
+                    existing.double_sided_surcharge = bool(row.double_sided_surcharge)
+                if row.manual_review_required is not None:
+                    existing.manual_review_required = bool(row.manual_review_required)
+                existing.category = category_slug
+                # Replace tiers
+                (
+                    db.query(PriceTier)
+                    .filter_by(product_id=existing.id)
+                    .delete(synchronize_session=False)
+                )
+                for t in row.tiers:
+                    db.add(PriceTier(
+                        organization_slug=target_org,
+                        product_id=existing.id,
+                        spec_key=t.spec_key,
+                        quantity=t.quantity,
+                        price=t.price,
+                    ))
+                db.flush()
+                ok.append({
+                    "row": idx, "key": key,
+                    "product_id": existing.id,
+                    "action": "updated",
+                    "tier_count": len(row.tiers),
+                })
+                summary["updated"] += 1
+            else:
+                # New product: build, flush to get id, then insert tiers.
+                p = Product(
+                    organization_slug=target_org,
+                    key=key,
+                    name=row.name,
+                    category=category_slug,
+                    description=row.description,
+                    notes=row.notes,
+                    pricing_strategy=row.pricing_strategy,
+                    metric_unit=row.metric_unit,
+                    pricing_unit=row.pricing_unit,
+                    price_per=row.price_per,
+                    image_url=row.image_url,
+                    double_sided_surcharge=row.double_sided_surcharge,
+                    unit_price=row.unit_price,
+                    bulk_price=row.bulk_price,
+                    bulk_threshold=row.bulk_threshold,
+                    min_qty=(row.min_qty or 1),
+                    manual_review_required=bool(row.manual_review_required),
+                    manual_review_reason=row.manual_review_reason,
+                    internal_notes=row.internal_notes,
+                    yield_per_sqm=row.yield_per_sqm,
+                    default_unit_size_mm=row.default_unit_size_mm,
+                    sheet_size_mm=row.sheet_size_mm,
+                    sheet_price=row.sheet_price,
+                    min_billable_sqm=row.min_billable_sqm,
+                    requires_dimensions=bool(row.requires_dimensions),
+                    sanity_max_unit_price=row.sanity_max_unit_price,
+                )
+                db.add(p)
+                db.flush()
+                for t in row.tiers:
+                    db.add(PriceTier(
+                        organization_slug=target_org,
+                        product_id=p.id,
+                        spec_key=t.spec_key,
+                        quantity=t.quantity,
+                        price=t.price,
+                    ))
+                db.flush()
+                ok.append({
+                    "row": idx, "key": key,
+                    "product_id": p.id,
+                    "action": "created",
+                    "tier_count": len(row.tiers),
+                })
+                summary["created"] += 1
+        except Exception as e:
+            # SAVEPOINT rollback — this row only.
+            savepoint.rollback()
+            failed.append({
+                "row": idx, "key": key,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+                "field": None,
+            })
+            summary["failed"] += 1
+
+    # ── Step 4: final commit OR rollback (dry-run) ───────────────────
+    if body.dry_run:
+        db.rollback()
+    else:
+        db.commit()
+
+    return {
+        "ok": ok,
+        "failed": failed,
+        "categories_created": categories_created,
+        "summary": summary,
+    }
 
 
 # ============================================================================
@@ -915,6 +1363,222 @@ def delete_surcharge(
         raise HTTPException(status_code=404, detail="Surcharge not found")
     db.delete(s)
     db.commit()
+
+
+# ============================================================================
+# v40.2 — Bulk surcharge import
+# ----------------------------------------------------------------------------
+# Operator workflow: the dashboard's Bulk import dialog reads a third
+# sheet `Surcharges` from the workbook, parses each row through Zod,
+# then POSTs the batch here. We share the same partial-success
+# response shape as the products endpoint and reuse the per-row
+# SAVEPOINT pattern. Conflict key is (organization_slug, name) per
+# the existing `uq_surcharge_org_name` constraint.
+#
+# Cross-validation: each row's `applies_to_product_keys` (if any)
+# must reference either an existing product or one created in the
+# preceding products import. The dashboard signals the latter via
+# the `X-Known-Keys` header so the same upload's surcharges +
+# products commit cleanly.
+# ============================================================================
+
+
+class BulkSurchargeRow(CreateSurchargeRequest):
+    """Inherits every field + kind validator from the single-create
+    surcharge model. Bulk import doesn't need extra fields — the
+    server still validates `applies_to_product_keys` against the
+    DB + the optional `X-Known-Keys` header set."""
+    model_config = ConfigDict(extra="forbid")
+
+
+class BulkSurchargeImportRequest(BaseModel):
+    """Top-level payload for `POST /surcharges/bulk`. Cap at 100
+    surcharges per upload (Just Print has 3 today; even a 30×
+    expansion fits)."""
+    model_config = ConfigDict(extra="forbid")
+    surcharges: list[BulkSurchargeRow] = Field(min_length=1, max_length=100)
+    conflict_policy: str = Field(
+        default="skip", pattern=r"^(skip|update|fail)$",
+        description=(
+            "What to do when a row's `name` already exists in the org. "
+            "`skip` (default) leaves the existing rule untouched. "
+            "`update` PATCHes its fields. `fail` records as failed."
+        ),
+    )
+    dry_run: bool = False
+
+
+@router.post("/orgs/{org_slug}/surcharges/bulk")
+def bulk_import_surcharges(
+    org_slug: str,
+    body: BulkSurchargeImportRequest,
+    request: Request,
+    claims: StrategosClaims = Depends(require_claims),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """v40.2 — bulk-create or update surcharges. Mirrors the
+    products bulk endpoint: per-row SAVEPOINT, partial-success
+    response, dry-run support, `skip`/`update`/`fail` conflict
+    policies.
+
+    `X-Known-Keys` header (comma-separated product keys) extends
+    the cross-validation set so an upload that creates products
+    + surcharges in the same workbook can reference its own
+    just-created products without a chicken-and-egg failure. The
+    dashboard sets this header during the second leg of the
+    import sequence.
+    """
+    access_guard(org_slug, claims)
+    require_role(claims, "client_owner")
+
+    target_org = (
+        org_slug if claims.role == "strategos_admin" else claims.org_slug
+    )
+
+    ok: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    summary = {"created": 0, "updated": 0, "skipped": 0, "failed": 0}
+
+    # ── Cross-validation set: existing keys + X-Known-Keys ──────────
+    db_keys = {
+        p.key for p in db.query(Product.key)
+        .filter_by(organization_slug=target_org).all()
+    }
+    header_known = (
+        request.headers.get("x-known-keys")
+        or request.headers.get("X-Known-Keys")
+        or ""
+    )
+    extra_keys = {
+        k.strip().lower() for k in header_known.split(",") if k.strip()
+    }
+    valid_keys = db_keys | extra_keys
+
+    # ── Pre-flight: dup names within upload ──────────────────────────
+    seen_names: dict[str, int] = {}
+    pre_failed: set[int] = set()
+    for idx, row in enumerate(body.surcharges):
+        nm = (row.name or "").strip().lower()
+        if not nm:
+            failed.append({
+                "row": idx, "key": "",
+                "error": "missing name", "field": "name",
+            })
+            pre_failed.add(idx)
+            continue
+        if nm in seen_names:
+            failed.append({
+                "row": idx, "key": row.name,
+                "error": (
+                    f"duplicate_within_upload: same name as row "
+                    f"{seen_names[nm]}"
+                ),
+                "field": "name",
+            })
+            pre_failed.add(idx)
+            continue
+        seen_names[nm] = idx
+
+    # ── Per-row commit with SAVEPOINT ────────────────────────────────
+    for idx, row in enumerate(body.surcharges):
+        if idx in pre_failed:
+            summary["failed"] += 1
+            continue
+
+        # Cross-validate applies_to_product_keys
+        if row.applies_to_product_keys:
+            unknown = [
+                k for k in row.applies_to_product_keys
+                if k not in valid_keys
+            ]
+            if unknown:
+                failed.append({
+                    "row": idx, "key": row.name,
+                    "error": (
+                        f"applies_to_product_keys references unknown "
+                        f"product(s): {unknown}"
+                    ),
+                    "field": "applies_to_product_keys",
+                })
+                summary["failed"] += 1
+                continue
+
+        savepoint = db.begin_nested()
+        try:
+            existing = (
+                db.query(SurchargeRule)
+                .filter_by(organization_slug=target_org, name=row.name)
+                .first()
+            )
+            if existing is not None:
+                if body.conflict_policy == "skip":
+                    savepoint.rollback()
+                    ok.append({
+                        "row": idx, "key": row.name,
+                        "surcharge_id": existing.id,
+                        "action": "skipped",
+                    })
+                    summary["skipped"] += 1
+                    continue
+                if body.conflict_policy == "fail":
+                    savepoint.rollback()
+                    failed.append({
+                        "row": idx, "key": row.name,
+                        "error": "surcharge name already exists",
+                        "field": "name",
+                    })
+                    summary["failed"] += 1
+                    continue
+                # update: PATCH fields
+                existing.multiplier = row.multiplier
+                existing.kind = row.kind
+                existing.applies_to_category = row.applies_to_category
+                existing.applies_to_product_keys = row.applies_to_product_keys
+                existing.description = row.description
+                db.flush()
+                ok.append({
+                    "row": idx, "key": row.name,
+                    "surcharge_id": existing.id,
+                    "action": "updated",
+                })
+                summary["updated"] += 1
+            else:
+                s = SurchargeRule(
+                    organization_slug=target_org,
+                    name=row.name,
+                    multiplier=row.multiplier,
+                    kind=row.kind,
+                    applies_to_category=row.applies_to_category,
+                    applies_to_product_keys=row.applies_to_product_keys,
+                    description=row.description,
+                )
+                db.add(s)
+                db.flush()
+                ok.append({
+                    "row": idx, "key": row.name,
+                    "surcharge_id": s.id,
+                    "action": "created",
+                })
+                summary["created"] += 1
+        except Exception as e:
+            savepoint.rollback()
+            failed.append({
+                "row": idx, "key": row.name,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+                "field": None,
+            })
+            summary["failed"] += 1
+
+    if body.dry_run:
+        db.rollback()
+    else:
+        db.commit()
+
+    return {
+        "ok": ok,
+        "failed": failed,
+        "summary": summary,
+    }
 
 
 # ============================================================================
