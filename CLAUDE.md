@@ -8,289 +8,380 @@ Read this first. This file is the handoff context for any new Claude Code sessio
 
 **Client:** Justin Byrne — Just-Print.ie (Irish print shop, Dublin)
 **Agency:** Strategos AI — Roi (owner) + JS (builder)
-**Status:** MVP. Not production. Custom-built microservice — NOT a GHL build.
+**Status:** **Live in production.** Multi-tenant. Cloud Run + Cloud SQL Postgres. Auto-deployed via Cloud Build (`main` push → 189-test gate → image build → Cloud Run revision).
 
-Craig is a custom AI quoting agent for Just Print's customers. It lives as a standalone microservice (this repo) and fronts a website chat widget + quick-quote form. Future channels (WhatsApp, email) will connect directly to this same backend. **We are deliberately not using GHL here — this custom build is the reason the project exists.**
+Craig is a custom AI quoting agent. It fronts:
+- A floating chat widget embedded on just-print.ie (`static/widget.js`, served from `/widget.js`)
+- An email channel via Missive (`info@just-print.ie` inbox)
 
-It uses a structured pricing database plus DeepSeek with tool-calling for natural conversation.
+Future channels (WhatsApp) will connect to the same `/chat` core. **No GHL** — this is a standalone microservice on purpose.
 
-**Commercial:** €2,500 paid upfront, €1,400 on delivery. Monthly plan TBD.
+Underlying model: DeepSeek (OpenAI-compatible) with tool-calling. The LLM never computes prices; it calls into the pricing engine.
+
+**Commercial:** €2,500 upfront, €1,400 on delivery (paid). Monthly TBD.
 
 ---
 
 ## The golden rules — NEVER break these
 
-1. **Craig NEVER invents a price.** Every quote comes from the DB via the pricing engine.
-2. **If the product/quantity/spec isn't on the sheet → escalate.** Don't guess, don't approximate.
-3. **Every quote is saved with `status="pending_approval"`.** Justin reviews before the customer ever sees it.
-4. **The DB is temporary.** Real prices will eventually come from PrintLogic API — we're waiting on Alexander (Wildcard) to build the pricing endpoints. Until then, the JSON/DB is our source of truth.
-5. **Keep the pricing engine and the LLM decoupled.** The LLM handles conversation; the engine owns prices. Never let the LLM compute a price directly.
+1. **Craig NEVER invents a price.** Every quote comes from `pricing_engine.py` via a real tool call against the DB.
+2. **If product/qty/spec isn't on the sheet → escalate.** Don't guess, don't approximate. Don't fall back to yield-only math when `Product.requires_dimensions=True` (v38).
+3. **Every quote is saved with `status="pending_approval"`.** Justin approves from the dashboard before the customer sees any commercial action.
+4. **Pricing engine and LLM stay decoupled.** Engine is pure Python + DB session. LLM is one chat loop + tool definitions.
+5. **No prod deploy without explicit user authorization.** `git push main` triggers Cloud Build → Cloud Run. `git push` to a dashboard branch + merge triggers Vercel.
 
 ---
 
-## Architecture
+## Architecture (post-v40)
 
 ```
-Customer (widget / email / WhatsApp)
-        ↓
-   FastAPI /chat endpoint
-        ↓
-   DeepSeek LLM (tool-calling)
-        ├── Handles natural conversation
-        ├── Calls pricing tools when it has all specs
-        └── Never touches prices directly
-        ↓
-   Pricing Engine (pure Python)
-        ├── Reads from SQLite
-        ├── Applies surcharge rules
-        └── Returns exact price OR escalation
-        ↓
-   SQLite DB (craig.db)
-        ├── products, price_tiers, aliases
-        ├── surcharge_rules, settings
-        └── conversations, quotes
+Customer (web widget │ Missive email)
+      ↓
+FastAPI /chat
+      ├── llm/inbound_classifier.py    (Missive only — Tier 1/2/3 triage)
+      ├── attribution.py                (merge first/last touch; identity backfill)
+      └── llm/craig_agent.chat_with_craig
+              ├── DeepSeek tool loop (max 5 iters, temperature=0.3)
+              │     tools: quote_small_format, quote_large_format, quote_booklet,
+              │            list_products, save_customer_info, find_past_quotes_by_email,
+              │            escalate_to_justin, confirm_order
+              ├── Server-side gates (Phase F/G + v37/v38):
+              │     - hallucinated-quote ([QUOTE_READY] without a Quote row → stripped)
+              │     - premature [QUOTE_READY] (no contact, funnel open, artwork unanswered)
+              │     - artwork choice/upload auto-emit ([ARTWORK_CHOICE], [ARTWORK_UPLOAD])
+              │     - customer-form auto-emit ([CUSTOMER_FORM])
+              │     - reply sanitizer (_humanize_reply: strip markdown)
+              │     - Quote dedupe (v26 — same product+specs → reuse pending row)
+              └── pricing_engine
+                    ├── _quote_per_sqm  (v36: vinyl labels, banners — area math)
+                    ├── _quote_per_sheet (v36: foamex/dibond/corri — panel packing)
+                    ├── _stack_tiers     (v34: 530 cards → 500 + 100 combo)
+                    └── apply_shipping_to_quote (€15 inc VAT, free over €100)
+      ↓
+Cloud SQL Postgres (just-print-craig:europe-west1:craig-db)
+   └── 12 tables, scoped by organization_slug
+
+Outbound (after Justin approves a quote in dashboard):
+   admin_api PATCH /quotes/:id status=approved
+      ├── stripe_client.create_payment_link        (Connect mode: Stripe-Account header)
+      ├── printlogic_push.push_quote               (idempotent on real order_id; DRY-* if dry_run)
+      └── missive_outbound.send_quote_draft        (PDF + payment link → email)
 ```
 
-**LLM flow:** Every customer message goes to DeepSeek with Craig's system prompt + tool definitions. DeepSeek decides when it has enough info, calls `quote_small_format`, `quote_large_format`, `quote_booklet`, `list_products`, or `escalate_to_justin`. We execute the tool against the DB and feed the result back. DeepSeek then generates the natural-language reply.
+**LLM channel override (load-bearing):** `_CHANNEL_CONTEXT["missive"]` in [llm/craig_agent.py:513](llm/craig_agent.py:513) SUPERSEDES the base personality + business rules. When `channel="missive"` we drop both because phrases like "Nice one!" and the chat-bubble tone bleed verbatim into emails. Email replies fly on: channel override (with 4-step funnel: specs → artwork → funnel → PDF) + FAQs + live catalog.
+
+**Inbound triage (v37, Missive only):** [app.py:921](app.py:921) `classify_inbound_email` + confidence threshold (default 0.85, per-tenant). Tier 1 (`confidence < LOW_CONFIDENCE_FLOOR`) silent drop. Tier 2 (`< threshold` OR `engaged-thread + verdict=False`) — runs Craig for preview, parks proposed reply in `Conversation.engagement_classification`, emails Justin to Approve/Reject. Tier 3 (`>= threshold`, `verdict=True`) — auto-responds.
 
 ---
 
-## File layout
+## File layout (current)
 
 ```
-craig-pricing-service/
-├── app.py                        # FastAPI app (entry point)
-├── pricing_engine.py             # Pure pricing logic, reads from SQLite
+Craig-Pricing/
+├── app.py                          # FastAPI; /chat, /quote/*, /widget-config, /widget.js,
+│                                   #   /webhook/missive/{org_slug}, Missive handler
+├── pricing_engine.py               # Pure pricing — small/large/booklet + per-sqm + per-sheet
+│                                   #   + apply_shipping_to_quote + client multiplier
+├── attribution.py                  # v40 — merge_attribution + backfill_attribution_by_identity
+├── widget_api.py                   # POST /widget/conversations/{cid}/customer-info,
+│                                   #   /upload-artwork, /report-issue
+├── admin_api.py                    # ~60 endpoints under /admin/api/* — JWT-protected per route
+├── auth/jwt_auth.py                # HS256 verify; StrategosClaims; access_guard, require_role
 ├── db/
-│   ├── __init__.py               # SQLAlchemy engine + session helpers
-│   └── models.py                 # 7 tables (see schema below)
+│   ├── __init__.py                 # engine, SessionLocal, get_db, parse_artwork_files
+│   └── models.py                   # 12 tables (see schema below)
 ├── llm/
-│   └── craig_agent.py            # DeepSeek tool-calling + Craig system prompt
+│   ├── craig_agent.py              # chat_with_craig orchestration (~2.9k LOC, all the gates)
+│   └── inbound_classifier.py       # v37 — classify_inbound_email + obvious_junk
+├── missive.py                      # Async client: verify_webhook, get_message, create_draft,
+│                                   #   add_shared_labels (v37.7), download_attachment_bytes
+├── missive_outbound.py             # Bridge: PDF + payment link → email thread
+├── printlogic.py                   # Async client: find_customer, create_order (dry-run),
+│                                   #   update_order_status
+├── printlogic_payload.py           # build_payload_from_quote — multi-line jobsheets, due_date
+├── printlogic_push.py              # Idempotent push orchestrator (DRY-* vs real order_id)
+├── stripe_client.py                # Payment Links (inline price) + webhook signature verify
+├── stripe_connect.py               # OAuth state signing (HMAC, 5-min TTL); code exchange
+├── notifications.py                # Resend — approval, manual-review, admin alerts,
+│                                   #   engagement-approval emails
+├── secrets_crypto.py               # Fernet (AES-128) at-rest; MultiFernet for rotation;
+│                                   #   prefix `enc::v1::`
+├── settings_security.py            # SECRET_KEYS allowlist + SECRET_MASK policy
+├── rate_limiter.py                 # In-memory sliding window, 60/min default
+├── pdf_generator.py                # ReportLab — Just Print branded quotation (v36 layout)
+├── integrations_status.py          # Per-tenant green/yellow/red for Missive/PrintLogic/Stripe
+├── pricing_data.py                 # Legacy JSON loader (kept for tests)
+├── extractor.py                    # Legacy fuzzy matcher (kept for alias data)
+├── main.py                         # Legacy v1 API (kept for old tests)
 ├── static/
-│   ├── index.html                # Preview page mocking just-print.ie + widget
-│   └── widget.js                 # Embeddable floating widget (chat + form tabs)
-├── data/                         # Justin's pricing (human-editable JSON)
-│   ├── small_format.json         # 10 products × 5 qty tiers
-│   ├── large_format.json         # 12 products, unit + bulk pricing
-│   ├── booklets.json             # A5/A4 × saddle/perfect × pages × covers
-│   └── rules.json                # Surcharges, VAT rate, turnaround, POA items
+│   ├── widget.js                   # Vanilla JS embeddable widget — captures UTMs (v40),
+│   │                               #   pushes dataLayer events, [ARTWORK_CHOICE] buttons
+│   └── index.html                  # /just-print.ie preview mock with widget mounted
 ├── scripts/
-│   └── migrate_json_to_db.py     # JSON → SQLite bootstrap (run once)
-├── test_pricing.py               # 31 tests verifying prices match spreadsheets
-├── demo.ipynb                    # Direct API endpoint demo
-├── demo_extractor.ipynb          # Legacy fuzzy-matching extractor demo
-├── extractor.py                  # Legacy fuzzy matcher (kept for alias data)
-├── main.py                       # Legacy v1 API (superseded by app.py, kept passing tests)
-├── .env.example                  # Env template (DEEPSEEK_API_KEY)
+│   ├── startup.py                  # Migration orchestrator — runs on every container boot
+│   ├── v2..v40 *.py                # Idempotent stacked migrations (see History below)
+│   ├── seed_demo_tenant.py         # Provision a `demo` tenant for new client setup
+│   ├── probe_printlogic.py         # Step 1 of go-live: READ-ONLY API key validation
+│   └── analyze_*.py, export_*.py   # Ops helpers (audit Missive, export conversations)
+├── docs/
+│   ├── go-live-checklist.md        # 5-step staged production activation runbook
+│   ├── missive-integration.md      # Webhook ↔ draft flow; HMAC; payload shapes
+│   ├── smoke-test-checklist.md     # Manual 10-min E2E (widget + dashboard + integrations)
+│   └── stripe-connect-migration.md # OAuth setup (platform + per-tenant connect)
+├── tests/                          # ~30 test files; CI gate runs 8 (see cloudbuild.yaml)
+├── cloudbuild.yaml                 # Tests → build → push → deploy (25m timeout)
+├── Dockerfile                      # python:3.11-slim; CMD runs startup.py then uvicorn
 ├── requirements.txt
-├── README.md                     # Human-facing setup docs
-└── CLAUDE.md                     # THIS FILE
+└── CLAUDE.md                       # THIS FILE
 ```
 
 ---
 
-## Database schema (SQLite, migratable to Postgres)
+## Database schema (12 tables, Postgres prod / SQLite local)
 
-- **products** — 26 rows. Small format (10), large format (12), booklets (4 variants — a5_saddle_stitch, a5_perfect_bound, a4_saddle_stitch, a4_perfect_bound).
-- **price_tiers** — 660 rows. For small format: `{product_id, quantity, price}`. For booklets: spec_key encodes `"{pages}pp|{cover_type}"`.
-- **product_aliases** — 180 rows. Free-text synonyms → product_key (e.g. "biz cards" → `business_cards`).
-- **surcharge_rules** — 3 rows: `double_sided` (+20%), `soft_touch` (+25%), `triplicate` (+10%).
-- **settings** — 4 rows: `vat_rate` (0.23), `artwork_rate_eur` (65.0), `standard_turnaround`, `poa_items`.
-- **conversations** — persisted chat history, one row per customer session.
-- **quotes** — every quote Craig produces, with `status="pending_approval"` until Justin approves.
+All tables carry `organization_slug` for tenant scoping. Default: `just-print`.
+
+| Table | Purpose | Key fields |
+|-------|---------|-----------|
+| `products` | Catalog | `pricing_strategy` (tiered / per_unit / per_sqm / per_sheet / bulk_break / per_job), `manual_review_required` (v34), `requires_dimensions` (v38), `sanity_max_unit_price` (v38), `min_billable_sqm` (v39), `yield_per_sqm` / `default_unit_size_mm` / `sheet_size_mm` / `sheet_price` (v36) |
+| `price_tiers` | `{product_id, spec_key, quantity, price}` — booklets encode spec as `"32pp\|self_cover"` |
+| `product_aliases` | Free-text synonyms → product_key |
+| `surcharge_rules` | `kind` (multiplier / additive), `applies_to_category` (v32), `applies_to_product_keys` (v34 — JSON list, wins over category) |
+| `settings` | Per-tenant K/V. Encrypted at rest for keys in `settings_security.SECRET_KEYS` |
+| `tax_rates` + `category_tax_map` | Per-category VAT (Irish standard 23%, reduced 13.5%) |
+| `categories` | First-class category with name/description/icon (v3) |
+| `conversations` | Per-customer session. Includes Phase E funnel (`is_company`, `delivery_method`, etc.), Phase G `customer_has_own_artwork` + `artwork_will_send_later`, `engagement_classification` (v37 JSONB), `attribution` (v40 JSONB), `is_test` (v35) |
+| `quotes` | Every quote Craig produces. PrintLogic / Stripe / Missive outbound state lives here, plus v33 approval (`approved_at`, `notification_sent_at`), v34 manual pricing (`manual_quote_price_inc_vat`, `manual_review_reason`), Phase G `artwork_files` JSON array, Phase F shipping cols |
+| `issue_reports` | v35 customer-side problem reports from widget footer |
+| `pricing_verification_flags` | v34 per-(product, qty, spec) operator flag + comment |
+
+Schema in [db/models.py](db/models.py). Quote lifecycle: `pending_approval` → `approved` (Justin clicks Approve) → payment link sent → Stripe webhook `paid` → PrintLogic push → `in_production`. Off-path: `needs_revision` (manual_review flow), `rejected`.
 
 ---
 
-## Pricing rules (Justin confirmed, April 10 2026)
+## Pricing rules (Justin confirmed)
 
 | Rule | Detail |
 |------|--------|
-| Prices | Retail, all quoted directly to customer, **ex VAT** |
-| Double-sided | +20% on base price (except business cards — no extra charge) |
-| Soft-touch finish | +25% on any product |
-| Both stacked | base × 1.20 × 1.25 (surcharges multiply, don't add) |
+| Prices | Retail, quoted to customer **inc VAT** in conversation; PDF shows breakdown |
+| Double-sided | +20% on base (except business cards — no extra) |
+| Soft-touch finish | +25% multiplier OR €15 additive (per-product config since v34) |
 | NCR triplicate | +10% on base (NCR only) |
-| Artwork | €65 + VAT per hour, quoted separately, never bundled |
-| VAT | Irish 23% |
-| Turnaround | 3-5 working days standard |
-| POA items | Z-fold, die-cut labels, installation, rush jobs, custom sizes → escalate |
+| Artwork | €65 + VAT per hour (one-hour standard). Standard 23% VAT rate (service, not goods) |
+| Shipping | €15 inc VAT delivery, free over €100 inc-VAT goods; €0 for collect |
+| Per-sqm products | Vinyl labels, banners, graphics. v38 `requires_dimensions=True` blocks yield-fallback runaway |
+| Per-sheet products | Foamex/dibond/corri panels. Greedy axis-aligned packing with rotation |
+| Off-tier qty | v34 stack-tier: 530 cards → 500 + 100 = 600 billed (cheapest combination, max 5× largest tier) |
+| Min billable area | v39 `min_billable_sqm` — vinyl labels under 1 m² billed as 1 m² (per-product config) |
+| Sanity ceiling | v38 `sanity_max_unit_price` — engine refuses to quote above per-unit cap, escalates |
+| VAT | Irish 23% standard, 13.5% reduced (per-category via tax_rates + category_tax_map) |
+| Turnaround | "3-5 working days" setting |
+| Client multiplier | Per-tenant scalar applied AFTER surcharges, BEFORE VAT. Clamp: 0 < x ≤ 10 |
+| POA items | Z-fold, die-cut, installation, rush, custom sizes → escalate via `escalate_to_justin` |
 
 ---
 
-## Quick start (for Claude Code sessions)
+## Channels
 
-```bash
-# 1. Install deps
-pip install -r requirements.txt
+### Web widget
 
-# 2. Env
-cp .env.example .env
-# Paste DEEPSEEK_API_KEY into .env
+`static/widget.js` is embedded on just-print.ie. Loads config from `GET /widget-config?client={slug}`. v37.8 kill switch: `widget_enabled=false` setting prevents mount. v40 captures `utm_*`, `gclid`/`gbraid`/`wbraid`, `fbclid`/`fbc`/`fbp`, `ttclid`, `msclkid`, `li_fat_id` from URL + first-touch write-once in localStorage; sends on every `/chat` + `/widget/conversations/{cid}/customer-info`. Pushes `lead_created` + `quote_generated` events to `window.dataLayer` with dedup `event_id`. **Decision LOCKED:** we feed dataLayer only; Google Ads/GTM team handles CAPI server-side.
 
-# 3. Build the DB from JSON (run this anytime JSON changes)
-python scripts/migrate_json_to_db.py
+Funnel form: `POST /widget/conversations/{cid}/customer-info` ([widget_api.py:174](widget_api.py:174)) — collects name/email/phone/company/returning/delivery+address. Auto-fills delivery_address from `shop_address` setting on collect. Validates Irish eircode + rejects disposable email domains. Triggers v33 approval notification.
 
-# 4. Run
-uvicorn app:app --reload
-# Open http://localhost:8000 — preview page with widget loads bottom-right
-```
+Artwork upload: multi-file (max 10 per quote, 100MB each), allowed exts `.pdf/.jpg/.png/.ai/.indd/.eps/.tiff/.psd/.svg`. GCS bucket `CRAIG_ARTWORK_BUCKET` in prod; `/tmp/craig-artwork` local. Files served via authenticated proxy `/admin/api/orgs/{slug}/quotes/{id}/artwork/{idx}/file`.
 
-**Known SQLite gotcha:** If the project lives on a cloud-synced folder (iCloud, Dropbox, OneDrive), SQLite throws "disk I/O error". Fix: `export CRAIG_DB_PATH=/tmp/craig.db` or `~/craig.db`.
+### Missive (email)
 
-**Tests:**
-```bash
-pytest test_pricing.py -v
-# 31 passing — verifies every surcharge combo against Justin's sheet
-```
+Webhook at `POST /webhook/missive/{org_slug}`. HMAC-SHA256 verified against `missive_webhook_secret` setting. Returns 200 within 15s, processes in BackgroundTask. Full flow in [app.py:692 `_handle_missive_event`](app.py:692). Key behaviors:
+- Idempotency cache (`_DRAFTED_FOR_MESSAGES`) — Missive retries up to 5× over 8 min
+- Self-sent / internal-team allowlist (`internal_team_domains` + `internal_team_addresses` v37.7) — silent drop
+- HTML strip + quoted-thread strip (`_strip_quoted_thread`)
+- Three-tier engagement triage (v37) before any LLM call
+- Inbound attachment ingestion → GCS, stamped onto pending Quote, flips `customer_has_own_artwork=True`
+- Returning-customer detection injected as `[CUSTOMER STATUS]` system message (v32.2)
+- v33 auto-send default ON; only escalations draft. Label tagging via `missive_label_auto_replied` setting (v37.7)
+
+Outbound (after Justin approves a quote on web-channel conv): `missive_outbound.send_quote_draft` creates a brand-new thread with PDF + payment link.
 
 ---
 
 ## What's been built ✅
 
-### Pricing + conversation core
-- [x] FastAPI microservice with `/chat`, `/quote/*`, `/products`, `/conversations`, `/quotes/:id/pdf` endpoints
-- [x] Pricing engine with surcharge logic, tenant-scoped (31/31 tests passing, prices cross-verified)
-- [x] DeepSeek tool-calling integration — tools: `quote_small_format`, `quote_large_format`, `quote_booklet`, `list_products`, `save_customer_info`, `escalate_to_justin`, `confirm_order`
-- [x] Channel-aware system prompt (web chat vs. email override with few-shot example)
-- [x] Server-side gates: `[QUOTE_READY]` for the PDF flow (web), `escalate_to_justin` refuses without contact info, `confirm_order` rejects cross-conversation quote IDs
-- [x] Prior-quote injection — LLM sees a `[PRIOR QUOTES ALREADY SENT ON THIS THREAD]` system message so it can route customer confirmations to `confirm_order` instead of re-quoting
-- [x] Branded PDF quote generator (`pdf_generator.py`)
-
-### Multi-tenancy + deployment
-- [x] V2–V9 idempotent migrations (see README) — every table scoped by `organization_slug`
-- [x] Cloud SQL Postgres backend (migrated from SQLite; same ORM, different connection string)
-- [x] Cloud Run production deploy with `--min-instances=1 --no-cpu-throttling` so Missive background tasks complete
-- [x] Tenant settings all live in `Setting` table — dashboard edits take effect next turn
-
-### Channels
-- [x] Web chat widget — branded per tenant via `/widget-config?client=<slug>`, embed-ready at `/widget.js`
-- [x] Missive email integration — webhook in, HMAC-verified, draft out with PDF attached. Full docs: [`docs/missive-integration.md`](./docs/missive-integration.md).
-
-### Admin API
-- [x] `admin_api.py` — JWT-authenticated CRUD for products, tiers, surcharges, tax rates, categories, quotes, conversations, settings, metrics
-- [x] Upsert semantics on settings PATCH so dashboard can create new keys without a schema migration
+- **Pricing core**: 6 strategies (tiered, per_unit, per_unit_metric, bulk_break, per_job, per_sqm, per_sheet), tier stacking, surcharge scoping (product → category → global precedence), shipping, client multiplier, manual-review gate, sanity ceiling, min billable area.
+- **LLM**: 8 tools, channel-aware prompts, 4-step email funnel (specs/artwork/funnel/PDF), Phase G upload-first flow, quote dedupe, ~15 server-side gates / sniffers (hallucinated-quote, premature [QUOTE_READY], artwork choice/upload, customer-form, contact-info sniff, artwork-answer sniff, pending-later sniff).
+- **Multi-tenancy**: every table scoped by `organization_slug`; 4-role hierarchy (`client_viewer < client_member < client_owner < strategos_admin`); JWT (HS256, 5-min) signed by dashboard, verified by [auth/jwt_auth.py](auth/jwt_auth.py).
+- **Dashboard** (separate repo, `strategos-dashboard`): 9 modules (Overview, Quotes, Conversations, Attribution v40, Connections, Catalog, Settings, Test Chat v35, Issues v35). Next.js 16 App Router + Supabase + Tailwind/Radix. Auto-deploys to Vercel.
+- **Integrations live**:
+  - Missive — webhook in, HMAC-verified; auto-send drafts; label tagging
+  - PrintLogic — order push (dry-run default; live mode flippable per-tenant); customer dedup via past_customer_email
+  - Stripe Connect — OAuth onboarding (state-signed, 5-min TTL); inline-price Payment Links; webhook with constant-time verify
+  - Resend — approval + manual-review + admin-alert + engagement-approval emails (all idempotent on `notification_sent_at`)
+- **CI**: Cloud Build runs 189 tests (8 files) before image build. Idempotent migrations apply at every container start via `python -m scripts.startup`.
+- **Marketing attribution (v40)**: first-touch write-once + last-touch always; identity backfill stitches email/WhatsApp leads to prior web sessions; `/admin/api/orgs/:slug/attribution-report` (owner-only) groups by utm_source/medium/campaign etc.
 
 ## What's NOT done ❌
 
-### Blockers (need Roi / Justin)
-- PrintLogic pricing API (waiting on Alexander from Wildcard) — still not blocking MVP
-- 5 small open questions about the pricing sheet — still not blocking MVP
-
-### Phase order (explicitly confirmed by the user)
-
-**Step 1 — Prove it works locally (widget + form)**
-Both the chat widget and the Quick Quote form must return real prices from the DB and route to DeepSeek cleanly. This is nearly done — just needs a real DeepSeek API key plugged in and a live test.
-
-**Step 2 — Deploy to Google Cloud**
-Target: Google Cloud Run (containerized FastAPI, pay-per-request, free tier). Alternative: GCE or App Engine. Do NOT use Railway or Render.
-
-Must include:
-- Dockerfile for the FastAPI app
-- Cloud Build or gcloud run deploy command
-- Managed SSL (Cloud Run gives this by default)
-- Env vars set as Cloud Run secrets (DEEPSEEK_API_KEY in particular)
-- DB strategy: SQLite works for single-instance; if scaling, migrate to Cloud SQL (Postgres). Schema is already Postgres-compatible.
-
-**Step 3 — Install widget on just-print.ie**
-WordPress backoffice at `/justprint_20200712_backoffice`. Inject `<script src="https://<cloud-run-url>/widget.js" defer></script>` on relevant pages.
-
-**Step 4 — WhatsApp integration (direct, no GHL)**
-Connect WhatsApp Business API directly to this microservice. Options:
-- WhatsApp Cloud API (Meta's direct offering, free tier for testing)
-- Twilio WhatsApp (easier setup, paid per message)
-New endpoint needed: `/webhook/whatsapp` that receives incoming messages, passes them through the existing `/chat` logic, and replies via the WhatsApp API.
-
-**Step 5 — Email integration (Missive)**
-Connect Missive API to receive inbound quote emails, run them through `/chat` logic, and post drafted replies back to Missive for Justin's approval.
-
-**Step 6 — PrintLogic order creation**
-When a customer accepts a quote, `POST` the order to PrintLogic's `create_order` endpoint. API docs in `Printlogic API-2.pdf`. Auth via `api_key=GA5PQHGaxDl3IJJVuIEZpard9OgCyPOFmegd4W4K` query param.
-
-**Step 7 — Supervised launch + polish**
-Craig runs in approval mode (Justin sees every quote before customer does). Tune prompts and escalation rules based on real customer interactions.
+- **WhatsApp** — endpoint stub planned; not wired.
+- **Catalog CSV/XLSX import** — Justin requested; postponed.
+- **PrintLogic live mode for Just Print** — currently dry_run=true; Stage 3 of go-live checklist is the supervised flip.
+- **Playwright suite for smoke-test-checklist.md** — runbook is manual today.
 
 ---
 
-## Open questions (not blocking MVP, collect later)
+## Migration history (high-level)
 
-1. Business cards: does "double-sided no extra charge" exception still stand, or move to +20% like everything else?
-2. Brochures A4 qty 1,000 shows €26 (lower than 2,500's €48). Likely sheet error. Justin to verify.
-3. Large format per-sq/m products: should Craig calculate area from customer dimensions, or collect and escalate?
-4. OnPrintShop (separate admin at just-print.onprintshop.com) vs PrintLogic — which is the primary order destination?
-5. Missive password confirmation.
+40 migrations stacked idempotently. `scripts/startup.py` orchestrates: pre-DDL passes (v34/v35/v36/v37/v38/v39/v40) → ORM init → seed/migrate scripts in version order.
 
-None of these block development. Build the MVP assuming current behavior; Craig escalates when unsure.
+Highlights:
+- **v2** multi-tenancy (organization_slug everywhere)
+- **v9** Missive settings seed
+- **v12-v18** PrintLogic + Stripe (paste-flow → Connect OAuth)
+- **v17** at-rest encryption for secret settings (Fernet, key from `CRAIG_SECRETS_KEY`)
+- **v22-v25** Phase E + F + G (funnel form, artwork upload, multi-file)
+- **v33** dashboard approval pipeline + Resend notifications
+- **v34** manual-review escalation + stack-tier + per-product surcharge scoping
+- **v35** test-chat sandbox + issue reports
+- **v36** per-sqm + per-sheet pricing
+- **v37 / v37.7** engagement triage + cutover safety (internal-team allowlist, sentinel `missive_from_address_last_known`)
+- **v38** `requires_dimensions` + `sanity_max_unit_price` + price-first artwork flow (Bug 3 fix)
+- **v39** `min_billable_sqm`
+- **v40** marketing attribution
 
----
-
-## Craig's personality (don't drift from this)
-
-Casual, helpful, specifically Irish-market professional. Transparent about being AI on the first message, doesn't keep repeating it. Replies are short and clear — no corporate fluff. Always mentions "Justin will double-check before we run anything" after giving a price.
-
-**Opening line style — DON'T drift into generic:**
-- ❌ "Hey! I'm Craig, your AI assistant. How can I help you today?"
-- ✅ "Hey — Craig here, I handle pricing for Just Print. What are you looking to print?"
-- ✅ "Hi, Craig here. I can get you a quick price — what do you need?"
-
-Full system prompt lives in `llm/craig_agent.py` — edit there, not elsewhere.
+For diff-level detail, read `scripts/vNN_*.py`.
 
 ---
 
-## Credentials (sensitive — never commit to git)
+## Local dev quick start
 
-Stored in the original `credentials.md` that Justin sent. Summary:
-- **PrintLogic API key:** `GA5PQHGaxDl3IJJVuIEZpard9OgCyPOFmegd4W4K`
-- **OnPrintShop admin:** `just-print.onprintshop.com/admin` — `Just Print Admin` / `N1mda123`
-- **Missive:** `info@just-print.ie` / `Hjk379bm!?`
-- **WordPress:** `just-print.ie/justprint_20200712_backoffice` — `ninja_admin` / `dHTPPU%rJCSQX&V2KBrzyR0O`
+The user's bootstrap-from-zero flow (see project memory `craig-pricing-local-bootstrap.md` for the gotcha):
 
-Add DeepSeek key to `.env` locally. Never commit `.env`.
+```bash
+# 1. Clone + venv
+git clone https://github.com/JSebastianIEU/Craig-Pricing.git
+cd Craig-Pricing
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pip install pytest pytest-cov httpx respx PyJWT
+
+# 2. Pull secrets from Secret Manager and write .env
+#    (gcloud auth assumed, project=just-print-craig)
+for s in DEEPSEEK_API_KEY STRATEGOS_JWT_SECRET; do
+  echo "$s=$(gcloud secrets versions access latest --secret=$s --project=just-print-craig)" >> .env
+done
+echo "CRAIG_SECRETS_KEY=$(gcloud secrets versions access latest --secret=craig-secrets-key --project=just-print-craig)" >> .env
+echo "CRAIG_DB_PATH=/tmp/craig.db" >> .env
+
+# 3. Seed local DB — MUST export env first; scripts.startup does NOT load .env
+set -a && source .env && set +a
+python -m scripts.startup
+
+# 4. CI gate
+pytest test_chat_smoke.py test_craig_flow.py test_pricing_edge_cases.py \
+       test_pricing.py test_cutover_safety.py test_inbound_classifier.py \
+       test_missive.py test_attribution.py -q
+# → 189 passed
+
+# 5. Run
+uvicorn app:app --reload
+# /             — preview page with widget
+# /docs         — OpenAPI explorer
+# /admin/api/me — needs Bearer JWT signed by STRATEGOS_JWT_SECRET
+```
+
+**SQLite I/O error on iCloud-synced folders:** `CRAIG_DB_PATH=/tmp/craig.db` in `.env` (already in the snippet above).
+
+---
+
+## Production
+
+| | |
+|--|--|
+| GCP project | `just-print-craig` |
+| Region | `europe-west1` |
+| Cloud Run service | `craig-pricing` |
+| Live URL | `https://craig-pricing-277215252762.europe-west1.run.app` |
+| Cloud SQL instance | `just-print-craig:europe-west1:craig-db` (Postgres, app user `craig`) |
+| Artifact Registry | `europe-west1-docker.pkg.dev/just-print-craig/craig/craig-pricing` |
+| Dashboard | Vercel — auto-deploy from `strategos-dashboard` `main` |
+| CI trigger | Push to `main` of Craig-Pricing → Cloud Build → 8-file pytest gate → build → push → `gcloud run services update` |
+
+Cloud Run flags worth knowing: `--min-instances=1 --no-cpu-throttling` so Missive background tasks (>15s) complete. Env vars resolved from Secret Manager via `secretKeyRef`:
+
+| Setting | Secret name |
+|--|--|
+| `DEEPSEEK_API_KEY` | `DEEPSEEK_API_KEY` |
+| `STRATEGOS_JWT_SECRET` | `STRATEGOS_JWT_SECRET` |
+| `CRAIG_SECRETS_KEY` | `craig-secrets-key` (note lowercase-dashed) |
+| `STRATEGOS_STRIPE_PLATFORM_KEY` | (Connect platform) |
+| `STRATEGOS_STRIPE_CONNECT_WEBHOOK_SECRET` | (Connect webhook signing) |
+| `RESEND_API_KEY` | (notification email) |
+
+Per-tenant secrets (PrintLogic API key, Stripe access token, Missive webhook secret, etc.) live in the encrypted `settings` table, NOT in env vars.
+
+---
+
+## Craig's personality (don't drift)
+
+Casual, Irish-market professional. Transparent about AI on first message; doesn't repeat. Short replies — 2-3 sentences, WhatsApp-style. **No markdown ever** (widget renders literal asterisks). Emojis fine on web channel, **zero emojis on email**.
+
+Email opener: "Hi {FirstName}," — body in 1-3 short paragraphs — sign-off `Cheers, / Craig / Just Print`. Web opener: "Hey — Craig here, I handle pricing for Just Print 🖨️ What are you looking to print?"
+
+Forbidden phrases on email: "Nice one!", "That comes to", "Want me to put together the full quote?", "Hey!"/"Hi there!", any emoji.
+
+**Language mirroring (v38):** detect customer's language from turn 1, lock it in. All other rules apply identically in that language.
+
+Full system prompts live in [llm/craig_agent.py:80 `CRAIG_SYSTEM_PROMPT`](llm/craig_agent.py:80) and [llm/craig_agent.py:513 `_CHANNEL_CONTEXT`](llm/craig_agent.py:513). Don't edit elsewhere — per-tenant overrides go in the `system_prompt` setting via the dashboard Settings tab.
+
+---
+
+## Credentials & secrets
+
+Sensitive values **never live in this repo**. Sources:
+
+- **Cloud Run env (Secret Manager)** — fetch with `gcloud secrets versions access latest --secret={name} --project=just-print-craig`.
+- **Per-tenant integration secrets** — in the encrypted `settings` table (`missive_api_token`, `missive_webhook_secret`, `printlogic_api_key`, `stripe_access_token`). Decrypted on read via `secrets_crypto.decrypt`; masked as `********` in `GET /admin/api/settings` responses ([settings_security.py](settings_security.py)).
+- **`.env` for local dev** — listed above; in `.gitignore`.
+
+**Client-account credentials (Justin's PrintLogic API key, OnPrintShop admin, Missive login, WordPress admin)** — those are Justin's accounts. Roi has them out-of-band. Don't paste into chat or commit.
 
 ---
 
 ## Coding conventions
 
-- Python 3.10+, type hints where useful, not religious about them
-- FastAPI for HTTP, SQLAlchemy 2.0 for DB, Pydantic v2 for validation
-- No ORM migrations tooling yet — `init_db()` creates tables on startup, run `migrate_json_to_db.py` to populate
-- Keep the pricing engine **pure** — no HTTP, no LLM concerns, just functions + DB session
-- Keep the LLM layer **thin** — system prompt + tool definitions + one chat loop, that's it
-- Widget is vanilla JS, no build step, no bundler. Keep it that way.
+- Python 3.11 (CI image). Type hints encouraged, not religious.
+- FastAPI for HTTP, SQLAlchemy 2.0 for DB, Pydantic v2 (`ConfigDict(extra="forbid")` on every write body).
+- Migrations: write a new `scripts/vNN_description.py`, wire into `scripts/startup.py` in the right order (pre-DDL pass if it ADDs columns; regular pass otherwise). Make it idempotent — startup runs on every container boot.
+- Pricing engine stays pure (no HTTP, no LLM). LLM layer stays thin (one chat loop + tool defs + gates).
+- Widget stays vanilla JS — no build step, no bundler.
+- Tests in CI gate are FAST (no real network — DeepSeek key faked, integrations stubbed). The `slow` marker is for tests hitting real services.
+
+---
+
+## Operational runbooks
+
+- [`docs/go-live-checklist.md`](docs/go-live-checklist.md) — 5-step staged production activation with rollbacks
+- [`docs/missive-integration.md`](docs/missive-integration.md) — webhook/draft details, troubleshooting
+- [`docs/smoke-test-checklist.md`](docs/smoke-test-checklist.md) — manual 10-min E2E
+- [`docs/stripe-connect-migration.md`](docs/stripe-connect-migration.md) — platform + per-tenant OAuth
 
 ---
 
 ## When in doubt
 
-- Pricing logic changes → edit JSON in `data/`, re-run `migrate_json_to_db.py`, run `pytest`
-- Craig behavior changes → edit system prompt in `llm/craig_agent.py`
-- Widget look changes → `static/widget.js` (all styles + markup inside)
-- New endpoints → `app.py`
-- New DB tables or columns → `db/models.py` + drop and rebuild the DB (it's fine, prices are in JSON)
+- Pricing logic → edit `pricing_engine.py`, add a test in `test_pricing.py` or `test_pricing_edge_cases.py`, run `pytest test_pricing*.py -q`
+- Craig behavior → edit prompts in `llm/craig_agent.py` (base or channel override); add a test in `test_chat_smoke.py` or `test_craig_flow.py`
+- Widget look → `static/widget.js` (all styles + markup inline)
+- New endpoints → `app.py` (public) or `admin_api.py` (JWT-protected)
+- New DB columns → new `scripts/vNN_*.py` + update `db/models.py`. Test by re-running `python -m scripts.startup` on a wiped DB.
 
 **Escalate to the human (JS / Roi) when:**
-- Pricing behavior changes that aren't on the sheet
+- Pricing behavior changes that aren't on Justin's sheet
 - Anything client-facing (copy, tone, escalation wording)
-- Payment / commercial questions
-- Cloud infrastructure choices (project ID, billing, region)
+- Cloud infrastructure changes (region, project, scaling)
+- ANY production deploy (no `gcloud run deploy` / `git push main` without explicit ask)
+- Writes against prod admin API (mint JWT + POST) — Justin prefers to make catalog/settings tweaks himself in the dashboard
 
 ---
 
-## Deployment target: Google Cloud Run
-
-We are using **Google Cloud** for deployment — not Railway, not Render.
-
-**Preferred service:** Cloud Run (container-based, fully managed, scales to zero, free tier covers MVP traffic).
-
-**What's needed (doesn't exist yet — build it when we get to Step 2):**
-- `Dockerfile` at project root — FastAPI + uvicorn + all deps
-- `.dockerignore` — exclude `craig.db`, `.env`, `preview_*.png`, `__pycache__`, `.cache`
-- Cloud Run deployment script / gcloud commands documented
-- Secret Manager entry for `DEEPSEEK_API_KEY`
-- Initial deploy runs `scripts/migrate_json_to_db.py` at container startup (or bake the DB into the image for MVP)
-- Cloud Run service URL used in the widget embed script for just-print.ie
-
-**DB scaling path:** SQLite is fine on a single Cloud Run instance for MVP. If we hit concurrency issues or need multi-instance, migrate to Cloud SQL (Postgres) — the schema is already Postgres-compatible, just swap `CRAIG_DATABASE_URL`.
-
----
-
-*Last updated: April 15, 2026 — MVP checkpoint (scope updated: no GHL, deploy to Google Cloud)*
+*Last updated: 2026-05-28 — post-v40 ship (per-product min billable area + marketing attribution).*
