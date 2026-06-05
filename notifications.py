@@ -61,6 +61,24 @@ def _setting(db: Session, key: str, default: str, *, organization_slug: str) -> 
     return str(val) if val is not None else default
 
 
+def _parse_recipients(raw: Optional[str]) -> list[str]:
+    """Parse a `notification_to_address` setting value into a list of
+    recipient email addresses.
+
+    Operators can store either a single address or a comma-separated
+    list (e.g. ``"sebastian@strategos-ai.com,justin@just-print.ie"``)
+    so a single notification fans out to multiple inboxes. Whitespace
+    around each address is stripped; empty entries are dropped.
+
+    Returns ``[]`` on empty/None/whitespace-only input, so the
+    callers' existing ``if not to_addr`` check still flags the
+    "no recipient configured" failure case uniformly on the parsed list.
+    """
+    if not raw:
+        return []
+    return [e.strip() for e in str(raw).split(",") if e.strip()]
+
+
 # ---------------------------------------------------------------------------
 # Email body composition
 # ---------------------------------------------------------------------------
@@ -290,7 +308,9 @@ def send_quote_ready_for_approval(
         "Craig (Just Print)",
         organization_slug=org_slug,
     )
-    to_addr = _setting(db, "notification_to_address", "", organization_slug=org_slug)
+    to_addr = _parse_recipients(
+        _setting(db, "notification_to_address", "", organization_slug=org_slug)
+    )
     if not to_addr:
         return {"ok": False, "message_id": None, "error": "missing_notification_to_address"}
 
@@ -317,7 +337,7 @@ def send_quote_ready_for_approval(
         resend.api_key = api_key
         params = {
             "from": f"{sender_name} <{sender_addr}>",
-            "to": [to_addr],
+            "to": to_addr,
             "subject": subject,
             "html": html_body,
             "text": text_body,
@@ -592,7 +612,9 @@ def send_manual_review_required(
         "Craig (Just Print)",
         organization_slug=org_slug,
     )
-    to_addr = _setting(db, "notification_to_address", "", organization_slug=org_slug)
+    to_addr = _parse_recipients(
+        _setting(db, "notification_to_address", "", organization_slug=org_slug)
+    )
     if not to_addr:
         return {"ok": False, "message_id": None, "error": "missing_notification_to_address"}
 
@@ -623,7 +645,7 @@ def send_manual_review_required(
         resend.api_key = api_key
         params = {
             "from": f"{sender_name} <{sender_addr}>",
-            "to": [to_addr],
+            "to": to_addr,
             "subject": subject,
             "html": html_body,
             "text": text_body,
@@ -759,10 +781,10 @@ def send_admin_alert(
         "Craig (Just Print)",
         organization_slug=org_slug,
     )
-    to_addr = _setting(
+    to_addr = _parse_recipients(_setting(
         db, "admin_alert_email", "sebastian@strategos-ai.com",
         organization_slug=org_slug,
-    )
+    ))
     if not to_addr:
         return {"ok": False, "message_id": None, "error": "missing_admin_alert_email"}
 
@@ -787,7 +809,7 @@ def send_admin_alert(
         resend.api_key = api_key
         params = {
             "from": f"{sender_name} <{sender_addr}>",
-            "to": [to_addr],
+            "to": to_addr,
             "subject": subject,
             "html": body_html,
             "text": body_text,
@@ -1161,7 +1183,9 @@ def send_engagement_ready_for_approval(
         "Craig (Just Print)",
         organization_slug=org_slug,
     )
-    to_addr = _setting(db, "notification_to_address", "", organization_slug=org_slug)
+    to_addr = _parse_recipients(
+        _setting(db, "notification_to_address", "", organization_slug=org_slug)
+    )
     if not to_addr:
         return {"ok": False, "message_id": None, "error": "missing_notification_to_address"}
 
@@ -1183,7 +1207,7 @@ def send_engagement_ready_for_approval(
         resend.api_key = api_key
         params = {
             "from": f"{sender_name} <{sender_addr}>",
-            "to": [to_addr],
+            "to": to_addr,
             "subject": subject,
             "html": html_body,
             "text": text_body,
