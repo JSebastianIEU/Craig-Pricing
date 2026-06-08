@@ -1279,6 +1279,83 @@ TOOLS = [
 ]
 
 
+def _build_tools_for_org(db: Session, organization_slug: str) -> list:
+    """v40.4 — dynamic tool definitions per chat turn.
+
+    The static ``TOOLS`` array hard-coded the small_format /
+    large_format product_key enums (business_cards, flyers_a5, …).
+    That worked when the catalog was edited only by code-side
+    migrations, but the v40.2 bulk import lets Justin add arbitrary
+    products from a workbook. With the hard-coded enum, DeepSeek
+    would either refuse to call the pricing tool for a brand-new
+    product or escalate it unnecessarily — Craig "didn't know it
+    existed" even though the catalog context in the system prompt
+    listed it.
+
+    This builder is called once per ``chat_with_craig`` invocation
+    and replaces those two enums with the live keys for the tenant
+    from the ``products`` table.
+
+    Tenant scoping is preserved (the same ``organization_slug``
+    threaded through the rest of the chat path), so two tenants
+    using the same Cloud Run revision still see only their own
+    products in the tool schema. The enum is *dropped entirely* if
+    a category has zero products for that tenant — an empty
+    ``enum: []`` is technically valid JSON Schema but confuses the
+    LLM ("the list is empty, am I allowed to call this?"). Better
+    to remove the constraint and let the prompt's catalog context
+    govern.
+
+    ``quote_booklet`` is left untouched — its enums are
+    ``format`` (a5/a4) and ``binding`` (saddle_stitch / perfect_bound),
+    both fundamental product structure rather than catalog data,
+    so they remain hard-coded.
+
+    Returns a deep copy of ``TOOLS`` with the enums adjusted — the
+    module-level constant stays untouched so concurrent requests
+    can't trample each other's tool list.
+    """
+    import copy as _copy
+    from db.models import Product as _Product
+
+    small_keys = sorted(
+        row[0]
+        for row in db.query(_Product.key).filter_by(
+            organization_slug=organization_slug, category="small_format",
+        ).all()
+    )
+    large_keys = sorted(
+        row[0]
+        for row in db.query(_Product.key).filter_by(
+            organization_slug=organization_slug, category="large_format",
+        ).all()
+    )
+
+    tools = _copy.deepcopy(TOOLS)
+    for tool in tools:
+        fn = tool.get("function", {})
+        if fn.get("name") not in ("quote_small_format", "quote_large_format"):
+            continue
+        product_key_spec = (
+            fn.get("parameters", {})
+            .get("properties", {})
+            .get("product_key")
+        )
+        if not isinstance(product_key_spec, dict):
+            continue
+        target_keys = (
+            small_keys if fn["name"] == "quote_small_format" else large_keys
+        )
+        if target_keys:
+            product_key_spec["enum"] = target_keys
+        else:
+            # No products in this category for this tenant — drop the
+            # enum so the LLM treats it as a free string instead of
+            # being told "the enum is empty, you may not call me".
+            product_key_spec.pop("enum", None)
+    return tools
+
+
 # =============================================================================
 # TOOL EXECUTION
 # =============================================================================
@@ -2150,12 +2227,18 @@ def chat_with_craig(
     order_confirmed = False
     last_quote_id: int | None = None
 
+    # v40.4 — build the tool schema with the live catalog enums for
+    # this tenant. Done ONCE per chat_with_craig call (not once per
+    # iteration of the tool-calling loop) so the LLM sees a stable
+    # tool list during multi-turn tool calls.
+    tools_for_org = _build_tools_for_org(db, organization_slug)
+
     # Tool-calling loop — LLM may call tools 0+ times before giving final answer
     for _ in range(5):  # safety cap
         response = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=messages,
-            tools=TOOLS,
+            tools=tools_for_org,
             tool_choice="auto",
             temperature=0.3,
         )
