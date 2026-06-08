@@ -50,6 +50,11 @@ steps:
     #        normalization (mixed-case merge), v38 fields round-trip,
     #        X-Known-Keys header for cross-validating just-created
     #        products against surcharges in the same upload.
+    #      * test_dynamic_tools.py — v40.4 dynamic LLM tool enums:
+    #        product_key enum on quote_small_format / quote_large_format
+    #        comes from the live catalog per chat turn so bulk-imported
+    #        products are immediately quotable; multi-tenant isolation;
+    #        TOOLS module constant immutability across concurrent turns.
     #
     #    Tests run against a fresh local SQLite (CRAIG_DB_PATH=/tmp/...)
     #    seeded by scripts.startup. ~2-3 min total.
@@ -81,6 +86,7 @@ steps:
                 test_attribution.py \
                 test_notifications.py \
                 test_bulk_catalog_import.py \
+                test_dynamic_tools.py \
                 -q --no-header --tb=short --maxfail=5
             echo "== All tests passed — proceeding to build =="
 
