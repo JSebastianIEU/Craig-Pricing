@@ -1056,6 +1056,94 @@ class TestV408PromptWording:
             "is named."
         )
 
+    def test_v40_8_10_extract_board_size_helper(self):
+        """v40.8.10 — the helper that auto-extracts board size from a
+        customer's message must recognize the 7 standard sizes across
+        common phrasings."""
+        from llm.craig_agent import _extract_board_size_from_message
+
+        # A-series (with or without surrounding words)
+        assert _extract_board_size_from_message("5 corri boards A3") == "A3"
+        assert _extract_board_size_from_message("10 corri boards A1") == "A1"
+        assert _extract_board_size_from_message("2 foamex boards A0") == "A0"
+        assert _extract_board_size_from_message("5 dibond boards A2") == "A2"
+        assert _extract_board_size_from_message("3 corri A4 boards") == "A4"
+        assert _extract_board_size_from_message("Quote 2 A0 dibond") == "A0"
+        assert _extract_board_size_from_message("a3 corri boards 5") == "A3"
+
+        # Full sheet phrasings
+        assert _extract_board_size_from_message("1 full sheet corri") == "2440x1220"
+        assert _extract_board_size_from_message("a full-sheet of corri") == "2440x1220"
+        assert _extract_board_size_from_message("1 corri 2440x1220") == "2440x1220"
+        assert _extract_board_size_from_message("1 corri 2440 x 1220") == "2440x1220"
+
+        # Half sheet phrasings
+        assert _extract_board_size_from_message("1 half sheet foamex") == "1220x1220"
+        assert _extract_board_size_from_message("1 corri 1220x1220") == "1220x1220"
+
+        # No size mentioned → None
+        assert _extract_board_size_from_message("5 corri boards") is None
+        assert _extract_board_size_from_message("10 banners please") is None
+        assert _extract_board_size_from_message("") is None
+        assert _extract_board_size_from_message(None) is None
+
+        # Custom mm with no A-series → None (let laydown path handle)
+        assert _extract_board_size_from_message("20 corri at 800x600mm") is None
+
+    def test_v40_8_10_exec_tool_signature_accepts_latest_user_message(self):
+        """v40.8.10 — _exec_tool must accept `latest_user_message`
+        kwarg so the chat loop can pass through the verbatim user
+        message to the board-size auto-injection gate."""
+        import inspect
+        from llm.craig_agent import _exec_tool
+        sig = inspect.signature(_exec_tool)
+        assert "latest_user_message" in sig.parameters, (
+            "_exec_tool must accept `latest_user_message` kwarg "
+            "(v40.8.10 board-size gate)."
+        )
+
+    def test_v40_8_10_exec_tool_auto_injects_size_for_boards(self):
+        """v40.8.10 — when the LLM calls quote_large_format for a board
+        product without `size` AND without width_mm/height_mm AND the
+        customer's message named an A-series size, _exec_tool must
+        auto-inject the size before calling the engine. End-to-end
+        test verified via the smoke runner; here we just assert the
+        wiring path executes without error."""
+        from llm.craig_agent import _exec_tool
+        from db import db_session
+
+        with db_session() as db:
+            # corri_boards needs to be tiered for this path to be live.
+            from db.models import Product
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="corri_boards",
+            ).first()
+            if p is None:
+                import pytest
+                pytest.skip("corri_boards missing")
+            orig_strat = p.pricing_strategy
+            p.pricing_strategy = "tiered"
+            db.commit()
+            try:
+                result = _exec_tool(
+                    db,
+                    "quote_large_format",
+                    args={"product_key": "corri_boards", "quantity": 5},
+                    organization_slug="just-print",
+                    latest_user_message="5 corri boards A3",  # ← customer named A3
+                )
+                # If the gate auto-injected size=A3, the engine ran the
+                # tiered-by-size path. The result should NOT contain
+                # the v40.8.9 escalation reason (no `size` and no width/height).
+                err = result.get("reason", "")
+                assert "without `size`" not in err and "without size" not in err, (
+                    f"Board-size gate did not auto-inject — engine returned "
+                    f"the no-size escalation: {err!r}"
+                )
+            finally:
+                p.pricing_strategy = orig_strat
+                db.commit()
+
     def test_v40_8_7_prompt_size_reduced(self):
         """v40.8.7 — sanity check that the prompt didn't bloat further.
         Pre-v40.8.7 was 16,208 chars; v40.8.7 shrunk to 13,454.
