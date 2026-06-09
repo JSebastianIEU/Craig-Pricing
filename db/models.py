@@ -135,6 +135,23 @@ class Product(Base):
     # per_sqm engine path reads it.
     min_billable_sqm = Column(Float, nullable=True)
 
+    # v41 — minimum order value in € (ex VAT). When set, if the
+    # engine's `final_price_ex_vat` after surcharges + client
+    # multiplier falls BELOW this value, the engine FLOORS the price
+    # to this value. Surfaced in `surcharges_applied` as
+    # "Minimum order €X" so the LLM mentions it to the customer.
+    # Null = no floor (legacy behaviour). Applies across all pricing
+    # strategies and all 3 quote_* paths. Justin's ask: €45 vinyl
+    # labels, €25 large_format. Set per-product in the dashboard.
+    min_order_value_eur = Column(Float, nullable=True)
+    # v41 — maximum quantity Craig will auto-quote. When set and the
+    # LLM tool passes `quantity > this`, the engine EARLY-EXITS with
+    # an EscalationResult(manual_review=True) BEFORE any pricing
+    # math. Craig auto-creates a needs_revision Quote and asks Justin
+    # to price manually. Null = no ceiling (legacy behaviour). Used
+    # for leaflets / letterheads where above N units = custom job.
+    max_qty_for_auto_quote = Column(Integer, nullable=True)
+
     # v34 — manual-review escalation flag. When True, Craig refuses to
     # auto-quote this product and instead creates a Quote with
     # status='needs_revision' so Justin prices it manually from the

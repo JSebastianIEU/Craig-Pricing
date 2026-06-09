@@ -420,6 +420,300 @@ class TestSanityCeilingInteractions:
 
 
 # ===========================================================================
+# v41 — TestMinOrderFloor + TestMaxQtyCeiling
+#
+# Per-product `min_order_value_eur` and `max_qty_for_auto_quote` columns
+# added in v41. Floor: bumps the final ex-VAT total up to the floor and
+# surfaces a "Minimum order €X applied" note. Ceiling: short-circuits
+# BEFORE pricing math and returns EscalationResult(manual_review=True).
+#
+# We verify both behaviors fire on each of the 4 quote_* entry points:
+#   - quote_small_format (small_format.tiered: business_cards)
+#   - _quote_per_sqm  via quote_large_format (vinyl_labels)
+#   - _quote_per_sheet via quote_large_format (foamex_boards)
+#   - quote_booklet (booklet_a5_saddle_stitch)
+#
+# All set/unset within the test (try/finally) so the catalog stays
+# pristine for the rest of the suite.
+# ===========================================================================
+
+
+def _set_v41_fields(db, product_key: str, *, min_eur=None, max_qty=None):
+    """Helper: set v41 fields on a product, return the Product so caller
+    can revert in finally."""
+    p = db.query(Product).filter_by(
+        organization_slug=ORG, key=product_key,
+    ).first()
+    if p is None:
+        pytest.skip(f"Product {product_key} missing from seed catalog.")
+    p.min_order_value_eur = min_eur
+    p.max_qty_for_auto_quote = max_qty
+    db.commit()
+    return p
+
+
+class TestMinOrderFloor:
+    """v41 — `min_order_value_eur` floors the engine's final ex-VAT
+    total when computed value falls below it. Verified across each
+    of the 4 quote entry points."""
+
+    def test_small_format_floor_applied(self):
+        """Business cards at the lowest tier (100 = ~€35 ex VAT).
+        Floor at €100 → bumped to €100; surcharges_applied carries the
+        'Minimum order €100.00' note."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "business_cards", min_eur=100.0)
+            try:
+                result = quote_small_format(
+                    db, product_key="business_cards",
+                    quantity=100, double_sided=False, finish="matte",
+                    organization_slug=ORG,
+                )
+                if isinstance(result, EscalationResult):
+                    pytest.skip(
+                        "business_cards escalated (tier missing in seed) — "
+                        "engine path covered by other tests."
+                    )
+                assert isinstance(result, QuoteResult)
+                # Floor only applies when computed is below floor.
+                assert result.final_price_ex_vat >= 100.0 - 0.005
+                assert any(
+                    "Minimum order" in s for s in result.surcharges_applied
+                ), (
+                    f"Expected min-order note, got {result.surcharges_applied}"
+                )
+            finally:
+                p.min_order_value_eur = None
+                db.commit()
+
+    def test_small_format_floor_not_applied_when_above(self):
+        """If the natural total is already above the floor, the floor
+        is a no-op — no surcharge note, no bump."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "business_cards", min_eur=1.0)
+            try:
+                result = quote_small_format(
+                    db, product_key="business_cards",
+                    quantity=100, double_sided=False, finish="matte",
+                    organization_slug=ORG,
+                )
+                if isinstance(result, EscalationResult):
+                    pytest.skip("business_cards escalated in seed catalog.")
+                assert isinstance(result, QuoteResult)
+                assert not any(
+                    "Minimum order" in s for s in result.surcharges_applied
+                ), (
+                    "Floor below natural total should not fire."
+                )
+            finally:
+                p.min_order_value_eur = None
+                db.commit()
+
+    def test_per_sqm_floor_applied(self):
+        """Tiny vinyl label order (1 × 50×30mm = 0.0015 m²) — natural
+        total well under €1. Floor at €45 (Justin's real minimum)
+        bumps it up."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "vinyl_labels", min_eur=45.0)
+            try:
+                result = quote_large_format(
+                    db, product_key="vinyl_labels",
+                    quantity=1, width_mm=50, height_mm=30,
+                    organization_slug=ORG,
+                )
+                if isinstance(result, EscalationResult):
+                    pytest.skip("vinyl_labels escalated under seeded rules.")
+                assert isinstance(result, QuoteResult)
+                assert result.final_price_ex_vat >= 45.0 - 0.005
+                assert any(
+                    "Minimum order" in s for s in result.surcharges_applied
+                )
+            finally:
+                p.min_order_value_eur = None
+                db.commit()
+
+    def test_per_sheet_floor_applied(self):
+        """1 small foamex panel — natural cost is fractional of a sheet.
+        Floor at €25 bumps to €25."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "foamex_boards", min_eur=25.0)
+            try:
+                result = quote_large_format(
+                    db, product_key="foamex_boards",
+                    quantity=1, width_mm=200, height_mm=200,
+                    organization_slug=ORG,
+                )
+                if isinstance(result, EscalationResult):
+                    pytest.skip("foamex_boards escalated under seeded rules.")
+                assert isinstance(result, QuoteResult)
+                # The per_sheet engine bills full sheets, so total may
+                # already exceed €25 — only assert floor behavior when
+                # it actually fires. If it didn't fire, computed >= 25,
+                # which is fine.
+                assert result.final_price_ex_vat >= 25.0 - 0.005
+            finally:
+                p.min_order_value_eur = None
+                db.commit()
+
+    def test_booklet_floor_applied(self):
+        """Cheapest booklet × huge floor — bumped to floor.
+        booklet_a5_saddle_stitch lowest tier ~€100-ish; floor at €500
+        forces a bump."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "booklet_a5_saddle_stitch", min_eur=500.0)
+            try:
+                result = quote_booklet(
+                    db, format="a5", binding="saddle_stitch",
+                    pages=16, cover_type="self_cover",
+                    quantity=50, organization_slug=ORG,
+                )
+                if isinstance(result, EscalationResult):
+                    pytest.skip(
+                        "Booklet tier missing in seed — engine path "
+                        "covered by booklet basics tests."
+                    )
+                assert isinstance(result, QuoteResult)
+                assert result.final_price_ex_vat >= 500.0 - 0.005
+                assert any(
+                    "Minimum order" in s for s in result.surcharges_applied
+                )
+            finally:
+                p.min_order_value_eur = None
+                db.commit()
+
+    def test_floor_only_applies_when_set(self):
+        """Default min_order_value_eur is null → floor never fires
+        (no surcharge note, no bump)."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "business_cards", min_eur=None)
+            try:
+                result = quote_small_format(
+                    db, product_key="business_cards",
+                    quantity=100, double_sided=False, finish="matte",
+                    organization_slug=ORG,
+                )
+                if isinstance(result, EscalationResult):
+                    pytest.skip("business_cards escalated.")
+                assert isinstance(result, QuoteResult)
+                assert not any(
+                    "Minimum order" in s for s in result.surcharges_applied
+                )
+            finally:
+                p.min_order_value_eur = None
+                db.commit()
+
+
+class TestMaxQtyCeiling:
+    """v41 — `max_qty_for_auto_quote` short-circuits BEFORE pricing
+    math and escalates to manual review."""
+
+    def test_small_format_above_ceiling_escalates(self):
+        """Business cards with ceiling=200 → ask for 500 → escalates
+        with manual_review=True and a reason string."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "business_cards", max_qty=200)
+            try:
+                result = quote_small_format(
+                    db, product_key="business_cards",
+                    quantity=500, double_sided=False, finish="matte",
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, EscalationResult), (
+                    f"Above-ceiling should escalate, got {type(result).__name__}"
+                )
+                assert result.manual_review is True
+                assert "auto-quote ceiling" in (result.reason or "").lower()
+            finally:
+                p.max_qty_for_auto_quote = None
+                db.commit()
+
+    def test_per_sqm_above_ceiling_escalates(self):
+        """Vinyl labels with ceiling=100 → ask for 500 → escalates."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "vinyl_labels", max_qty=100)
+            try:
+                result = quote_large_format(
+                    db, product_key="vinyl_labels",
+                    quantity=500, width_mm=50, height_mm=30,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, EscalationResult)
+                assert result.manual_review is True
+            finally:
+                p.max_qty_for_auto_quote = None
+                db.commit()
+
+    def test_per_sheet_above_ceiling_escalates(self):
+        """Foamex boards with ceiling=50 → ask for 200 panels → escalates."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "foamex_boards", max_qty=50)
+            try:
+                result = quote_large_format(
+                    db, product_key="foamex_boards",
+                    quantity=200, width_mm=300, height_mm=200,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, EscalationResult)
+                assert result.manual_review is True
+            finally:
+                p.max_qty_for_auto_quote = None
+                db.commit()
+
+    def test_booklet_above_ceiling_escalates(self):
+        """Booklet with ceiling=10 → ask for 100 → escalates."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "booklet_a5_saddle_stitch", max_qty=10)
+            try:
+                result = quote_booklet(
+                    db, format="a5", binding="saddle_stitch",
+                    pages=16, cover_type="self_cover",
+                    quantity=100, organization_slug=ORG,
+                )
+                assert isinstance(result, EscalationResult)
+                assert result.manual_review is True
+            finally:
+                p.max_qty_for_auto_quote = None
+                db.commit()
+
+    def test_at_ceiling_exact_passes(self):
+        """Qty == ceiling should NOT escalate (guard uses > not >=)."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "business_cards", max_qty=100)
+            try:
+                result = quote_small_format(
+                    db, product_key="business_cards",
+                    quantity=100, double_sided=False, finish="matte",
+                    organization_slug=ORG,
+                )
+                # Either a quote or an escalation for a non-ceiling
+                # reason. If it's an EscalationResult, it must NOT be
+                # the ceiling escalation.
+                if isinstance(result, EscalationResult):
+                    assert "auto-quote ceiling" not in (result.reason or "").lower()
+            finally:
+                p.max_qty_for_auto_quote = None
+                db.commit()
+
+    def test_ceiling_only_applies_when_set(self):
+        """Default max_qty_for_auto_quote is null → no ceiling fires."""
+        with db_session() as db:
+            p = _set_v41_fields(db, "business_cards", max_qty=None)
+            try:
+                result = quote_small_format(
+                    db, product_key="business_cards",
+                    quantity=500, double_sided=False, finish="matte",
+                    organization_slug=ORG,
+                )
+                # Should NOT be a ceiling escalation. (May be a
+                # tier-missing escalation, that's fine.)
+                if isinstance(result, EscalationResult):
+                    assert "auto-quote ceiling" not in (result.reason or "").lower()
+            finally:
+                p.max_qty_for_auto_quote = None
+                db.commit()
+
+
+# ===========================================================================
 # Small-format edge cases
 # ===========================================================================
 

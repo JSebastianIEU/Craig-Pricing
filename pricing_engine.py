@@ -570,6 +570,79 @@ def apply_shipping_to_quote(
 
 
 # =============================================================================
+# v41 — per-product floor + auto-quote ceiling helpers
+# =============================================================================
+
+
+def _check_qty_ceiling(product, quantity: int) -> Optional["EscalationResult"]:
+    """v41 — early-exit ceiling check. Returns an EscalationResult when
+    ``product.max_qty_for_auto_quote`` is set and ``quantity`` exceeds
+    it. Used at the top of every quote_* path. Returns None for legacy
+    products (max_qty unset) — engine continues as before.
+
+    The escalation carries ``manual_review=True`` so the LLM shell
+    auto-creates a ``Quote(status='needs_revision')`` row and pings
+    Justin via the v33 notification pipeline. Customer sees Craig say
+    "let me get Justin to confirm the price on this", no number quoted.
+    """
+    cap = getattr(product, "max_qty_for_auto_quote", None)
+    if not cap:
+        return None
+    try:
+        cap_int = int(cap)
+    except (TypeError, ValueError):
+        return None
+    if cap_int <= 0 or quantity <= cap_int:
+        return None
+    return EscalationResult(
+        reason=(
+            f"quantity {quantity} exceeds the auto-quote ceiling "
+            f"({cap_int}) on {product.name}"
+        ),
+        product_name=product.name,
+        manual_review=True,
+        message=(
+            "Quantity is above the auto-quote limit for this product — "
+            "Justin to price manually from the dashboard."
+        ),
+    )
+
+
+def _apply_min_order_floor(
+    product,
+    final_ex: float,
+    surcharges_applied: list[str],
+) -> float:
+    """v41 — per-product minimum order floor. If
+    ``product.min_order_value_eur`` is set and ``final_ex`` (ex-VAT
+    subtotal AFTER surcharges + client multiplier, BEFORE VAT) falls
+    below it, this returns the floor value AND appends a human-
+    readable line to ``surcharges_applied`` so the LLM mentions the
+    minimum to the customer (\"Minimum order €25\"). No-op for legacy
+    products (min unset) — returns the original ``final_ex``.
+
+    Centralised so the same logic fires in every quote_* path
+    (small_format / per_sqm / per_sheet / booklet) and tier-stack
+    helpers can share the call site rather than reimplementing the
+    branch.
+    """
+    floor = getattr(product, "min_order_value_eur", None)
+    if not floor:
+        return final_ex
+    try:
+        floor_f = float(floor)
+    except (TypeError, ValueError):
+        return final_ex
+    if floor_f <= 0 or final_ex >= floor_f:
+        return final_ex
+    surcharges_applied.append(
+        f"Minimum order €{floor_f:.2f} applied "
+        f"(computed was €{final_ex:.2f})"
+    )
+    return round(floor_f, 2)
+
+
+# =============================================================================
 # SMALL FORMAT
 # =============================================================================
 
@@ -617,6 +690,13 @@ def quote_small_format(
                 "asked for the missing detail (dimensions in mm, etc.)."
             ),
         )
+
+    # v41 — qty ceiling check. If the product has a max_qty_for_auto_quote
+    # set and the requested quantity is above it, escalate BEFORE any
+    # pricing math (don't quote a huge job Justin needs to confirm).
+    _ceil = _check_qty_ceiling(product, quantity)
+    if _ceil is not None:
+        return _ceil
 
     tier = db.query(PriceTier).filter_by(
         product_id=product.id, spec_key="", quantity=quantity,
@@ -760,6 +840,11 @@ def quote_small_format(
         sign = "+" if pct >= 0 else ""
         surcharges_applied.append(f"Client adjustment: {sign}{pct}%")
 
+    # v41 — minimum order floor. Applied AFTER client multiplier so the
+    # multiplier can't dodge the floor; BEFORE VAT because the floor is
+    # an ex-VAT business rule (Justin's "minimum €25 ex VAT").
+    final_ex = _apply_min_order_floor(product, final_ex, surcharges_applied)
+
     surcharge_amount = round(final_ex - base_price, 2)
 
     vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
@@ -838,6 +923,11 @@ def _quote_per_sqm(
             reason="quantity must be positive",
             product_name=product.name,
         )
+
+    # v41 — qty ceiling check at the top of per_sqm path.
+    _ceil = _check_qty_ceiling(product, quantity)
+    if _ceil is not None:
+        return _ceil
 
     # 1. Resolve total area
     total_m2: Optional[float] = None
@@ -1035,6 +1125,11 @@ def _quote_per_sqm(
         sign = "+" if pct >= 0 else ""
         surcharges_applied.append(f"Client adjustment: {sign}{pct}%")
 
+    # v41 — minimum order floor. AFTER client multiplier, BEFORE VAT.
+    # Critical for vinyl_labels and per-sqm products where small areas
+    # would otherwise price below Justin's €45 minimum.
+    total_ex = _apply_min_order_floor(product, total_ex, surcharges_applied)
+
     # VAT
     vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
     vat = round(total_ex * vat_rate, 2)
@@ -1107,6 +1202,11 @@ def _quote_per_sheet(
             product_name=product.name,
         )
 
+    # v41 — qty ceiling check at the top of per_sheet path.
+    _ceil = _check_qty_ceiling(product, quantity)
+    if _ceil is not None:
+        return _ceil
+
     # 1. Need panel dimensions — no sensible default for panels
     if not (width_mm and height_mm):
         return EscalationResult(
@@ -1169,6 +1269,10 @@ def _quote_per_sheet(
         pct = int(round((client_mult - 1.0) * 100))
         sign = "+" if pct >= 0 else ""
         surcharges_applied.append(f"Client adjustment: {sign}{pct}%")
+
+    # v41 — minimum order floor on per_sheet path. Catches "1 small
+    # panel = €5" style requests below the €25 large_format minimum.
+    total_ex = _apply_min_order_floor(product, total_ex, surcharges_applied)
 
     # VAT
     vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
@@ -1265,6 +1369,15 @@ def quote_large_format(
             ),
         )
 
+    # v41 — qty ceiling check at the top of quote_large_format. Covers
+    # ALL 3 dispatch paths (per_sqm, per_sheet, legacy bulk_break) in
+    # one place so we don't have to repeat the guard inside each helper.
+    # (The helpers also call _check_qty_ceiling defensively in case
+    # they're invoked directly from a test or future code path.)
+    _ceil = _check_qty_ceiling(product, quantity)
+    if _ceil is not None:
+        return _ceil
+
     # v36 — per-sq/m + per-sheet pricing strategies. These short-circuit
     # the legacy bulk_break path because their inputs (dimensions, sheet
     # config) require completely different math. Both helpers return
@@ -1309,6 +1422,12 @@ def quote_large_format(
         pct = int(round((client_mult - 1.0) * 100))
         sign = "+" if pct >= 0 else ""
         applied.append(f"Client adjustment: {sign}{pct}%")
+
+    # v41 — minimum order floor on legacy bulk_break path. AFTER
+    # client multiplier, BEFORE VAT. Note: `applied` is the local
+    # surcharges list in this path (named `applied` here, not
+    # `surcharges_applied`).
+    total_ex = _apply_min_order_floor(product, total_ex, applied)
 
     vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
     vat = round(total_ex * vat_rate, 2)
@@ -1396,6 +1515,12 @@ def quote_booklet(
             ),
         )
 
+    # v41 — qty ceiling check on booklets (symmetric with the other
+    # two quote_* entry points).
+    _ceil = _check_qty_ceiling(product, quantity)
+    if _ceil is not None:
+        return _ceil
+
     spec_key = f"{pages}pp|{cover_type}"
     tier = db.query(PriceTier).filter_by(
         product_id=product.id, spec_key=spec_key, quantity=quantity,
@@ -1448,6 +1573,10 @@ def quote_booklet(
         pct = int(round((client_mult - 1.0) * 100))
         sign = "+" if pct >= 0 else ""
         applied.append(f"Client adjustment: {sign}{pct}%")
+
+    # v41 — minimum order floor on booklets. AFTER client multiplier,
+    # BEFORE VAT (parity with the other three product families).
+    final_ex = _apply_min_order_floor(product, final_ex, applied)
 
     vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
     vat = round(final_ex * vat_rate, 2)
