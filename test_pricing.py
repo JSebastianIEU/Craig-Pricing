@@ -3,7 +3,7 @@ Test suite for Craig Pricing Service.
 Tests real scenarios against Justin's spreadsheet values.
 
 PRICING MODEL (confirmed by Justin 16 Apr 2026):
-- Small format prices are PER UNIT BASE (per 100 for cards/flyers, per 5 for NCR pads)
+- Small format prices are PER UNIT BASE (per 100 for cards/flyers, per 5 for NCR books)
 - Total = unit_price × (quantity / unit_base)
 - Printed matter VAT = 13.5% (not 23%)
 - Large format = 23% VAT (signage, not printed matter)
@@ -81,7 +81,7 @@ def test_finish_param_ignored_when_product_has_no_finishes():
 
 
 # =============================================================================
-# SMALL FORMAT — UNIT-BASED PRICING (per 100 cards/flyers, per 5 NCR pads)
+# SMALL FORMAT — UNIT-BASED PRICING (per 100 cards/flyers, per 5 NCR books)
 # =============================================================================
 
 
@@ -162,9 +162,9 @@ def test_flyers_a4_1000_double_sided_soft_touch():
 
 
 def test_ncr_a5_10_duplicate():
-    """10 NCR A5 pads @ €90/5 pads = €180."""
+    """10 NCR A5 books @ €90/5 books = €180."""
     r = client.post("/quote/small-format", json={
-        "product_key": "ncr_pads_a5",
+        "product_key": "ncr_books_a5",
         "quantity": 10,
         "double_sided": False,
         "finish": "duplicate",
@@ -176,9 +176,9 @@ def test_ncr_a5_10_duplicate():
 
 
 def test_ncr_a4_20_triplicate():
-    """20 NCR A4 pads @ €85/5 pads = €340, +10% triplicate = €374."""
+    """20 NCR A4 books @ €85/5 books = €340, +10% triplicate = €374."""
     r = client.post("/quote/small-format", json={
-        "product_key": "ncr_pads_a4",
+        "product_key": "ncr_books_a4",
         "quantity": 20,
         "double_sided": False,
         "finish": "triplicate",

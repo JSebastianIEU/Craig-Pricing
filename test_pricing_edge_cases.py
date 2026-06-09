@@ -719,7 +719,7 @@ class TestMaxQtyCeiling:
 
 
 class TestSmallFormatEdgeCases:
-    """Business cards, flyers, NCR pads — quantity tier boundaries."""
+    """Business cards, flyers, NCR books — quantity tier boundaries."""
 
     def test_quantity_off_tier_escalates_or_extrapolates(self):
         """Business cards tiers: 100, 250, 500, 1000, 2500. A request

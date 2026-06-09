@@ -52,8 +52,8 @@ class SmallFormatProduct(str, Enum):
     brochures_a4 = "brochures_a4"
     compliment_slips = "compliment_slips"
     letterheads = "letterheads"
-    ncr_pads_a5 = "ncr_pads_a5"
-    ncr_pads_a4 = "ncr_pads_a4"
+    ncr_books_a5 = "ncr_books_a5"
+    ncr_books_a4 = "ncr_books_a4"
 
 
 class LargeFormatProduct(str, Enum):
@@ -205,12 +205,12 @@ def calculate_small_format(req: SmallFormatRequest) -> QuoteResponse | Escalatio
             surcharges_applied.append(f"Soft-touch finish: +{int(SURCHARGES['soft_touch'] * 100)}%")
 
         elif finish == "triplicate":
-            if req.product.value in ("ncr_pads_a5", "ncr_pads_a4"):
+            if req.product.value in ("ncr_books_a5", "ncr_books_a4"):
                 multiplier *= (1 + SURCHARGES["triplicate"])
                 surcharges_applied.append(f"Triplicate: +{int(SURCHARGES['triplicate'] * 100)}%")
             else:
                 return EscalationResponse(
-                    reason="Triplicate finish only applies to NCR pads.",
+                    reason="Triplicate finish only applies to NCR books.",
                     product_name=product_data["name"],
                 )
 

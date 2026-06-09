@@ -978,7 +978,7 @@ TOOLS = [
             "name": "quote_small_format",
             "description": (
                 "Get a price for a small-format product (business cards, flyers, brochures, "
-                "compliment slips, letterheads, NCR pads). Returns the exact price from Justin's sheet "
+                "compliment slips, letterheads, NCR books). Returns the exact price from Justin's sheet "
                 "or an escalation message if the combination isn't available."
             ),
             "parameters": {
@@ -990,7 +990,7 @@ TOOLS = [
                         "enum": [
                             "business_cards", "flyers_a6", "flyers_a5", "flyers_a4", "flyers_dl",
                             "brochures_a4", "compliment_slips", "letterheads",
-                            "ncr_pads_a5", "ncr_pads_a4",
+                            "ncr_books_a5", "ncr_books_a4",
                         ],
                     },
                     "quantity": {
