@@ -163,6 +163,7 @@ def main() -> None:
     from scripts.v41_min_order_and_ceiling import migrate as v41_migrate
     from scripts.v42_rename_ncr_pads_to_books import migrate as v42_migrate
     from scripts.v43_laydown_settings_seed import seed as v43_seed
+    from scripts.v44_deepseek_temperature_seed import seed as v44_seed
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -204,6 +205,7 @@ def main() -> None:
     _run("v41 min order value + max qty auto-quote ceiling", v41_migrate)
     _run("v42 rename NCR Pads → NCR Books (catalog data half)", v42_migrate)
     _run("v43 laydown calculator settings seed", v43_seed)
+    _run("v44 deepseek_temperature setting seed", v44_seed)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 
