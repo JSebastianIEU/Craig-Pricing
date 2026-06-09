@@ -131,6 +131,23 @@ DO:
 - ALWAYS confirm the specs back to the customer BEFORE calling the pricing tool, even if they gave everything upfront. Example: "Just to confirm — 500 business cards, single-sided, matte finish?" Wait for them to say yes, THEN call the tool.
 - This avoids quoting the wrong thing if you misunderstood their message.
 
+## CRITICAL: Off-tier quantities — DO NOT ask the customer to round
+The quantities listed in the catalog (e.g. `quantities: 25, 50, 100, 250, 500` for booklets,
+or `100, 250, 500, 1000` for flyers / cards) are **tier breakpoints, not restrictive options**.
+The engine automatically handles ANY quantity by stack-combining tiers (e.g. 80 booklets =
+50 + 25 + 25 billed as 100; 530 cards = 500 + 100 billed as 600). You pass the customer's
+EXACT requested quantity to the tool — the engine takes care of the rest.
+
+❌ WRONG: "Our tiers are 25, 50, 100, 250 — would 100 work?"
+✓ RIGHT: Call the tool with quantity=80. The engine returns a quote stacked to the
+   nearest tier (or stack of tiers). Report that price back to the customer naturally:
+   "For 80, that comes to €X + VAT (we bill in tier packs — 80 falls into the 100-pack
+   bracket)" or similar.
+
+The ONLY time to escalate is when the engine itself returns an EscalationResult — e.g.
+when the requested quantity is more than 5× the largest tier (likely a press job that
+needs Justin's eyes). Off-tier within the normal range is always auto-quoteable.
+
 ## CRITICAL: How to present the price
 - Give the price as "€X + VAT" (Irish B2B convention — that's how Justin and his customers talk).
   Example: "That'll be €38 + VAT for 500 business cards 👍"
@@ -511,7 +528,15 @@ def _build_catalog_context(db: Session, organization_slug: str) -> str:
             if spec_keys:
                 parts.append(f"  options: {', '.join(spec_keys)}")
             if qtys:
-                parts.append(f"  quantities: {', '.join(str(q) for q in qtys)}")
+                # v40.8.2 — frame as "tier breakpoints" not enum. The
+                # engine stack-bills off-tier quantities (e.g. 80 → 50+25+25
+                # = 100 billed; 530 → 500+100 = 600 billed). Never ask the
+                # customer to round to a listed value.
+                parts.append(
+                    f"  tier breakpoints: {', '.join(str(q) for q in qtys)} "
+                    f"(engine stacks off-tier qtys automatically — pass the "
+                    f"customer's exact qty to the tool)"
+                )
             # v36 — pricing-strategy hint so the LLM knows when to ask
             # for dimensions vs quantities.
             strategy = (p.pricing_strategy or "").lower()
