@@ -1024,10 +1024,13 @@ TOOLS = [
             "name": "quote_large_format",
             "description": (
                 "Get a price for a large-format product (banners, boards, signage, vehicle magnetics, "
-                "vinyl labels). Applies unit or bulk pricing based on quantity. NOTE: per-sq/m "
-                "products (vinyl_labels, pvc_banners, window_graphics, floor_graphics, "
-                "mesh_banners, fabric_displays) will return manual_review=true — pass "
-                "width_mm/height_mm if the customer told you so Justin can manually price."
+                "vinyl labels). Applies unit or bulk pricing based on quantity. "
+                "FOR BOARD PRODUCTS (corri_boards, foamex_boards, dibond_boards): pass `size` for "
+                "one of the 7 standard sizes (A4, A3, A2, A1, A0, 2440x1220, 1220x1220), OR pass "
+                "`width_mm` + `height_mm` for custom panel sizes (engine runs the laydown "
+                "calculator). NOTE: per-sq/m products (vinyl_labels, pvc_banners, window_graphics, "
+                "floor_graphics, mesh_banners, fabric_displays) will return manual_review=true — "
+                "pass width_mm/height_mm if the customer told you so Justin can manually price."
             ),
             "parameters": {
                 "type": "object",
@@ -1044,9 +1047,19 @@ TOOLS = [
                         "type": "integer",
                         "description": "Number of units. For per-sq/m products this is the count of items the customer wants, NOT the area.",
                     },
+                    "size": {
+                        "type": "string",
+                        "enum": ["A4", "A3", "A2", "A1", "A0", "2440x1220", "1220x1220"],
+                        "description": (
+                            "Standard size for board products (corri/foamex/dibond). "
+                            "Use 2440x1220 for full sheet, 1220x1220 for half sheet. "
+                            "If the customer gave custom dimensions in mm instead, pass "
+                            "width_mm + height_mm (no `size`)."
+                        ),
+                    },
                     "width_mm": {
                         "type": "integer",
-                        "description": "Width per unit in millimetres. Pass this for per-sq/m products (vinyl labels, banners, graphics) when the customer has told you the size.",
+                        "description": "Width per unit in millimetres. Pass this for per-sq/m products (vinyl labels, banners, graphics) when the customer has told you the size, OR for custom board panel sizes.",
                     },
                     "height_mm": {
                         "type": "integer",
@@ -1536,9 +1549,12 @@ def _exec_tool(
             # capturing the dimensions here means they're stamped onto
             # the needs_revision Quote's specs so Justin can manually
             # price it without emailing the customer back.
+            # v40.7 — `size` routes to the 2-D board pricing path; width/
+            # height (no size) routes to the laydown calculator.
             _w = args.get("width_mm")
             _h = args.get("height_mm")
             _a = args.get("area_sqm")
+            _size = args.get("size")
             result = quote_large_format(
                 db,
                 product_key=args["product_key"],
@@ -1549,6 +1565,7 @@ def _exec_tool(
                 width_mm=int(_w) if _w is not None else None,
                 height_mm=int(_h) if _h is not None else None,
                 area_sqm=float(_a) if _a is not None else None,
+                size=str(_size) if _size else None,
             )
             # If the engine refused by manual-review policy, hand off to
             # the v34 escalation handler — auto-create a Quote with
