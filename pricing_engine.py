@@ -1317,6 +1317,325 @@ def _quote_per_sheet(
 
 
 # =============================================================================
+# v40.7 — large_format TIERED + spec_key engine paths
+# =============================================================================
+#
+# Justin's REAL board pricing is a 2-D table: (size, quantity) → price for
+# 7 standard sizes (A4, A3, A2, A1, A0, 2440x1220 full sheet, 1220x1220
+# half sheet) across 200 qty rows. That doesn't fit `per_sheet` (single
+# sheet_price × ceil(qty / yield)) — that strategy was producing wrong
+# numbers (e.g. 5 A3 corri quoted as €140 when his sheet says €70).
+#
+# Two new dispatch paths kick in when a large_format product is
+# configured with `pricing_strategy='tiered'`:
+#
+#   1. Standard size  (size kwarg given, matches one of the 7 sizes)
+#      → exact-tier lookup, spec_key=size. Falls back to _stack_tiers
+#        on off-tier quantities (parity with quote_booklet).
+#
+#   2. Custom size    (width_mm + height_mm given, no `size` kwarg)
+#      → laydown calculator: derive how many panels fit on the full
+#        sheet considering bleed (per side) + grip area (top/bottom/
+#        left/right). Constants live in Settings (v43 seed). Bills the
+#        derived sheets_needed at the `2440x1220` tier price.
+#
+# Both helpers reuse the existing _units_per_sheet (no duplicate
+# packing math) and apply min_order_floor + client multiplier + VAT +
+# artwork in the same order as the other quote_* entry points so the
+# QuoteResult shape stays identical for downstream consumers.
+
+_STANDARD_BOARD_SIZES = ("A4", "A3", "A2", "A1", "A0", "2440x1220", "1220x1220")
+
+
+def _quote_large_format_tiered_by_size(
+    db: Session,
+    product: "Product",
+    quantity: int,
+    size: str,
+    needs_artwork: bool,
+    artwork_hours: float,
+    organization_slug: str,
+) -> "QuoteResult | EscalationResult":
+    """v40.7 — board pricing by exact (size, qty) tier table.
+
+    Mirrors `quote_booklet` exactly: spec_key encodes the variant
+    (here the size string), tier lookup is on (product_id, spec_key,
+    quantity). Off-tier quantities fall back to _stack_tiers with
+    per_job=True so we sum absolute tier prices, not unit prices.
+    """
+    # Defensive ceiling check (the caller — quote_large_format — also
+    # checks, but keep this here for tests that hit the helper directly).
+    _ceil = _check_qty_ceiling(product, quantity)
+    if _ceil is not None:
+        return _ceil
+
+    # Normalize size — Justin's input is "A3", "2440x1220" etc.; allow
+    # lowercase + spaces too so customer-friendly text routes correctly.
+    spec_key = size.strip().upper().replace(" ", "")
+    # Detect "WxH" form and keep the digits lowercased
+    if "X" in spec_key and not spec_key.startswith("A"):
+        spec_key = spec_key.lower().replace(" ", "")
+
+    tier = db.query(PriceTier).filter_by(
+        product_id=product.id, spec_key=spec_key, quantity=quantity,
+    ).first()
+
+    base_price = 0.0
+    applied: list[str] = []
+    if tier is not None:
+        base_price = float(tier.price)
+    else:
+        stacked = _stack_tiers(db, product.id, spec_key, quantity, per_job=True)
+        if stacked is None:
+            available_specs = db.query(PriceTier.spec_key, PriceTier.quantity).filter_by(
+                product_id=product.id,
+            ).all()
+            available_sizes = sorted({s for s, _ in available_specs})
+            available_qtys = sorted({q for _, q in available_specs})
+            return EscalationResult(
+                reason=f"No matching price for {product.name} / size {spec_key} / qty {quantity}.",
+                product_name=product.name,
+                message=(
+                    f"Available sizes: {available_sizes}. "
+                    f"Available quantities: {available_qtys}. "
+                    f"Justin needs to quote this directly."
+                ),
+            )
+        billed_qty, total_price, breakdown = stacked
+        base_price = total_price
+        tier_summary = " + ".join(str(q) for q, _ in breakdown)
+        if billed_qty == quantity:
+            applied.append(f"Tier combination: {tier_summary} = {quantity}")
+        else:
+            applied.append(
+                f"Tier combination: {quantity} billed as {tier_summary} = {billed_qty}"
+            )
+
+    # Client multiplier — applied BEFORE VAT (parity with booklet path).
+    final_ex = base_price
+    client_mult = _get_client_multiplier(db, organization_slug=organization_slug)
+    if abs(client_mult - 1.0) > 1e-6:
+        final_ex = round(base_price * client_mult, 2)
+        pct = int(round((client_mult - 1.0) * 100))
+        sign = "+" if pct >= 0 else ""
+        applied.append(f"Client adjustment: {sign}{pct}%")
+
+    # v41 — min order floor (parity).
+    final_ex = _apply_min_order_floor(product, final_ex, applied)
+
+    vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
+    vat = round(final_ex * vat_rate, 2)
+
+    artwork_ex = None
+    artwork_inc = None
+    total = round(final_ex + vat, 2)
+    if needs_artwork and artwork_hours > 0:
+        artwork_rate = _get_setting(db, "artwork_rate_eur", 65.0, organization_slug=organization_slug)
+        artwork_ex = round(artwork_rate * artwork_hours, 2)
+        artwork_inc = round(artwork_ex * (1 + _STANDARD_VAT_RATE), 2)
+        total = round(total + artwork_inc, 2)
+
+    turnaround = _get_setting(
+        db, "standard_turnaround", "3-5 working days",
+        organization_slug=organization_slug,
+    )
+
+    return QuoteResult(
+        success=True,
+        product_name=f"{product.name} — {spec_key}",
+        category="large_format",
+        quantity=quantity,
+        quantity_unit="panels",
+        base_price=base_price,
+        surcharges_applied=applied,
+        surcharge_amount=round(final_ex - base_price, 2),
+        final_price_ex_vat=final_ex,
+        vat_amount=vat,
+        final_price_inc_vat=round(final_ex + vat, 2),
+        artwork_cost_ex_vat=artwork_ex,
+        artwork_cost_inc_vat=artwork_inc,
+        total_inc_everything=total,
+        turnaround=turnaround,
+        notes=[product.notes] if product.notes else [],
+        pricing_unit=product.pricing_unit or f"per panel ({spec_key})",
+    )
+
+
+def _quote_large_format_with_laydown(
+    db: Session,
+    product: "Product",
+    quantity: int,
+    custom_width_mm: int,
+    custom_height_mm: int,
+    needs_artwork: bool,
+    artwork_hours: float,
+    organization_slug: str,
+) -> "QuoteResult | EscalationResult":
+    """v40.7 — custom-size board pricing via Justin's laydown calculator.
+
+    Math (from `Laydown1.xls` Sheet-Fit calculator):
+
+        bleed       = laydown_bleed_mm        (default 6)
+        grip_front  = laydown_grip_front_mm   (default 15)
+        grip_back   = laydown_grip_back_mm    (default  5)
+        grip_side   = laydown_grip_side_mm    (default  5)   (each side)
+
+        effective_panel_w = panel_w + 2 * bleed
+        effective_panel_h = panel_h + 2 * bleed
+        effective_sheet_w = sheet_w - 2 * grip_side
+        effective_sheet_h = sheet_h - grip_front - grip_back
+
+        units_per_sheet   = _units_per_sheet(eff_panel_w, eff_panel_h,
+                                              eff_sheet_w,  eff_sheet_h)
+        sheets_needed     = ceil(qty / units_per_sheet)
+
+        price = exact-tier or _stack_tiers lookup at the full-sheet
+                spec_key for qty=sheets_needed.
+
+    The full-sheet spec_key is read from `product.sheet_size_mm`
+    normalized to "WxH" (e.g. "2440x1220") — same format the seeded
+    tier rows use.
+
+    Escalates if:
+      - product.sheet_size_mm is unset or unparsable
+      - the effective panel doesn't fit on the effective sheet at all
+      - no tier exists at the full-sheet spec_key
+    """
+    # Defensive ceiling (same as the by-size helper).
+    _ceil = _check_qty_ceiling(product, quantity)
+    if _ceil is not None:
+        return _ceil
+
+    sheet_dims = _parse_size_mm(product.sheet_size_mm)
+    if sheet_dims is None:
+        return EscalationResult(
+            reason=f"{product.name} has no sheet_size_mm configured.",
+            product_name=product.name,
+            message="Sheet size not set — Justin needs to fill it on the dashboard.",
+        )
+    sheet_w, sheet_h = sheet_dims
+
+    # Read laydown constants from Settings (v43 seed). Fall back to
+    # Just Print's confirmed defaults if a tenant somehow misses the
+    # seed — keeps the helper safe for multi-tenant catalogs that
+    # adopt board pricing later.
+    bleed = int(_get_setting(db, "laydown_bleed_mm", 6, organization_slug=organization_slug))
+    grip_front = int(_get_setting(db, "laydown_grip_front_mm", 15, organization_slug=organization_slug))
+    grip_back = int(_get_setting(db, "laydown_grip_back_mm", 5, organization_slug=organization_slug))
+    grip_side = int(_get_setting(db, "laydown_grip_side_mm", 5, organization_slug=organization_slug))
+
+    eff_panel_w = custom_width_mm + 2 * bleed
+    eff_panel_h = custom_height_mm + 2 * bleed
+    eff_sheet_w = sheet_w - 2 * grip_side
+    eff_sheet_h = sheet_h - grip_front - grip_back
+
+    units_per_sheet = _units_per_sheet(eff_panel_w, eff_panel_h, eff_sheet_w, eff_sheet_h)
+    if units_per_sheet <= 0:
+        return EscalationResult(
+            reason=(
+                f"{custom_width_mm}×{custom_height_mm}mm panel doesn't fit on "
+                f"{sheet_w}×{sheet_h}mm sheet (with bleed + grip)."
+            ),
+            product_name=product.name,
+            message=(
+                "Panel is too big for a single sheet — Justin would have to "
+                "split it or use a larger substrate. Escalating for manual quote."
+            ),
+        )
+
+    import math
+    sheets_needed = math.ceil(quantity / units_per_sheet)
+
+    # Full-sheet spec_key — must match the tier rows seeded for the
+    # standard "2440x1220" size. Lowercase + no spaces so the key matches
+    # exactly whether stored as "2440x1220" or "2440 x 1220".
+    full_sheet_spec = f"{sheet_w}x{sheet_h}"
+
+    tier = db.query(PriceTier).filter_by(
+        product_id=product.id, spec_key=full_sheet_spec, quantity=sheets_needed,
+    ).first()
+
+    base_price = 0.0
+    applied: list[str] = [
+        f"Laydown: {units_per_sheet} panels/sheet ({eff_panel_w}×{eff_panel_h}mm "
+        f"on {eff_sheet_w}×{eff_sheet_h}mm useable) → {sheets_needed} sheet(s)"
+    ]
+    if tier is not None:
+        base_price = float(tier.price)
+    else:
+        stacked = _stack_tiers(db, product.id, full_sheet_spec, sheets_needed, per_job=True)
+        if stacked is None:
+            return EscalationResult(
+                reason=(
+                    f"{product.name}: no tier for {full_sheet_spec} at "
+                    f"qty {sheets_needed}."
+                ),
+                product_name=product.name,
+                message="Sheet price ladder missing this quantity. Justin to quote manually.",
+            )
+        billed_qty, total_price, breakdown = stacked
+        base_price = total_price
+        tier_summary = " + ".join(str(q) for q, _ in breakdown)
+        if billed_qty == sheets_needed:
+            applied.append(f"Sheet tier combination: {tier_summary} = {sheets_needed}")
+        else:
+            applied.append(
+                f"Sheet tier combination: {sheets_needed} billed as "
+                f"{tier_summary} = {billed_qty}"
+            )
+
+    # Client multiplier + min order floor + VAT + artwork (parity).
+    final_ex = base_price
+    client_mult = _get_client_multiplier(db, organization_slug=organization_slug)
+    if abs(client_mult - 1.0) > 1e-6:
+        final_ex = round(base_price * client_mult, 2)
+        pct = int(round((client_mult - 1.0) * 100))
+        sign = "+" if pct >= 0 else ""
+        applied.append(f"Client adjustment: {sign}{pct}%")
+
+    final_ex = _apply_min_order_floor(product, final_ex, applied)
+
+    vat_rate = _get_vat_rate_for_product(db, product, organization_slug)
+    vat = round(final_ex * vat_rate, 2)
+
+    artwork_ex = None
+    artwork_inc = None
+    total = round(final_ex + vat, 2)
+    if needs_artwork and artwork_hours > 0:
+        artwork_rate = _get_setting(db, "artwork_rate_eur", 65.0, organization_slug=organization_slug)
+        artwork_ex = round(artwork_rate * artwork_hours, 2)
+        artwork_inc = round(artwork_ex * (1 + _STANDARD_VAT_RATE), 2)
+        total = round(total + artwork_inc, 2)
+
+    turnaround = _get_setting(
+        db, "standard_turnaround", "3-5 working days",
+        organization_slug=organization_slug,
+    )
+
+    return QuoteResult(
+        success=True,
+        product_name=(
+            f"{product.name} — custom {custom_width_mm}×{custom_height_mm}mm"
+        ),
+        category="large_format",
+        quantity=quantity,
+        quantity_unit="panels",
+        base_price=base_price,
+        surcharges_applied=applied,
+        surcharge_amount=round(final_ex - base_price, 2),
+        final_price_ex_vat=final_ex,
+        vat_amount=vat,
+        final_price_inc_vat=round(final_ex + vat, 2),
+        artwork_cost_ex_vat=artwork_ex,
+        artwork_cost_inc_vat=artwork_inc,
+        total_inc_everything=total,
+        turnaround=turnaround,
+        notes=[product.notes] if product.notes else [],
+        pricing_unit=product.pricing_unit or "per panel (custom)",
+    )
+
+
+# =============================================================================
 # LARGE FORMAT
 # =============================================================================
 
@@ -1334,6 +1653,11 @@ def quote_large_format(
     width_mm: Optional[int] = None,
     height_mm: Optional[int] = None,
     area_sqm: Optional[float] = None,
+    # v40.7 — board pricing by standard size. When set + product is
+    # `pricing_strategy=tiered`, dispatch to _quote_large_format_tiered_by_size
+    # instead of the legacy bulk_break path. width_mm + height_mm (no size)
+    # routes to the laydown calculator for custom sizes.
+    size: Optional[str] = None,
 ) -> QuoteResult | EscalationResult:
     """Look up a large-format price (scoped per tenant). Applies unit or bulk pricing based on quantity."""
 
@@ -1397,6 +1721,39 @@ def quote_large_format(
             width_mm=width_mm, height_mm=height_mm,
             needs_artwork=needs_artwork, artwork_hours=artwork_hours,
             organization_slug=organization_slug,
+        )
+
+    # v40.7 — large_format tiered dispatch. Two branches:
+    #   (a) `size` given → 2-D (size, qty) tier lookup. Matches the way
+    #       Justin's actual board price sheet is structured.
+    #   (b) `width_mm` + `height_mm` given → laydown calculator. Computes
+    #       how many panels fit on the full sheet (with bleed + grip) and
+    #       bills the derived sheets_needed at the full-sheet tier.
+    #   Neither → escalate asking the LLM to fetch one or the other.
+    if strategy == "tiered":
+        if size:
+            return _quote_large_format_tiered_by_size(
+                db, product, quantity, size,
+                needs_artwork=needs_artwork, artwork_hours=artwork_hours,
+                organization_slug=organization_slug,
+            )
+        if width_mm and height_mm:
+            return _quote_large_format_with_laydown(
+                db, product, quantity,
+                custom_width_mm=int(width_mm), custom_height_mm=int(height_mm),
+                needs_artwork=needs_artwork, artwork_hours=artwork_hours,
+                organization_slug=organization_slug,
+            )
+        return EscalationResult(
+            reason=(
+                f"{product.name} needs either a standard `size` (e.g. A3, "
+                f"2440x1220) or custom `width_mm` + `height_mm`."
+            ),
+            product_name=product.name,
+            message=(
+                "Customer should be asked: which standard size, or what custom "
+                "dimensions in mm?"
+            ),
         )
 
     if quantity < (product.min_qty or 1):

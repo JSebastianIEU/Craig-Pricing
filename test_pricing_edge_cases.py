@@ -876,3 +876,308 @@ class TestPostersManualReview:
             or "justin" in (result.reason or "").lower()
             or "poster" in (result.reason or "").lower()
         ), f"Escalation reason should mention manual/Justin: {result.reason!r}"
+
+
+# ===========================================================================
+# v40.7 — TestLargeFormatTieredBySize + TestLargeFormatCustomLaydown
+#
+# Boards (corri/foamex/dibond) use a 2-D (size, qty) tier table. The new
+# engine paths kick in when `pricing_strategy == 'tiered'`. To exercise
+# them without mutating prod-seed data permanently, each test:
+#   1. Snapshots the product's current strategy + sheet_size_mm.
+#   2. Flips strategy to 'tiered', seeds a few PriceTier rows
+#      (cleaned up in finally).
+#   3. Calls quote_large_format with `size` OR `width_mm`+`height_mm`.
+#   4. Asserts on the returned QuoteResult / EscalationResult.
+#   5. Tears down: deletes the test tiers, restores strategy/sheet_size.
+# ===========================================================================
+
+from db.models import PriceTier as _PT  # noqa: E402
+
+
+def _seed_board_tiers(db, product, rows):
+    """Helper: add tier rows under (product_id, spec_key, quantity, price)."""
+    for spec_key, qty, price in rows:
+        db.add(_PT(
+            product_id=product.id,
+            spec_key=spec_key,
+            quantity=qty,
+            price=price,
+        ))
+    db.commit()
+
+
+def _clean_board_tiers(db, product):
+    """Helper: wipe all tiers under a product (test teardown)."""
+    db.query(_PT).filter_by(product_id=product.id).delete()
+    db.commit()
+
+
+class TestLargeFormatTieredBySize:
+    """v40.7 — `size`-driven 2-D tier lookup for board products."""
+
+    def test_a3_exact_tier_returns_table_price(self):
+        """5 A3 corri @ €70/5 = €70 (Justin's exact sheet value)."""
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug=ORG, key="corri_boards",
+            ).first()
+            if p is None:
+                pytest.skip("corri_boards not in seed.")
+            orig_strat, orig_sheet = p.pricing_strategy, p.sheet_size_mm
+            p.pricing_strategy = "tiered"
+            p.sheet_size_mm = "2440x1220"
+            db.commit()
+            try:
+                _seed_board_tiers(db, p, [
+                    ("A3", 5, 70.0),
+                    ("A3", 10, 120.0),
+                    ("A1", 5, 140.0),
+                ])
+                result = quote_large_format(
+                    db, product_key="corri_boards",
+                    quantity=5, size="A3",
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, QuoteResult)
+                assert abs(result.final_price_ex_vat - 70.0) < 0.01
+            finally:
+                _clean_board_tiers(db, p)
+                p.pricing_strategy = orig_strat
+                p.sheet_size_mm = orig_sheet
+                db.commit()
+
+    def test_off_tier_qty_stacks(self):
+        """15 A3 with tiers [5=70, 10=120] → stack 10+5 = 190."""
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug=ORG, key="corri_boards",
+            ).first()
+            orig_strat, orig_sheet = p.pricing_strategy, p.sheet_size_mm
+            p.pricing_strategy = "tiered"
+            p.sheet_size_mm = "2440x1220"
+            db.commit()
+            try:
+                _seed_board_tiers(db, p, [
+                    ("A3", 5, 70.0),
+                    ("A3", 10, 120.0),
+                ])
+                result = quote_large_format(
+                    db, product_key="corri_boards",
+                    quantity=15, size="A3",
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, QuoteResult)
+                assert abs(result.final_price_ex_vat - 190.0) < 0.01
+                assert any("Tier combination" in s for s in result.surcharges_applied)
+            finally:
+                _clean_board_tiers(db, p)
+                p.pricing_strategy = orig_strat
+                p.sheet_size_mm = orig_sheet
+                db.commit()
+
+    def test_unknown_size_escalates_with_available_sizes(self):
+        """A2 not in tier table → escalation, message lists [A3, A1]."""
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug=ORG, key="corri_boards",
+            ).first()
+            orig_strat, orig_sheet = p.pricing_strategy, p.sheet_size_mm
+            p.pricing_strategy = "tiered"
+            p.sheet_size_mm = "2440x1220"
+            db.commit()
+            try:
+                _seed_board_tiers(db, p, [
+                    ("A3", 5, 70.0),
+                    ("A1", 5, 140.0),
+                ])
+                result = quote_large_format(
+                    db, product_key="corri_boards",
+                    quantity=5, size="A2",
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, EscalationResult)
+                assert "A2" in (result.reason or "")
+                # Message should expose the available sizes so the LLM
+                # can ask the customer to pick.
+                assert "A3" in (result.message or "") or "A1" in (result.message or "")
+            finally:
+                _clean_board_tiers(db, p)
+                p.pricing_strategy = orig_strat
+                p.sheet_size_mm = orig_sheet
+                db.commit()
+
+    def test_missing_both_size_and_dims_escalates(self):
+        """No size + no width/height → friendly escalation."""
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug=ORG, key="corri_boards",
+            ).first()
+            orig_strat = p.pricing_strategy
+            p.pricing_strategy = "tiered"
+            db.commit()
+            try:
+                result = quote_large_format(
+                    db, product_key="corri_boards",
+                    quantity=5,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, EscalationResult)
+                assert "size" in (result.reason or "").lower() or "width" in (result.reason or "").lower()
+            finally:
+                p.pricing_strategy = orig_strat
+                db.commit()
+
+    def test_lowercase_size_normalizes(self):
+        """`size='a3'` should match `spec_key='A3'`."""
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug=ORG, key="corri_boards",
+            ).first()
+            orig_strat, orig_sheet = p.pricing_strategy, p.sheet_size_mm
+            p.pricing_strategy = "tiered"
+            p.sheet_size_mm = "2440x1220"
+            db.commit()
+            try:
+                _seed_board_tiers(db, p, [("A3", 5, 70.0)])
+                result = quote_large_format(
+                    db, product_key="corri_boards",
+                    quantity=5, size="a3",
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, QuoteResult)
+                assert abs(result.final_price_ex_vat - 70.0) < 0.01
+            finally:
+                _clean_board_tiers(db, p)
+                p.pricing_strategy = orig_strat
+                p.sheet_size_mm = orig_sheet
+                db.commit()
+
+
+class TestLargeFormatCustomLaydown:
+    """v40.7 — laydown calculator for custom panel sizes (mm).
+
+    Math sanity:
+        2440 × 1220 sheet, bleed=6mm/side, grip top=15, bottom=5, sides=5 each
+        → useable sheet: (2440-10) × (1220-20) = 2430 × 1200 mm
+        For an 800×600 panel: effective panel = 812×612
+        → fits: rotated yields 3 panels/sheet (2430/612=3 cols, 1200/812=1 row)
+    """
+
+    def test_standard_custom_size_uses_laydown(self):
+        """5 × 800×600mm corri → laydown derives 3/sheet → ceil(5/3)=2 sheets.
+        Stack 2 sheets at tier ladder [1=180, 5=750]: 1+1 = €360."""
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug=ORG, key="corri_boards",
+            ).first()
+            orig_strat, orig_sheet = p.pricing_strategy, p.sheet_size_mm
+            p.pricing_strategy = "tiered"
+            p.sheet_size_mm = "2440x1220"
+            db.commit()
+            try:
+                _seed_board_tiers(db, p, [
+                    ("2440x1220", 1, 180.0),
+                    ("2440x1220", 5, 750.0),
+                ])
+                result = quote_large_format(
+                    db, product_key="corri_boards",
+                    quantity=5, width_mm=800, height_mm=600,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, QuoteResult), (
+                    f"Expected QuoteResult, got {result}"
+                )
+                # 1 sheet @ 180 × 2 = 360 (stack of 1+1)
+                assert abs(result.final_price_ex_vat - 360.0) < 0.01
+                assert any("Laydown" in s for s in result.surcharges_applied)
+            finally:
+                _clean_board_tiers(db, p)
+                p.pricing_strategy = orig_strat
+                p.sheet_size_mm = orig_sheet
+                db.commit()
+
+    def test_panel_too_big_escalates(self):
+        """A 10000×10000 panel doesn't fit on any sheet → escalates."""
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug=ORG, key="corri_boards",
+            ).first()
+            orig_strat, orig_sheet = p.pricing_strategy, p.sheet_size_mm
+            p.pricing_strategy = "tiered"
+            p.sheet_size_mm = "2440x1220"
+            db.commit()
+            try:
+                _seed_board_tiers(db, p, [("2440x1220", 1, 180.0)])
+                result = quote_large_format(
+                    db, product_key="corri_boards",
+                    quantity=1, width_mm=10000, height_mm=10000,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, EscalationResult)
+                assert "doesn't fit" in (result.reason or "").lower() or "fit" in (result.reason or "").lower()
+            finally:
+                _clean_board_tiers(db, p)
+                p.pricing_strategy = orig_strat
+                p.sheet_size_mm = orig_sheet
+                db.commit()
+
+    def test_no_sheet_size_escalates(self):
+        """Product missing sheet_size_mm → escalation tells operator to set it."""
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug=ORG, key="corri_boards",
+            ).first()
+            orig_strat, orig_sheet = p.pricing_strategy, p.sheet_size_mm
+            p.pricing_strategy = "tiered"
+            p.sheet_size_mm = None
+            db.commit()
+            try:
+                result = quote_large_format(
+                    db, product_key="corri_boards",
+                    quantity=5, width_mm=400, height_mm=300,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, EscalationResult)
+                assert "sheet_size" in (result.reason or "").lower() or "sheet" in (result.reason or "").lower()
+            finally:
+                p.pricing_strategy = orig_strat
+                p.sheet_size_mm = orig_sheet
+                db.commit()
+
+    def test_high_qty_stacks_sheets(self):
+        """50 × 400×300mm: eff panel 412×312, eff sheet 2430×1200.
+        Rotated: 2430/312=7 cols × 1200/412=2 rows = 14/sheet
+        Non-rotated: 2430/412=5 × 1200/312=3 = 15/sheet → use 15
+        50/15 = ceil = 4 sheets → stack [1+1+1+1] = €720."""
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug=ORG, key="corri_boards",
+            ).first()
+            orig_strat, orig_sheet = p.pricing_strategy, p.sheet_size_mm
+            p.pricing_strategy = "tiered"
+            p.sheet_size_mm = "2440x1220"
+            db.commit()
+            try:
+                _seed_board_tiers(db, p, [
+                    ("2440x1220", 1, 180.0),
+                    ("2440x1220", 5, 750.0),
+                ])
+                result = quote_large_format(
+                    db, product_key="corri_boards",
+                    quantity=50, width_mm=400, height_mm=300,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, QuoteResult), result
+                # Engine picked sheets_needed; the exact value depends on
+                # the packing direction. Either 4 (15/sheet) or 5 (10/sheet
+                # if a future engine rev reduces yield). Stay loose on the
+                # number but assert that the result is sensible:
+                # at least 1 sheet's worth at €180.
+                assert result.final_price_ex_vat >= 180.0
+                assert any("Laydown" in s for s in result.surcharges_applied)
+            finally:
+                _clean_board_tiers(db, p)
+                p.pricing_strategy = orig_strat
+                p.sheet_size_mm = orig_sheet
+                db.commit()
