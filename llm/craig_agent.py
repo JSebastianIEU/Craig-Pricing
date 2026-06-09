@@ -1639,15 +1639,64 @@ def _handle_manual_review_escalation(
     }
 
 
+_BOARD_PRODUCT_KEYS = {"corri_boards", "foamex_boards", "dibond_boards"}
+_BOARD_A_SERIES_RE = re.compile(r"\bA[0-4]\b", re.IGNORECASE)
+_BOARD_FULL_SHEET_RE = re.compile(
+    r"(full[\s-]?sheet|2440\s*[x×]\s*1220|2440x1220)", re.IGNORECASE
+)
+_BOARD_HALF_SHEET_RE = re.compile(
+    r"(half[\s-]?sheet|1220\s*[x×]\s*1220|1220x1220)", re.IGNORECASE
+)
+
+
+def _extract_board_size_from_message(msg: str) -> Optional[str]:
+    """v40.8.10 — server-side board-size extraction.
+
+    When the LLM calls quote_large_format for a board product without
+    `size` and without `width_mm`+`height_mm`, but the customer's most
+    recent message clearly named a standard A-series size or "full
+    sheet" / "half sheet", auto-extract the size and inject it into
+    the tool call.
+
+    This works around DeepSeek's tendency to call quote_large_format
+    with only product_key + quantity (forgetting to pass `size`)
+    despite v40.7's tool schema, v40.8.3+v40.8.6 prompt examples, and
+    v40.8.9's REQUIRED-flagging — observed in multiple D5 + Justin-
+    reported smoke runs.
+
+    Returns the canonical size string ('A3', '2440x1220', etc.) or
+    None if no standard size is detected in the message.
+    """
+    if not msg:
+        return None
+    # Full / half sheet are checked first because "1 full sheet corri"
+    # also matches the bare A-series regex through accidental tokens.
+    if _BOARD_FULL_SHEET_RE.search(msg):
+        return "2440x1220"
+    if _BOARD_HALF_SHEET_RE.search(msg):
+        return "1220x1220"
+    a_match = _BOARD_A_SERIES_RE.search(msg)
+    if a_match:
+        return a_match.group(0).upper()
+    return None
+
+
 def _exec_tool(
     db: Session,
     name: str,
     args: dict,
     conversation_id: int | None = None,
     organization_slug: str = "just-print",
+    latest_user_message: str = "",
 ) -> dict:
     """Execute a tool call and return a dict the LLM can read. All pricing is
-    scoped to `organization_slug` so Craig reads the right tenant's catalog."""
+    scoped to `organization_slug` so Craig reads the right tenant's catalog.
+
+    `latest_user_message` (v40.8.10): the most recent customer message in
+    the conversation. Used by the board-size auto-injection gate to
+    work around DeepSeek's tendency to forget the `size` arg on board
+    orders. Pass through the verbatim user message from the chat loop.
+    """
     try:
         # v38 — Phase F's "artwork-question required before pricing"
         # guard has been REMOVED. The audit showed it caused 42% of
@@ -1699,6 +1748,33 @@ def _exec_tool(
             _h = args.get("height_mm")
             _a = args.get("area_sqm")
             _size = args.get("size")
+            # v40.8.10 — server-side board-size auto-injection gate.
+            # DeepSeek consistently forgets to pass `size` for board
+            # orders despite tool-schema flagging it REQUIRED and the
+            # CRAIG_SYSTEM_PROMPT having 6 verbatim examples. If the
+            # tool call is for a board with no size and no custom
+            # dimensions, scan the customer's latest message — if a
+            # standard A-series size or "full sheet" / "half sheet" is
+            # named, inject it here so the engine takes the tiered
+            # path instead of escalating.
+            _is_board = args.get("product_key") in _BOARD_PRODUCT_KEYS
+            if (
+                _is_board
+                and not _size
+                and not _w
+                and not _h
+                and latest_user_message
+            ):
+                _extracted = _extract_board_size_from_message(latest_user_message)
+                if _extracted:
+                    print(
+                        f"[craig] v40.8.10 BOARD-SIZE GATE: auto-injected "
+                        f"size={_extracted!r} into quote_large_format call "
+                        f"for {args.get('product_key')!r} (LLM forgot to "
+                        f"pass it; customer said: {latest_user_message[:120]!r})",
+                        flush=True,
+                    )
+                    _size = _extracted
             result = quote_large_format(
                 db,
                 product_key=args["product_key"],
@@ -2455,6 +2531,16 @@ def chat_with_craig(
             ],
         })
 
+        # v40.8.10 — extract the most recent customer message so
+        # _exec_tool can use it for board-size auto-injection.
+        _latest_user_msg = ""
+        for _m in reversed(messages):
+            if isinstance(_m, dict) and _m.get("role") == "user":
+                _content = _m.get("content")
+                if isinstance(_content, str):
+                    _latest_user_msg = _content
+                    break
+
         # Execute each tool and append the result
         for tc in msg.tool_calls:
             args = json.loads(tc.function.arguments or "{}")
@@ -2464,6 +2550,7 @@ def chat_with_craig(
                 args,
                 conversation_id=conversation.id,
                 organization_slug=organization_slug,
+                latest_user_message=_latest_user_msg,
             )
             tool_calls_audit.append({
                 "tool": tc.function.name,
