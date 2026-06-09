@@ -2374,6 +2374,27 @@ def chat_with_craig(
     # tool list during multi-turn tool calls.
     tools_for_org = _build_tools_for_org(db, organization_slug)
 
+    # v40.8.8 — tenant-tunable DeepSeek temperature. Default 0.3 (the
+    # original hardcoded value). Lower it (0.1) to make Craig's tool-
+    # calling more deterministic when a tenant's flow is heavy on
+    # structured outputs (e.g., Just-Print's D5 smoke showed temp=0.3
+    # caused inconsistent confirm-vs-tool-call behavior on single-
+    # message orders). Read via pricing_engine._get_setting so we reuse
+    # the same type-cast machinery + decryption.
+    from pricing_engine import _get_setting
+    try:
+        deepseek_temperature = float(
+            _get_setting(db, "deepseek_temperature", 0.3, organization_slug=organization_slug)
+        )
+    except (TypeError, ValueError):
+        deepseek_temperature = 0.3
+    # Clamp to OpenAI's accepted range so a fat-fingered DB value
+    # doesn't cause a 400 from the upstream API.
+    if deepseek_temperature < 0.0:
+        deepseek_temperature = 0.0
+    elif deepseek_temperature > 2.0:
+        deepseek_temperature = 2.0
+
     # Tool-calling loop — LLM may call tools 0+ times before giving final answer
     for _ in range(5):  # safety cap
         response = client.chat.completions.create(
@@ -2381,7 +2402,7 @@ def chat_with_craig(
             messages=messages,
             tools=tools_for_org,
             tool_choice="auto",
-            temperature=0.3,
+            temperature=deepseek_temperature,
         )
         msg = response.choices[0].message
 

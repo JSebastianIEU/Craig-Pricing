@@ -903,6 +903,60 @@ class TestV408PromptWording:
             f"imperative and caused DeepSeek inconsistency."
         )
 
+    def test_v40_8_8_deepseek_temperature_setting_seeded(self):
+        """v40.8.8 — the per-tenant `deepseek_temperature` setting must
+        be seeded on the just-print org so the runtime can read it via
+        _get_setting. Default value 0.3 preserves pre-v40.8.8 behavior."""
+        from db import db_session
+        from db.models import Setting
+        with db_session() as db:
+            row = (
+                db.query(Setting)
+                .filter_by(organization_slug="just-print",
+                           key="deepseek_temperature")
+                .first()
+            )
+            # Extract values BEFORE session close to avoid
+            # DetachedInstanceError on lazy attribute load.
+            row_present = row is not None
+            row_value_type = row.value_type if row else None
+            row_value = row.value if row else None
+
+        assert row_present, (
+            "deepseek_temperature setting missing for just-print — "
+            "v44 seed didn't run."
+        )
+        assert row_value_type == "float", (
+            f"deepseek_temperature value_type must be float (got {row_value_type!r}); "
+            "_get_setting type-casts based on this."
+        )
+        # Default seed = 0.3 (pre-v40.8.8 behavior). Test only asserts
+        # the row exists with float type; the actual numeric value can
+        # be tuned per-tenant via PATCH /settings/deepseek_temperature.
+        assert 0.0 <= float(row_value) <= 2.0, (
+            f"deepseek_temperature must be in OpenAI's [0.0, 2.0] range "
+            f"(got {row_value!r})."
+        )
+
+    def test_v40_8_8_chat_loop_reads_temperature_from_setting(self):
+        """v40.8.8 — chat_with_craig must read the temperature from the
+        Setting via _get_setting (not hardcode 0.3). Verify by checking
+        the function source uses _get_setting('deepseek_temperature', ...)
+        OR references the variable name."""
+        import inspect
+        from llm.craig_agent import chat_with_craig
+        src = inspect.getsource(chat_with_craig)
+        assert "deepseek_temperature" in src, (
+            "chat_with_craig must read 'deepseek_temperature' from settings, "
+            "not hardcode 0.3."
+        )
+        # No raw `temperature=0.3` literal should remain — must come from
+        # the variable. (The clamping branch may still mention 0.0/2.0.)
+        assert "temperature=0.3" not in src, (
+            "Hardcoded temperature=0.3 found in chat_with_craig — should "
+            "use deepseek_temperature variable read from Setting."
+        )
+
     def test_v40_8_7_prompt_size_reduced(self):
         """v40.8.7 — sanity check that the prompt didn't bloat further.
         Pre-v40.8.7 was 16,208 chars; v40.8.7 target was <14,000."""
