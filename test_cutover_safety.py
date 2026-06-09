@@ -223,3 +223,77 @@ class TestCutoverSafety:
             assert enabled.value == "true", (
                 "Re-running migration on stable state should NOT auto-OFF"
             )
+
+
+class TestV36DoesNotRevertTieredBoards:
+    """v40.8.11 — protects against the v36 migration silently reverting
+    board products from `tiered` (set by D3 data ops in June 2026) back
+    to `per_sheet` on every container boot. Discovered when board orders
+    started escalating despite repeated D3 PATCHes — every deploy was
+    re-running v36 and undoing the data fix."""
+
+    def test_v36_skips_products_already_on_tiered(self):
+        """If corri_boards is on `tiered` (post-D3 state), v36 must
+        recognize it as 'already migrated' and skip — NOT overwrite
+        strategy + sheet_size_mm back to the legacy per_sheet
+        defaults."""
+        from db import db_session
+        from db.models import Product
+        from scripts.v36_per_sqm_per_sheet_pricing import migrate as v36_migrate
+
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="corri_boards",
+            ).first()
+            if p is None:
+                import pytest
+                pytest.skip("corri_boards missing")
+
+            # Snapshot the current state.
+            orig_strategy = p.pricing_strategy
+            orig_sheet = p.sheet_size_mm
+            orig_sheet_price = p.sheet_price
+
+            # Put it in the post-D3 state.
+            p.pricing_strategy = "tiered"
+            p.sheet_size_mm = "2440x1220"
+            p.sheet_price = 130.0
+            db.commit()
+
+        try:
+            # Run v36 — this should NOT touch corri_boards because
+            # it's already on `tiered` (post-D3).
+            v36_migrate()
+
+            with db_session() as db:
+                p2 = db.query(Product).filter_by(
+                    organization_slug="just-print", key="corri_boards",
+                ).first()
+                assert p2.pricing_strategy == "tiered", (
+                    f"v36 reverted strategy from 'tiered' to "
+                    f"{p2.pricing_strategy!r} — D3 data ops gets silently "
+                    f"undone on every container boot. This is the "
+                    f"2026-06-09 board-escalation bug."
+                )
+                assert p2.sheet_size_mm == "2440x1220", (
+                    f"v36 reverted sheet_size_mm to {p2.sheet_size_mm!r}"
+                )
+                assert p2.sheet_price == 130.0, (
+                    f"v36 overwrote sheet_price to {p2.sheet_price!r}"
+                )
+        finally:
+            # Restore the original state.
+            with db_session() as db:
+                p3 = db.query(Product).filter_by(
+                    organization_slug="just-print", key="corri_boards",
+                ).first()
+                p3.pricing_strategy = orig_strategy
+                p3.sheet_size_mm = orig_sheet
+                p3.sheet_price = orig_sheet_price
+                db.commit()
+            # v36 force-reseeds the business_rules Setting back to v36
+            # wording (8 rules). The downstream TestV38PromptContracts
+            # asserts on v38 wording — re-run v38 here to restore so
+            # we don't pollute test ordering.
+            from scripts.v38_widget_fixes import migrate as v38_migrate
+            v38_migrate()

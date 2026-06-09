@@ -311,9 +311,15 @@ def migrate() -> None:
 
             # Idempotent: only re-write if the strategy is still the
             # legacy bulk_break OR if any v36 field is missing. Skip
-            # if the row already looks v36-shaped.
+            # if the row already looks v36-shaped OR if it's been
+            # explicitly moved to the v40.7 `tiered` path (D3 board
+            # data ops in June 2026 moved corri/foamex/dibond to
+            # `tiered` for 2-D (size, qty) lookup; without this guard,
+            # v36 would silently revert the strategy on every container
+            # boot — Sebastian found this on 2026-06-09 when board
+            # orders started escalating despite repeated D3 PATCHes).
             already_migrated = (
-                current_strategy in ("per_sqm", "per_sheet")
+                current_strategy in ("per_sqm", "per_sheet", "tiered")
             )
             if already_migrated:
                 print(f"  - {key}: already on '{current_strategy}' (skipping)")
