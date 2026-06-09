@@ -1744,15 +1744,31 @@ def quote_large_format(
                 needs_artwork=needs_artwork, artwork_hours=artwork_hours,
                 organization_slug=organization_slug,
             )
+        # v40.8.9 — Craig-facing escalation. The previous wording said
+        # "Customer should be asked... what custom dimensions in mm?"
+        # which Craig was repeating verbatim to the customer even when
+        # the customer had already named a standard A-series size in
+        # their message ("5 corri boards A3" → Craig: "what size in
+        # mm?"). The new wording is INSTRUCTIONAL FOR THE LLM, not for
+        # the customer: it tells Craig to RETRY the tool call with the
+        # right `size` arg, and only ask the customer for mm if the
+        # customer genuinely wanted a custom non-standard size.
         return EscalationResult(
             reason=(
-                f"{product.name} needs either a standard `size` (e.g. A3, "
-                f"2440x1220) or custom `width_mm` + `height_mm`."
+                f"{product.name} was called without `size` and without "
+                f"`width_mm`+`height_mm`."
             ),
             product_name=product.name,
             message=(
-                "Customer should be asked: which standard size, or what custom "
-                "dimensions in mm?"
+                "INSTRUCTION FOR CRAIG (do NOT repeat to the customer): "
+                "if the customer named a standard size in their original "
+                "message — A4, A3, A2, A1, A0, 2440x1220, or 1220x1220 "
+                "(even just 'A3 boards' or 'full sheet') — RETRY this "
+                "tool call immediately with `size` set to that value. "
+                "Only ask the customer about millimetre dimensions if "
+                "they explicitly want a custom panel size that is NOT "
+                "one of the seven standards (e.g. '800x600mm' or "
+                "'500mm by 500mm')."
             ),
         )
 

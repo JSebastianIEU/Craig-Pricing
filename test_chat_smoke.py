@@ -957,12 +957,114 @@ class TestV408PromptWording:
             "use deepseek_temperature variable read from Setting."
         )
 
+    def test_v40_8_9_boards_no_size_escalation_is_craig_instructional(self):
+        """v40.8.9 — Justin reported many board orders escalating to
+        manual pricing because Craig was repeating the engine's
+        old escalation message ('what custom dimensions in mm?')
+        verbatim to customers who had already named a standard A-series
+        size. New message must be CRAIG-INSTRUCTIONAL (tells the LLM
+        to retry with `size`), not customer-facing."""
+        from pricing_engine import quote_large_format, EscalationResult
+        from db import db_session
+        with db_session() as db:
+            from db.models import Product
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="corri_boards",
+            ).first()
+            if p is None:
+                import pytest
+                pytest.skip("corri_boards missing from seed.")
+            orig_strat = p.pricing_strategy
+            p.pricing_strategy = "tiered"
+            db.commit()
+            try:
+                # Caller forgot to pass size or width/height.
+                result = quote_large_format(
+                    db, product_key="corri_boards", quantity=5,
+                    organization_slug="just-print",
+                )
+                msg = result.message if isinstance(result, EscalationResult) else ""
+            finally:
+                p.pricing_strategy = orig_strat
+                db.commit()
+
+        assert isinstance(result, EscalationResult)
+        # The new message must be addressed to Craig, not the customer.
+        instructional_signals = [
+            "INSTRUCTION FOR CRAIG",
+            "do NOT repeat to the customer",
+            "RETRY this tool call",
+            "RETRY the tool call",
+            "retry the tool call",
+        ]
+        assert any(s in msg for s in instructional_signals), (
+            f"Escalation message must be Craig-instructional, not "
+            f"customer-facing. Looked for: {instructional_signals}. "
+            f"Got: {msg!r}"
+        )
+        # And must NOT contain the old customer-facing wording.
+        assert "Customer should be asked" not in msg, (
+            "Old customer-facing wording leaked through — the v40.8.9 "
+            "fix is not in place."
+        )
+
+    def test_v40_8_9_size_tool_description_emphasizes_required_for_a_series(self):
+        """v40.8.9 — the `size` parameter description in
+        quote_large_format must explicitly tell DeepSeek that `size`
+        is REQUIRED when the customer mentions an A-series size, not
+        just optional."""
+        from llm.craig_agent import TOOLS
+        large_format = next(t for t in TOOLS
+                            if t.get("function", {}).get("name") == "quote_large_format")
+        size_desc = large_format["function"]["parameters"]["properties"]["size"]["description"]
+        required_signals = [
+            "REQUIRED for board products",
+            "REQUIRED whenever",
+            "EVEN IF the customer only said",
+            "Do NOT ask the customer for",
+            "ONLY OMIT `size`",
+        ]
+        present = sum(1 for s in required_signals if s in size_desc)
+        assert present >= 3, (
+            f"Tool size description must emphasize that `size` is "
+            f"REQUIRED for boards with A-series mention. Found "
+            f"{present}/{len(required_signals)} markers."
+        )
+
+    def test_v40_8_9_prompt_has_board_size_examples(self):
+        """v40.8.9 — the prompt's DIRECT TOOL CALL section must include
+        explicit examples for the 7 board sizes so DeepSeek
+        pattern-matches against them."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # Each canonical board phrasing should appear verbatim
+        board_examples = [
+            "5 corri boards A3",
+            "10 foamex boards A1",
+            "2 A0 dibond",
+            "1 full sheet corri",
+            "20 corri boards at 800mm by 600mm",
+        ]
+        present = sum(1 for ex in board_examples if ex in CRAIG_SYSTEM_PROMPT)
+        assert present >= 4, (
+            f"Prompt must contain ≥4 verbatim board examples. "
+            f"Found {present}/{len(board_examples)}: "
+            f"{[ex for ex in board_examples if ex in CRAIG_SYSTEM_PROMPT]}."
+        )
+        # And the anti-pattern warning
+        assert "NEVER ask" in CRAIG_SYSTEM_PROMPT and "mm" in CRAIG_SYSTEM_PROMPT, (
+            "Prompt must explicitly forbid asking for mm when A-series "
+            "is named."
+        )
+
     def test_v40_8_7_prompt_size_reduced(self):
         """v40.8.7 — sanity check that the prompt didn't bloat further.
-        Pre-v40.8.7 was 16,208 chars; v40.8.7 target was <14,000."""
+        Pre-v40.8.7 was 16,208 chars; v40.8.7 shrunk to 13,454.
+        v40.8.9 added ~1,400 chars of board examples + anti-pattern
+        warning (necessary to fix Justin's board escalation bug).
+        Guardrail raised to 15,500 to accommodate."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
-        assert len(CRAIG_SYSTEM_PROMPT) < 14500, (
-            f"Prompt is {len(CRAIG_SYSTEM_PROMPT)} chars — v40.8.7 should "
-            f"have shrunk it under 14,500. Check if you accidentally "
-            f"re-added a verbose block."
+        assert len(CRAIG_SYSTEM_PROMPT) < 15500, (
+            f"Prompt is {len(CRAIG_SYSTEM_PROMPT)} chars — should stay "
+            f"under 15,500. Check if you accidentally re-added a "
+            f"verbose block."
         )

@@ -158,9 +158,6 @@ Examples — DIRECT TOOL CALL (no confirm step, all fields clear):
   - "500 business cards single sided, I have my own artwork"
     → qty=500, sides=single, finish=uncoated (default), needs_artwork=false
     → CALL quote_small_format directly.
-  - "5 corri boards A3"
-    → product=corri_boards, qty=5, size=A3
-    → CALL quote_large_format directly.
   - "250 A5 flyers single-sided, got artwork"
     → all fields clear, flyers have no finish question
     → CALL quote_small_format directly.
@@ -168,9 +165,33 @@ Examples — DIRECT TOOL CALL (no confirm step, all fields clear):
     → all 5 booklet fields given
     → CALL quote_booklet directly.
 
+BOARD EXAMPLES — pay close attention. Whenever the customer says a board product
+together with ANY A-series mention (A4 / A3 / A2 / A1 / A0) or "full sheet" /
+"half sheet" / "2440x1220" / "1220x1220", DO NOT ask for millimetre dimensions.
+Pass the `size` parameter directly:
+
+  - "5 corri boards A3" → product=corri_boards, qty=5, size=A3
+    → CALL quote_large_format(product_key="corri_boards", quantity=5, size="A3").
+  - "10 foamex boards A1" → size=A1
+    → CALL quote_large_format(product_key="foamex_boards", quantity=10, size="A1").
+  - "2 A0 dibond" → size=A0
+    → CALL quote_large_format(product_key="dibond_boards", quantity=2, size="A0").
+  - "1 full sheet corri" / "1 corri board 2440x1220" → size=2440x1220
+    → CALL quote_large_format(product_key="corri_boards", quantity=1, size="2440x1220").
+  - "3 corri A4" → size=A4
+    → CALL quote_large_format(product_key="corri_boards", quantity=3, size="A4").
+  - "20 corri boards at 800mm by 600mm" → width_mm=800, height_mm=600 (custom size, no `size`)
+    → CALL quote_large_format(product_key="corri_boards", quantity=20, width_mm=800, height_mm=600).
+
+NEVER ask "what size is each board in mm?" when the customer already said A3 / A4 /
+A2 / A1 / A0 / 2440x1220 / 1220x1220 / "full sheet" / "half sheet". That's the
+known bug from June 2026 — Justin reported many customers escalating because Craig
+asked for mm when they had already named a standard size.
+
 Examples — CONFIRM / ASK FIRST (missing or ambiguous fields):
   - "100 business cards" → sides missing → ask "single or double-sided?"
-  - "10 corri boards" → size missing → ask "which size?"
+  - "10 corri boards" → size missing → ask "which size? A4 / A3 / A2 / A1 / A0 /
+    full sheet (2440x1220) / half sheet (1220x1220) / custom mm?"
   - "50 booklets" → format/binding/pages/cover all missing → start with format.
   - "I want gloss matte business cards" → contradictory finish → confirm which one.
   - "10000 business cards" → unusually high → confirm before quoting.
@@ -1168,10 +1189,16 @@ TOOLS = [
                         "type": "string",
                         "enum": ["A4", "A3", "A2", "A1", "A0", "2440x1220", "1220x1220"],
                         "description": (
-                            "Standard size for board products (corri/foamex/dibond). "
-                            "Use 2440x1220 for full sheet, 1220x1220 for half sheet. "
-                            "If the customer gave custom dimensions in mm instead, pass "
-                            "width_mm + height_mm (no `size`)."
+                            "REQUIRED for board products (corri_boards, foamex_boards, "
+                            "dibond_boards) whenever the customer mentions ANY of "
+                            "A4/A3/A2/A1/A0 or '2440x1220'/'full sheet' or '1220x1220'/"
+                            "'half sheet' in their message. Pass it EVEN IF the customer "
+                            "only said the size in passing (e.g. '5 corri A3', '10 foamex "
+                            "A1', '1 full sheet corri'). Do NOT ask the customer for "
+                            "millimetre dimensions in these cases. ONLY OMIT `size` and use "
+                            "width_mm+height_mm when the customer explicitly wants a custom "
+                            "non-standard panel size (e.g. '800x600mm' or '500mm by 500mm'). "
+                            "Use 2440x1220 for full sheet, 1220x1220 for half sheet."
                         ),
                     },
                     "width_mm": {
