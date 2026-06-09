@@ -99,6 +99,17 @@ def main() -> None:
     )
     _run("v40 pre-DDL (Conversation.attribution)", v40_ddl_only)
 
+    # v41 pre-DDL — adds Product.min_order_value_eur +
+    # Product.max_qty_for_auto_quote. The model declares them; older ORM
+    # migrations SELECT Product, so the columns must exist first.
+    from scripts.v41_min_order_and_ceiling import (
+        migrate_ddl_only as v41_ddl_only,
+    )
+    _run(
+        "v41 pre-DDL (Product.min_order_value_eur + max_qty_for_auto_quote)",
+        v41_ddl_only,
+    )
+
     # Only bootstrap pricing data if the DB is empty — otherwise this wipes
     # everything the user has edited since first deploy (system_prompt,
     # business_rules, catalog edits, etc.).
@@ -149,6 +160,7 @@ def main() -> None:
     from scripts.v38_widget_fixes import migrate as v38_migrate
     from scripts.v39_min_billable_area import migrate as v39_migrate
     from scripts.v40_attribution import migrate as v40_migrate
+    from scripts.v41_min_order_and_ceiling import migrate as v41_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -187,6 +199,7 @@ def main() -> None:
     _run("v38 widget bug-fix pass (requires_dimensions + posters + price-first rules)", v38_migrate)
     _run("v39 minimum billable area (per-sq/m floor)", v39_migrate)
     _run("v40 marketing attribution column", v40_migrate)
+    _run("v41 min order value + max qty auto-quote ceiling", v41_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 

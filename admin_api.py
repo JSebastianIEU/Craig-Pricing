@@ -328,6 +328,12 @@ def _product_to_dict(p: Product, tiers: list[PriceTier]) -> dict[str, Any]:
         # per-unit price and escalates above it.
         "requires_dimensions": bool(getattr(p, "requires_dimensions", False)),
         "sanity_max_unit_price": getattr(p, "sanity_max_unit_price", None),
+        # v41 — per-product minimum order value (€). If the engine's
+        # final_price_ex_vat falls below this, it FLOORS to this
+        # value. v41 also exposes max_qty_for_auto_quote — above this
+        # quantity, the engine returns EscalationResult before pricing.
+        "min_order_value_eur": getattr(p, "min_order_value_eur", None),
+        "max_qty_for_auto_quote": getattr(p, "max_qty_for_auto_quote", None),
         "tiers": [
             {"id": t.id, "spec_key": t.spec_key, "quantity": t.quantity, "price": t.price}
             for t in tiers
@@ -409,6 +415,16 @@ class CreateProductRequest(BaseModel):
     # bulk-import endpoint can set them on creation.
     requires_dimensions: Optional[bool] = False
     sanity_max_unit_price: Optional[float] = Field(default=None, ge=0)
+    # v41 — per-product minimum order value (€, ex VAT) + max-qty
+    # auto-quote ceiling. When `min_order_value_eur` is set, the
+    # engine FLOORS the computed price to this value (catches "1
+    # business card = €0.40" style requests below Justin's minimum).
+    # When `max_qty_for_auto_quote` is set, the engine escalates
+    # BEFORE pricing if the requested quantity exceeds this — for
+    # leaflets / letterheads above N units that need Justin's hand.
+    # Both null = legacy behaviour (no floor, no ceiling).
+    min_order_value_eur: Optional[float] = Field(default=None, ge=0)
+    max_qty_for_auto_quote: Optional[int] = Field(default=None, gt=0)
 
     @field_validator("pricing_strategy")
     @classmethod
@@ -476,6 +492,9 @@ def create_product(
         # v38 — defensive scaffolding (newly exposed in v40.2)
         requires_dimensions=bool(body.requires_dimensions),
         sanity_max_unit_price=body.sanity_max_unit_price,
+        # v41 — per-product floor + auto-quote ceiling
+        min_order_value_eur=body.min_order_value_eur,
+        max_qty_for_auto_quote=body.max_qty_for_auto_quote,
     )
     db.add(p)
     db.commit()
@@ -515,6 +534,11 @@ class UpdateProductRequest(BaseModel):
     # v38 — defensive scaffolding (newly exposed on the CRUD surface in v40.2)
     requires_dimensions: Optional[bool] = None
     sanity_max_unit_price: Optional[float] = Field(default=None, ge=0)
+    # v41 — per-product floor + auto-quote ceiling. PATCH-able from
+    # the dashboard form; omitting either leaves the existing value
+    # intact (exclude_unset semantics).
+    min_order_value_eur: Optional[float] = Field(default=None, ge=0)
+    max_qty_for_auto_quote: Optional[int] = Field(default=None, gt=0)
 
     @field_validator("pricing_strategy")
     @classmethod
@@ -679,7 +703,12 @@ class BulkProductRow(CreateProductRequest):
     field + `extra="forbid"` + `pricing_strategy` enum validation
     from `CreateProductRequest`, then adds its tier list."""
     model_config = ConfigDict(extra="forbid")
-    tiers: list[BulkProductTierRow] = Field(default_factory=list, max_length=100)
+    # v41 — bumped from 100 to 2000 so the v40.7 board-tier import (200
+    # qty × 7 sizes = 1,400 tiers per product) fits in a single bulk
+    # call instead of needing client-side batching. The original v40.2
+    # comment noted "50k tier-rows worst case" — 2,000 is still well
+    # below that and removes a real operational paper cut.
+    tiers: list[BulkProductTierRow] = Field(default_factory=list, max_length=2000)
 
 
 class BulkProductImportRequest(BaseModel):
@@ -932,6 +961,8 @@ def bulk_import_products(
                     "sheet_size_mm", "sheet_price", "min_billable_sqm",
                     "manual_review_reason",
                     "requires_dimensions", "sanity_max_unit_price",
+                    # v41 — per-product order limits
+                    "min_order_value_eur", "max_qty_for_auto_quote",
                 ):
                     val = getattr(row, fld, None)
                     if val is not None:
@@ -994,6 +1025,9 @@ def bulk_import_products(
                     min_billable_sqm=row.min_billable_sqm,
                     requires_dimensions=bool(row.requires_dimensions),
                     sanity_max_unit_price=row.sanity_max_unit_price,
+                    # v41 — per-product order limits
+                    min_order_value_eur=row.min_order_value_eur,
+                    max_qty_for_auto_quote=row.max_qty_for_auto_quote,
                 )
                 db.add(p)
                 db.flush()
