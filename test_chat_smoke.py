@@ -622,6 +622,48 @@ class TestV408PromptWording:
             f"for 'no laminate' escalation patterns (found {present}/4)."
         )
 
+    def test_top_fact_is_at_the_very_start_of_prompt(self):
+        """v40.8.5 — the FACT statement about unlaminated business cards
+        must live in the FIRST ~1,000 chars of the prompt so DeepSeek
+        attends to it strongly enough to override training priors."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        head = CRAIG_SYSTEM_PROMPT[:1500]
+        assert "TOP FACT" in head, (
+            f"'TOP FACT' header should be in the first 1,500 chars "
+            f"(found at position {CRAIG_SYSTEM_PROMPT.find('TOP FACT')})."
+        )
+        assert "BUSINESS CARDS ONLY" in head, (
+            "Top FACT must be visibly scoped to business cards only."
+        )
+
+    def test_top_fact_explicitly_scoped_not_universal(self):
+        """v40.8.5 — Sebastian was explicit: the FACT must NOT extend
+        to other products. The prompt must say so EXPLICITLY so the
+        LLM doesn't generalize the unlaminated-default rule beyond
+        business cards."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        scope_signals = [
+            "does NOT extend",
+            "does not extend",
+            "ONLY about business_cards",
+            "ONLY about business cards",
+            "only to product_key=\"business_cards\"",
+            "STRICTLY to product_key",
+        ]
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in scope_signals), (
+            "TOP FACT must explicitly say it does NOT apply to other "
+            f"products (looked for any of: {scope_signals})."
+        )
+        # And explicitly mention some of the other products NOT covered
+        not_covered = ["flyers", "leaflets", "brochures", "NCR books",
+                       "letterheads", "compliment slips", "boards"]
+        non_covered_count = sum(1 for p in not_covered
+                                if p in CRAIG_SYSTEM_PROMPT[:2000])
+        assert non_covered_count >= 4, (
+            f"TOP FACT should name at least 4 of {not_covered} as "
+            f"NOT covered (found {non_covered_count})."
+        )
+
     def test_prompt_forbids_pushing_laminate_unprompted(self):
         """v40.8.1 — Craig should NOT push laminate unprompted on
         business cards. Wait for the customer to mention it."""
