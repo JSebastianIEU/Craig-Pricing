@@ -468,24 +468,87 @@ class TestV408PromptWording:
             "DO NOT offer gloss",
             "no finish option",
             "no finish options",
+            "never get a finish question",
         ]
         assert any(s in CRAIG_SYSTEM_PROMPT for s in forbid_signals), (
             "Base prompt should explicitly forbid finishes on non-cards "
             f"(looked for any of: {forbid_signals})."
         )
 
+    def test_prompt_treats_finish_as_laminate_type(self):
+        """v40.8.1 — finishes (gloss/matte/soft-touch) ARE the laminate
+        type on business cards, not an independent option. Default
+        cards are unlaminated; ask finish ONLY when customer mentions
+        laminate. The prompt must encode this."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # "finish IS the laminate" framing — look for the conceptual
+        # tie-in and the unlaminated-default rule.
+        laminate_signals = [
+            "type of LAMINATE",
+            "type of laminate",
+            "IS the type of LAMINATE",
+            "= the laminate",
+            "= which laminate",
+            "LAMINATE TYPES",
+        ]
+        default_unlaminated_signals = [
+            "default is UNLAMINATED",
+            "default is unlaminated",
+            "Default cards are unlaminated",
+            "default cards are unlaminated",
+            "Default: no laminate",
+            "no finish surcharge",
+        ]
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in laminate_signals), (
+            "Prompt must frame finish as the laminate type "
+            f"(looked for any of: {laminate_signals})."
+        )
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in default_unlaminated_signals), (
+            "Prompt must say default cards are unlaminated "
+            f"(looked for any of: {default_unlaminated_signals})."
+        )
+
+    def test_prompt_forbids_pushing_laminate_unprompted(self):
+        """v40.8.1 — Craig should NOT push laminate unprompted on
+        business cards. Wait for the customer to mention it."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        no_push_signals = [
+            "Do NOT push laminate",
+            "Don't push laminate",
+            "do not push laminate",
+            "don't push laminate",
+            "Do NOT push laminate unprompted",
+            "no push",
+        ]
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in no_push_signals), (
+            "Prompt must instruct Craig not to push laminate "
+            f"(looked for any of: {no_push_signals})."
+        )
+
     def test_email_channel_drops_generic_finish_offer(self):
         """The missive channel context should NOT instruct Craig
         to offer 'gloss/matte/soft-touch' generically — that's a
-        business-cards-only line per v40.8."""
+        business-cards-only line per v40.8, and the v40.8.1 rewrite
+        also clarifies finish = laminate type."""
         from llm.craig_agent import _CHANNEL_CONTEXT
         missive = _CHANNEL_CONTEXT.get("missive", "")
-        # The rewrite scopes the finish line to cards explicitly.
-        assert (
-            "Finishes apply ONLY to business cards" in missive
-            or "no finish option" in missive
-            or "DO NOT ask for finish" in missive
-        ), "Missive context should restrict finishes to business cards."
+        scope_signals = [
+            # v40.8 original wording
+            "Finishes apply ONLY to business cards",
+            "no finish option",
+            "DO NOT ask for finish",
+            # v40.8.1 rewritten wording (laminate-type framing)
+            "ONLY apply to business cards",
+            "LAMINATE TYPES",
+            "are LAMINATE TYPES",
+            "do not push laminate",
+            "do NOT push laminate",
+            "Do NOT push laminate",
+        ]
+        assert any(s in missive for s in scope_signals), (
+            "Missive context should restrict finishes to business cards "
+            f"(looked for any of: {scope_signals})."
+        )
 
     def test_catalog_context_injects_board_sizes_hint_for_tiered_large_format(self):
         """When a large_format product is configured tiered (v40.7),
