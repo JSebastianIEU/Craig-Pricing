@@ -429,3 +429,110 @@ class TestCatalogSmoke:
         r = client.get("/products")
         n = len(r.json())
         assert n >= 25, f"Catalog shrank to {n} products — migration data loss?"
+
+
+# ===========================================================================
+# v40.8 — System prompt + catalog-context wording tests
+#
+# These verify that Justin's meeting feedback is baked into the prompt
+# and the runtime catalog context the LLM sees:
+#   1. Price wording is "+ VAT" (Irish B2B), not "inc VAT", in chat.
+#   2. Finishes (gloss/matte/soft-touch) are scoped to BUSINESS CARDS only.
+#   3. Board products surface the 7 standard sizes + custom-mm option.
+# ===========================================================================
+
+
+class TestV408PromptWording:
+    """v40.8 — verify the system prompt + catalog hints carry the
+    meeting fixes BEFORE they reach the LLM."""
+
+    def test_prompt_uses_plus_vat_phrasing(self):
+        """The base system prompt should tell Craig to say '+ VAT'
+        (Irish B2B convention) rather than 'inc VAT' in chat."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        assert "+ VAT" in CRAIG_SYSTEM_PROMPT, (
+            "Base prompt should instruct '+ VAT' wording (v40.8)."
+        )
+
+    def test_prompt_forbids_finish_question_on_flyers(self):
+        """The prompt should explicitly tell Craig NOT to ask
+        gloss/matte/soft-touch on flyers / leaflets / brochures /
+        NCR books / letterheads / compliment slips — they're 170gsm
+        silk full-stop."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # Look for any of the explicit-forbid phrases that the v40.8
+        # rewrite introduced.
+        forbid_signals = [
+            "NO finish question",
+            "DO NOT ask for finish on flyers",
+            "DO NOT offer gloss",
+            "no finish option",
+            "no finish options",
+        ]
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in forbid_signals), (
+            "Base prompt should explicitly forbid finishes on non-cards "
+            f"(looked for any of: {forbid_signals})."
+        )
+
+    def test_email_channel_drops_generic_finish_offer(self):
+        """The missive channel context should NOT instruct Craig
+        to offer 'gloss/matte/soft-touch' generically — that's a
+        business-cards-only line per v40.8."""
+        from llm.craig_agent import _CHANNEL_CONTEXT
+        missive = _CHANNEL_CONTEXT.get("missive", "")
+        # The rewrite scopes the finish line to cards explicitly.
+        assert (
+            "Finishes apply ONLY to business cards" in missive
+            or "no finish option" in missive
+            or "DO NOT ask for finish" in missive
+        ), "Missive context should restrict finishes to business cards."
+
+    def test_catalog_context_injects_board_sizes_hint_for_tiered_large_format(self):
+        """When a large_format product is configured tiered (v40.7),
+        _build_catalog_context should inject the hint that lists the
+        7 standard sizes + custom-mm option so the LLM knows what
+        to ask the customer."""
+        from llm.craig_agent import _build_catalog_context
+        from db import db_session
+        from db.models import Product
+
+        # Snapshot + mutate corri_boards to tiered for this assertion,
+        # then revert in finally.
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="corri_boards",
+            ).first()
+            if p is None:
+                import pytest
+                pytest.skip("corri_boards not in seed.")
+            orig_strat = p.pricing_strategy
+            p.pricing_strategy = "tiered"
+            db.commit()
+            try:
+                ctx = _build_catalog_context(db, "just-print")
+            finally:
+                p.pricing_strategy = orig_strat
+                db.commit()
+
+        assert "2440x1220" in ctx, (
+            "Catalog context should mention full sheet size for boards."
+        )
+        # At least one of the standard sizes should appear next to the
+        # tiered-board hint.
+        assert "A3" in ctx and "A1" in ctx, (
+            "Catalog context should mention standard board sizes (A3, A1, etc.)."
+        )
+        assert "laydown" in ctx.lower() or "custom" in ctx.lower(), (
+            "Catalog context should mention the laydown / custom-mm path."
+        )
+
+    def test_catalog_context_does_not_break_for_per_sheet_boards(self):
+        """Sanity: with corri_boards still on per_sheet, the catalog
+        context still renders (no exception, no regression)."""
+        from llm.craig_agent import _build_catalog_context
+        from db import db_session
+        with db_session() as db:
+            ctx = _build_catalog_context(db, "just-print")
+        assert "corri_boards" in ctx or "Corri" in ctx, (
+            "Catalog context should always include corri_boards."
+        )

@@ -128,13 +128,14 @@ DO:
 - For large format: product, quantity.
 - For booklet: format (a5/a4), binding, pages, cover_type, quantity.
 - If missing info → ask ONE question at a time.
-- ALWAYS confirm the specs back to the customer BEFORE calling the pricing tool, even if they gave everything upfront. Example: "Just to confirm — 500 business cards, single-sided, soft-touch finish?" Wait for them to say yes, THEN call the tool.
+- ALWAYS confirm the specs back to the customer BEFORE calling the pricing tool, even if they gave everything upfront. Example: "Just to confirm — 500 business cards, single-sided, matte finish?" Wait for them to say yes, THEN call the tool.
 - This avoids quoting the wrong thing if you misunderstood their message.
 
 ## CRITICAL: How to present the price
-- Give ONLY the total price (inc VAT). The customer just wants to know what they'll pay.
-- DO NOT mention "ex VAT", "plus VAT", "before VAT", or show any VAT breakdown.
-- Just say the total: "That'll be €46.74 for 500 business cards 👍"
+- Give the price as "€X + VAT" (Irish B2B convention — that's how Justin and his customers talk).
+  Example: "That'll be €38 + VAT for 500 business cards 👍"
+- DO NOT say "inc VAT" or break down ex VAT / VAT amount / inc VAT separately in chat. The PDF quote
+  shows the breakdown; the chat reply just says "€X + VAT".
 - After giving the price, ALWAYS ask if they want the full quote: "Want me to put together the full quote for you? 📋"
 - If they say yes, respond with EXACTLY this format (the widget will detect it): "Here's your quote! 📋 [QUOTE_READY]"
 - Design service is **€65 ex VAT (€79.95 inc VAT) for one hour of design work**. Always phrase it as "one hour of design" — that's what €65 buys: an hour of our designer's time. Most jobs fit comfortably inside one hour; bigger jobs may need more. Say things like "€65 + VAT for an hour of design" or "It's €79.95 inc VAT — that's one hour with our designer." When the customer confirms they want it, on the NEXT pricing tool call pass `needs_artwork=true, artwork_hours=1.0` — that's how we bill it through the engine. If they have print-ready artwork, omit both arguments (no design line item).
@@ -164,12 +165,22 @@ The collection pattern (same for standard quotes and escalations):
    appends the marker automatically, but you should still emit it yourself.)
 
 ## Tone examples
-- "Nice one! That comes to €46.74 for 500 business cards 👍"
+- "Nice one! That'll be €38 + VAT for 500 business cards 👍"
 - "Let me check that for you 🔍"
 - "That's one for Justin — I'll get him to come back to you on that 👍"
 - "Single-sided or double-sided?"
-- "What kind of finish are you after? Gloss, matte, or soft-touch?"
+- "What kind of finish are you after? Gloss, matte, or soft-touch?" (ONLY for business cards — flyers, leaflets,
+  brochures, NCR books, letterheads, compliment slips come standard on 170gsm silk with no finish options)
 - "Hmm, that doesn't look quite right — could you double-check the email? 🤔"
+
+## Finishes — what to ask vs what to skip
+- **Business cards**: ALWAYS ask the finish (gloss / matte / soft-touch). Default tier prices assume one of these.
+- **Flyers, leaflets, brochures, NCR books, letterheads, compliment slips**: NO finish question.
+  These are standard 170gsm silk full-stop. DO NOT offer gloss / matte / soft-touch / lamination —
+  they're not configured on Justin's price sheet for these products. If the customer asks for laminate
+  on flyers, escalate to Justin (laminated flyers use 250gsm silk and need a manual quote).
+- **Boards (corri / foamex / dibond)**: NO finish question — they come matt laminated by default.
+- **NCR books**: ask `duplicate` or `triplicate` (that's the only choice — it's about layers, not finish).
 
 ## Helpful images
 If the customer is confused about paper sizes (A3, A4, A5, A6, DL, business card), include [SIZE_GUIDE] in your reply. The widget will show them a visual size comparison chart. Example: "Here's a quick guide to help! [SIZE_GUIDE]"
@@ -502,6 +513,18 @@ def _build_catalog_context(db: Session, organization_slug: str) -> str:
                 if p.sheet_size_mm:
                     hint_parts.append(f"sheet {p.sheet_size_mm} mm")
                 parts.append(f"  pricing: {' · '.join(hint_parts)} — ask for panel size in mm")
+            elif strategy == "tiered" and (p.category or "").lower() == "large_format":
+                # v40.8 — board products (corri/foamex/dibond) priced via
+                # 2-D (size, qty) table after v40.7. Hint the LLM that it
+                # can offer the 7 standard sizes OR ask for custom mm
+                # dimensions (laydown calculator path).
+                parts.append(
+                    "  pricing: tiered by size — accept one of "
+                    "[A4, A3, A2, A1, A0, 2440x1220, 1220x1220] as `size`, "
+                    "OR `width_mm` + `height_mm` for custom panel sizes "
+                    "(engine runs the laydown calculator). Ask the customer "
+                    "which size or what dimensions in mm."
+                )
             if p.notes:
                 parts.append(f"  note: {p.notes.strip()}")
             lines.append("\n".join(parts))
@@ -643,8 +666,12 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "Each customer message lands you in ONE of these states. Figure\n"
         "out which one, then send the matching reply. Never skip a step.\n"
         "Hallucinated finish names like \"standard\" or \"uncoated\" are\n"
-        "forbidden \u2014 only offer finishes that are actually on the catalog\n"
-        "(for cards: matte, gloss, soft-touch).\n"
+        "forbidden \u2014 only offer finishes that are actually on the catalog.\n"
+        "Finishes apply ONLY to business cards (matte, gloss, soft-touch).\n"
+        "DO NOT ask for finish on flyers, leaflets, brochures, NCR books,\n"
+        "letterheads, or compliment slips \u2014 they're standard 170gsm silk\n"
+        "with no finish option. If the customer requests laminate on flyers,\n"
+        "escalate to Justin (250gsm silk + lam needs a manual quote).\n"
         "\n"
         "  STEP 1 \u2014 Specs incomplete\n"
         "    Trigger: not enough info to price (no qty, or no sides, or no\n"
@@ -715,8 +742,9 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "          Thanks for those details \u2014 got everything I need.\n"
         "\n"
         "          For <qty> <product> <specs>, the total comes to\n"
-        "          \u20ac<price from tool> including VAT. I've attached the\n"
-        "          full branded quote as a PDF for your records.\n"
+        "          \u20ac<price from tool> + VAT. I've attached the full\n"
+        "          branded quote as a PDF for your records (it shows the\n"
+        "          full ex VAT / VAT / inc VAT breakdown).\n"
         "\n"
         "          Turnaround is 3-5 working days once we have your\n"
         "          print-ready artwork. Just reply to this email to\n"
@@ -778,7 +806,7 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "Hi Juan,\n"
         "\n"
         "Perfect, your order for JP-0018 (500 business cards, soft-touch,\n"
-        "double-sided, \u20ac269.56 including VAT) is confirmed.\n"
+        "double-sided, \u20ac219.15 + VAT) is confirmed.\n"
         "\n"
         "Please send through your print-ready artwork when it's ready and\n"
         "we'll get everything moving on our side. We'll be in touch with\n"
@@ -849,7 +877,7 @@ _CHANNEL_CONTEXT: dict[str, str] = {
         "\n"
         "Thanks for those details. For 100 business cards, single-sided,\n"
         "soft-touch finish, including one hour of design work, the total\n"
-        "comes to \u20ac135.30 including VAT.\n"
+        "comes to \u20ac110.00 + VAT (PDF shows the full breakdown).\n"
         "\n"
         "I've attached the full branded quote as a PDF. Turnaround is\n"
         "3-5 working days from when we have print-ready artwork. Reply\n"
@@ -2131,10 +2159,17 @@ def chat_with_craig(
     if existing_quotes:
         summary_lines = ["[PRIOR QUOTES ALREADY SENT ON THIS THREAD]"]
         for q in existing_quotes:
-            price = q.final_price_inc_vat or 0.0
+            # v40.8 \u2014 prefer ex-VAT total + "+ VAT" wording for consistency
+            # with the prompt rule. Fall back to inc-VAT on legacy rows.
+            _ex = getattr(q, "final_price_ex_vat", None)
+            _inc = q.final_price_inc_vat or 0.0
+            if _ex:
+                price_str = f"\u20ac{float(_ex):.2f} + VAT"
+            else:
+                price_str = f"\u20ac{float(_inc):.2f} inc VAT"
             summary_lines.append(
                 f"- JP-{q.id:04d}: {q.product_key or 'custom'}, "
-                f"\u20ac{price:.2f} inc VAT, status={q.status}"
+                f"{price_str}, status={q.status}"
             )
         summary_lines.append(
             "If the customer's message is a confirmation of one of these "
@@ -2641,13 +2676,21 @@ def chat_with_craig(
         if last_quote_id and ("€" not in kept and "EUR" not in kept.upper()):
             try:
                 _q = db.query(Quote).filter_by(id=last_quote_id).first()
-                if _q is not None and _q.final_price_inc_vat:
+                # v40.8 — surface the ex-VAT total + "+ VAT" wording
+                # (Irish B2B convention, replaces the legacy "inc VAT"
+                # phrasing). Fall back to inc-VAT only if ex-VAT is unset
+                # on a legacy Quote row.
+                _price_ex = getattr(_q, "final_price_ex_vat", None) if _q else None
+                _price_inc = getattr(_q, "final_price_inc_vat", None) if _q else None
+                _price_display = _price_ex if _price_ex else _price_inc
+                if _q is not None and _price_display:
                     _qty = (_q.specs or {}).get("quantity") if _q.specs else None
                     _prod = (_q.product_key or "").replace("_", " ")
                     qty_str = f"{int(_qty)} " if _qty else ""
+                    _suffix = "+ VAT" if _price_ex else "inc VAT"
                     price_intro = (
-                        f"That'll be €{float(_q.final_price_inc_vat):.2f} "
-                        f"for {qty_str}{_prod} inc VAT 👍"
+                        f"That'll be €{float(_price_display):.2f} "
+                        f"for {qty_str}{_prod} {_suffix} 👍"
                     )
                     if kept:
                         kept = price_intro + "\n\n" + kept
