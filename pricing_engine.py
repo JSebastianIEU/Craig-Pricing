@@ -330,7 +330,7 @@ def _units_per_sheet(panel_w: int, panel_h: int, sheet_w: int, sheet_h: int) -> 
 #
 # Confirmed by Justin (May 2026): 530 cards should NOT escalate to a
 # manual quote — Craig should bill it as 500 + 100 = 600 cards. Same
-# rule applies to flyers, brochures, NCR pads — every tiered product.
+# rule applies to flyers, brochures, NCR books — every tiered product.
 #
 # Algorithm (greedy, largest-first):
 #   1. Sort available tiers descending by qty.
@@ -791,7 +791,7 @@ def quote_small_format(
             )
 
         elif normalized == "triplicate":
-            if product.key in ("ncr_pads_a5", "ncr_pads_a4"):
+            if product.key in ("ncr_books_a5", "ncr_books_a4"):
                 _apply(
                     "triplicate",
                     label_pct="Triplicate: +{pct}%",
@@ -799,7 +799,7 @@ def quote_small_format(
                 )
             else:
                 return EscalationResult(
-                    reason="Triplicate finish only applies to NCR pads.",
+                    reason="Triplicate finish only applies to NCR books.",
                     product_name=product.name,
                 )
 

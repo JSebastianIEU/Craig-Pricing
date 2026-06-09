@@ -62,14 +62,25 @@ PRODUCT_ALIASES = {
         "letterheads", "letterhead", "letter heads", "letter head",
         "headed paper", "letter paper",
     ],
-    "ncr_pads_a5": [
-        "a5 ncr", "ncr a5", "a5 ncr pads", "ncr pads a5",
+    # v40.6 — renamed from ncr_pads_* to ncr_books_* (Justin clarified
+    # the bound product is a "book", "pads" is a different tear-off
+    # product). Aliases keep all the "ncr pads" / "pads a4" / etc.
+    # strings so customers who still use the old word match correctly,
+    # AND add "ncr books" / "books a4" / etc. for the new name.
+    "ncr_books_a5": [
+        "a5 ncr", "ncr a5", "a5 ncr books", "ncr books a5",
+        "a5 ncr pads", "ncr pads a5",
+        "a5 duplicate books", "a5 triplicate books",
         "a5 duplicate pads", "a5 triplicate pads",
+        "a5 invoice books", "a5 receipt books", "a5 docket books",
         "a5 invoice pads", "a5 receipt pads", "a5 docket pads",
     ],
-    "ncr_pads_a4": [
-        "a4 ncr", "ncr a4", "a4 ncr pads", "ncr pads a4",
+    "ncr_books_a4": [
+        "a4 ncr", "ncr a4", "a4 ncr books", "ncr books a4",
+        "a4 ncr pads", "ncr pads a4",
+        "a4 duplicate books", "a4 triplicate books",
         "a4 duplicate pads", "a4 triplicate pads",
+        "a4 invoice books", "a4 receipt books", "a4 docket books",
         "a4 invoice pads", "a4 receipt pads", "a4 docket pads",
     ],
     # Large format

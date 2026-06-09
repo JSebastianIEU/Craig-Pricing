@@ -172,8 +172,8 @@
     },
     "notes": "Min qty 100. Double-sided add 20%."
   },
-  "ncr_pads_a5": {
-    "name": "NCR Pads \u2014 A5",
+  "ncr_books_a5": {
+    "name": "NCR Books \u2014 A5",
     "description": "Duplicate - perforated & stitched - 50 sets per book. A5 size.",
     "sizes": [
       "A5"
@@ -193,8 +193,8 @@
     },
     "notes": "Standard one side. Black & sequential numbering. Triplicate add 10%."
   },
-  "ncr_pads_a4": {
-    "name": "NCR Pads \u2014 A4",
+  "ncr_books_a4": {
+    "name": "NCR Books \u2014 A4",
     "description": "Duplicate - perforated & stitched - 50 sets per book. A4 size.",
     "sizes": [
       "A4"

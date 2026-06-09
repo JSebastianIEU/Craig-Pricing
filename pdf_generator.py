@@ -616,9 +616,9 @@ def _build_description(quote, product=None) -> str:
         lines.append("<b>Letterheads</b>")
         lines.append("A4, 120gsm uncoated bond")
         lines.append("Double-sided" if specs.get("double_sided") else "Single-sided")
-    elif "ncr_pads" in product_key:
+    elif "ncr_books" in product_key:
         size = "A5" if "a5" in product_key else "A4"
-        lines.append(f"<b>NCR Pads {size}</b>")
+        lines.append(f"<b>NCR Books {size}</b>")
         lines.append("Perforated & stitched, 50 sets per book")
         if specs.get("finish"):
             lines.append(specs["finish"].title())

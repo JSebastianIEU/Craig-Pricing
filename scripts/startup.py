@@ -161,6 +161,7 @@ def main() -> None:
     from scripts.v39_min_billable_area import migrate as v39_migrate
     from scripts.v40_attribution import migrate as v40_migrate
     from scripts.v41_min_order_and_ceiling import migrate as v41_migrate
+    from scripts.v42_rename_ncr_pads_to_books import migrate as v42_migrate
 
     _run("v2 multi-tenancy", v2_migrate)
     _run("v3 categories + images", v3_migrate)
@@ -200,6 +201,7 @@ def main() -> None:
     _run("v39 minimum billable area (per-sq/m floor)", v39_migrate)
     _run("v40 marketing attribution column", v40_migrate)
     _run("v41 min order value + max qty auto-quote ceiling", v41_migrate)
+    _run("v42 rename NCR Pads → NCR Books (catalog data half)", v42_migrate)
 
     print(f"[startup] all migrations complete. DATABASE_URL={os.environ.get('CRAIG_DATABASE_URL', '<default sqlite>')[:40]}...", flush=True)
 
