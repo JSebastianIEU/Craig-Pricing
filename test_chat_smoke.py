@@ -664,6 +664,63 @@ class TestV408PromptWording:
             f"NOT covered (found {non_covered_count})."
         )
 
+    def test_prompt_has_positive_imperative_tool_call_template(self):
+        """v40.8.6 — root-cause fix for the no-laminate workflow inversion.
+        The TOP FACT must include a POSITIVE imperative ('your NEXT action
+        is a tool call') with an explicit args template, not just a
+        negative prohibition ('don't escalate')."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        positive_signals = [
+            "YOUR IMMEDIATE NEXT ACTION",
+            "Your IMMEDIATE next action",
+            "your NEXT action is a tool call",
+            "NEXT action is a tool call",
+            "Tool to call: quote_small_format",
+            "Tool to call: quote_small_format",
+        ]
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in positive_signals), (
+            "Prompt must give an explicit IMMEDIATE NEXT ACTION (tool call) "
+            f"for business_cards orders (looked for: {positive_signals})."
+        )
+
+    def test_prompt_specifies_required_order_of_operations(self):
+        """v40.8.6 — the bug is workflow inversion (contact-collect
+        BEFORE tool call). Prompt must enforce: tool → price → ask
+        → contact."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        sequence_signals = [
+            "REQUIRED ORDER OF OPERATIONS",
+            "ORDER OF OPERATIONS for business_cards",
+            "CALL the tool (above). Get the price",
+            "ONLY AFTER the customer says yes",
+            "ONLY AFTER",
+        ]
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in sequence_signals), (
+            "Prompt must specify the required order (tool→price→ask→contact). "
+            f"Looked for: {sequence_signals}."
+        )
+
+    def test_prompt_lists_forbidden_workflow_inversion_patterns(self):
+        """v40.8.6 — explicit ❌ FORBIDDEN list with the verbatim
+        patterns Justin reported (post-v40.8.5 smoke). Without these,
+        DeepSeek keeps gravitating to the contact-first pattern."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # At least 2 of the 6 verbatim forbidden patterns should be in
+        # the prompt for pattern-matching.
+        forbidden = [
+            "Before I get Justin to confirm the price",
+            "So Justin can get back to you with the price",
+            "I need to grab your details first",
+            "Justin will check that and come back to you",
+            "BEFORE calling the tool",
+            "you HAVE the price",
+        ]
+        present = sum(1 for f in forbidden if f in CRAIG_SYSTEM_PROMPT)
+        assert present >= 2, (
+            f"At least 2 of {len(forbidden)} forbidden patterns should "
+            f"be explicit in prompt (found {present})."
+        )
+
     def test_prompt_forbids_pushing_laminate_unprompted(self):
         """v40.8.1 — Craig should NOT push laminate unprompted on
         business cards. Wait for the customer to mention it."""
