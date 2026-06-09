@@ -568,58 +568,79 @@ class TestV408PromptWording:
         )
 
     def test_prompt_has_explicit_what_to_say_examples_for_flyer_finishes(self):
-        """v40.8.3 — the rule alone wasn't enough to inhibit DeepSeek.
-        The prompt now includes explicit ❌ WRONG / ✓ RIGHT example
-        replies for when customers ask about flyer finishes."""
+        """v40.8.3 → v40.8.7: prompt must give Craig the safe-reply
+        wording when customer asks about flyer finishes. The v40.8.7
+        cleanup collapsed the verbose ❌WRONG/✓RIGHT block; what
+        survived is the exact-reply phrase that DeepSeek pattern-
+        matches against."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
-        # Look for the wrong/right example pattern in the finishes section.
-        assert "❌ WRONG" in CRAIG_SYSTEM_PROMPT, "Prompt should have ❌ WRONG examples"
-        assert "✓ RIGHT" in CRAIG_SYSTEM_PROMPT, "Prompt should have ✓ RIGHT examples"
-        # The flyer-specific WRONG/RIGHT block should mention silk.
-        assert "no finish options needed" in CRAIG_SYSTEM_PROMPT, (
-            "Prompt should give Craig the exact safe-reply pattern for "
-            "'what finishes do you have?' on flyers."
+        # Look for the safe-reply phrase OR the WRONG/RIGHT marker
+        # (whichever wording is current).
+        signals = [
+            "no finish options needed",
+            "no separate finish options",
+            "no finish options",
+            "no separate matte/gloss",
+            "❌ WRONG",
+            "✓ RIGHT",
+        ]
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in signals), (
+            "Prompt should give the safe-reply pattern for 'what "
+            f"finishes do you have?' on flyers. Looked for: {signals}."
         )
 
     def test_prompt_explicitly_says_no_laminate_is_supported_no_escalation(self):
-        """v40.8.4 — Justin reported (post-D3 smoke): customer says
-        '530 cards, no laminate' and Craig replies "I'll need to get
-        Justin to check that for you" instead of just calling the tool
-        with finish=uncoated. The prompt rule from v40.8.1 was there but
-        DeepSeek kept being cautious. PR 4.4 adds explicit WHAT-TO-SAY
-        examples to make it airtight."""
+        """v40.8.4 → v40.8.7: prompt must frame 'no laminate' as a valid
+        supported choice (not requiring escalation). v40.8.7 collapsed
+        the verbose examples; the shorter TOP FACT + Finishes section
+        carries the same instruction."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
-        # The explicit "valid, common, supported choice" framing
         positive_signals = [
+            # v40.8.4 wording
             "valid, common, supported choice",
-            "valid common supported choice",
             "JUST PRICE IT",
             "Do NOT escalate to Justin",
-            "Do not escalate to Justin",
             "do NOT escalate to Justin",
+            # v40.8.7 wording (short TOP FACT + Finishes section)
+            "that IS the default product",
+            "Don't push laminate",
+            "don't escalate",
+            "no finish surcharge",
+            "Do NOT escalate. Do NOT push laminate",
         ]
         assert any(s in CRAIG_SYSTEM_PROMPT for s in positive_signals), (
-            "Prompt must frame 'no laminate' as supported (not requiring "
+            "Prompt must frame 'no laminate' as supported (not "
             f"escalation). Looked for any of: {positive_signals}."
         )
 
     def test_prompt_has_no_laminate_what_to_say_examples(self):
-        """v40.8.4 — explicit ❌ WRONG / ✓ RIGHT examples for the
-        'no laminate' case. Without these the rule keeps being ignored."""
+        """v40.8.4 → v40.8.7: in v40.8.4 we baked verbatim ❌ WRONG
+        examples; v40.8.7 collapsed them into the shorter Finishes
+        section. What survives is the positive instruction (pass
+        finish='uncoated', don't escalate) which is what DeepSeek
+        actually needs."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
-        # Specific WRONG-example phrases that v40.8.4 forbids
+        # Either the explicit forbidden examples (v40.8.4 wording)
+        # OR the positive imperative (v40.8.7 wording) is acceptable.
         wrong_examples = [
             "I'll need to get Justin to check that for you",
             "Would you like me to go with one of those finishes anyway",
             "Plain unlaminated business cards aren't a standard option",
             "Most people go with soft-touch",
         ]
-        # At least 2 of the forbidden examples should be present in the
-        # ❌ WRONG list so DeepSeek pattern-matches when generating.
-        present = sum(1 for w in wrong_examples if w in CRAIG_SYSTEM_PROMPT)
-        assert present >= 2, (
-            f"Prompt should contain at least 2 explicit ❌ WRONG examples "
-            f"for 'no laminate' escalation patterns (found {present}/4)."
+        positive_imperative = [
+            "pass `finish=\"uncoated\"`",
+            "pass `finish=\\\"uncoated\\\"`",
+            "finish=\"uncoated\"",
+            "Pass `finish=\"uncoated\"`",
+            "call quote_small_format(finish=\"uncoated\")",
+        ]
+        wrong_present = sum(1 for w in wrong_examples if w in CRAIG_SYSTEM_PROMPT)
+        positive_present = any(p in CRAIG_SYSTEM_PROMPT for p in positive_imperative)
+        assert wrong_present >= 2 or positive_present, (
+            f"Prompt must either list ≥2 ❌ WRONG examples (v40.8.4 wording, "
+            f"found {wrong_present}) or contain the positive imperative "
+            f"finish='uncoated' (v40.8.7 wording)."
         )
 
     def test_top_fact_is_at_the_very_start_of_prompt(self):
@@ -637,77 +658,83 @@ class TestV408PromptWording:
         )
 
     def test_top_fact_explicitly_scoped_not_universal(self):
-        """v40.8.5 — Sebastian was explicit: the FACT must NOT extend
-        to other products. The prompt must say so EXPLICITLY so the
-        LLM doesn't generalize the unlaminated-default rule beyond
-        business cards."""
+        """v40.8.5 → v40.8.7: TOP FACT must remain scoped to
+        business_cards only. v40.8.7 shortened the wording but the
+        scoping is preserved."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
         scope_signals = [
+            # v40.8.5 wording
             "does NOT extend",
-            "does not extend",
             "ONLY about business_cards",
-            "ONLY about business cards",
-            "only to product_key=\"business_cards\"",
             "STRICTLY to product_key",
+            # v40.8.7 wording (short FACT)
+            "applies ONLY to business_cards",
+            "ONLY to business_cards",
+            "other products keep their own rules below",
+            "applies ONLY to business cards",
         ]
         assert any(s in CRAIG_SYSTEM_PROMPT for s in scope_signals), (
-            "TOP FACT must explicitly say it does NOT apply to other "
-            f"products (looked for any of: {scope_signals})."
-        )
-        # And explicitly mention some of the other products NOT covered
-        not_covered = ["flyers", "leaflets", "brochures", "NCR books",
-                       "letterheads", "compliment slips", "boards"]
-        non_covered_count = sum(1 for p in not_covered
-                                if p in CRAIG_SYSTEM_PROMPT[:2000])
-        assert non_covered_count >= 4, (
-            f"TOP FACT should name at least 4 of {not_covered} as "
-            f"NOT covered (found {non_covered_count})."
+            "TOP FACT must explicitly scope to business_cards "
+            f"(looked for any of: {scope_signals})."
         )
 
     def test_prompt_has_positive_imperative_tool_call_template(self):
-        """v40.8.6 — root-cause fix for the no-laminate workflow inversion.
-        The TOP FACT must include a POSITIVE imperative ('your NEXT action
-        is a tool call') with an explicit args template, not just a
-        negative prohibition ('don't escalate')."""
+        """v40.8.6 → v40.8.7: the v40.8.6 verbose "IMMEDIATE NEXT
+        ACTION" block was collapsed into the graded confirm rule in
+        v40.8.7. The positive direction "specs clear → CALL THE TOOL
+        DIRECTLY" is preserved (now applies to all products, not just
+        business_cards)."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
         positive_signals = [
+            # v40.8.6 verbose wording
             "YOUR IMMEDIATE NEXT ACTION",
-            "Your IMMEDIATE next action",
             "your NEXT action is a tool call",
-            "NEXT action is a tool call",
             "Tool to call: quote_small_format",
-            "Tool to call: quote_small_format",
+            # v40.8.7 graded rule wording
+            "CALL THE TOOL DIRECTLY",
+            "CALL quote_small_format directly",
+            "CALL quote_large_format directly",
+            "CALL quote_booklet directly",
+            "DIRECT TOOL CALL",
         ]
         assert any(s in CRAIG_SYSTEM_PROMPT for s in positive_signals), (
-            "Prompt must give an explicit IMMEDIATE NEXT ACTION (tool call) "
-            f"for business_cards orders (looked for: {positive_signals})."
+            "Prompt must give a positive tool-call imperative "
+            f"(looked for: {positive_signals})."
         )
 
     def test_prompt_specifies_required_order_of_operations(self):
-        """v40.8.6 — the bug is workflow inversion (contact-collect
-        BEFORE tool call). Prompt must enforce: tool → price → ask
-        → contact."""
+        """v40.8.6 → v40.8.7: the bug is workflow inversion (collect
+        contact BEFORE tool call). v40.8.7 collapsed the explicit
+        ORDER OF OPERATIONS block; what survives is the negative
+        instruction "Do NOT collect contact info before calling the
+        tool" inside the short TOP FACT."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
         sequence_signals = [
+            # v40.8.6 verbose wording
             "REQUIRED ORDER OF OPERATIONS",
-            "ORDER OF OPERATIONS for business_cards",
             "CALL the tool (above). Get the price",
-            "ONLY AFTER the customer says yes",
             "ONLY AFTER",
+            # v40.8.7 wording (in the short TOP FACT)
+            "Do NOT collect contact info before calling the tool",
+            "Do not collect contact info before calling the tool",
+            "before calling the tool",
+            "graded confirm rule applies normally",
         ]
         assert any(s in CRAIG_SYSTEM_PROMPT for s in sequence_signals), (
-            "Prompt must specify the required order (tool→price→ask→contact). "
-            f"Looked for: {sequence_signals}."
+            "Prompt must enforce the order (no contact-collect before "
+            f"tool call). Looked for: {sequence_signals}."
         )
 
     def test_prompt_lists_forbidden_workflow_inversion_patterns(self):
-        """v40.8.6 — explicit ❌ FORBIDDEN list with the verbatim
-        patterns Justin reported (post-v40.8.5 smoke). Without these,
-        DeepSeek keeps gravitating to the contact-first pattern."""
+        """v40.8.6 → v40.8.7: the v40.8.6 verbatim ❌ FORBIDDEN block
+        was collapsed in v40.8.7. The new structure delegates to the
+        graded confirm rule + the short TOP FACT, which together say
+        'specs clear → tool call, don't collect contact first'. Accept
+        either the v40.8.6 verbatim phrases OR the v40.8.7 condensed
+        instruction."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
-        # At least 2 of the 6 verbatim forbidden patterns should be in
-        # the prompt for pattern-matching.
-        forbidden = [
+        # v40.8.6 verbatim
+        forbidden_verbatim = [
             "Before I get Justin to confirm the price",
             "So Justin can get back to you with the price",
             "I need to grab your details first",
@@ -715,10 +742,19 @@ class TestV408PromptWording:
             "BEFORE calling the tool",
             "you HAVE the price",
         ]
-        present = sum(1 for f in forbidden if f in CRAIG_SYSTEM_PROMPT)
-        assert present >= 2, (
-            f"At least 2 of {len(forbidden)} forbidden patterns should "
-            f"be explicit in prompt (found {present})."
+        # v40.8.7 condensed
+        condensed_signals = [
+            "Do NOT collect contact info before calling the tool",
+            "Do not collect contact info before calling the tool",
+            "Do NOT escalate. Do NOT push laminate",
+            "before calling the tool",
+        ]
+        verbatim_present = sum(1 for f in forbidden_verbatim if f in CRAIG_SYSTEM_PROMPT)
+        condensed_present = any(s in CRAIG_SYSTEM_PROMPT for s in condensed_signals)
+        assert verbatim_present >= 2 or condensed_present, (
+            f"Prompt must inhibit contact-first workflow either by ≥2 "
+            f"verbatim v40.8.6 patterns (found {verbatim_present}) or "
+            f"by the v40.8.7 condensed instruction."
         )
 
     def test_prompt_forbids_pushing_laminate_unprompted(self):
@@ -811,4 +847,68 @@ class TestV408PromptWording:
             ctx = _build_catalog_context(db, "just-print")
         assert "corri_boards" in ctx or "Corri" in ctx, (
             "Catalog context should always include corri_boards."
+        )
+
+    def test_v40_8_7_graded_confirm_rule_present(self):
+        """v40.8.7 — the prompt must include the graded confirm rule
+        that resolves the v40.8.6 contradiction (always-confirm vs
+        tool-first). DeepSeek needs both the GENUINE AMBIGUITY framing
+        AND the DIRECT TOOL CALL counter-examples to pattern-match
+        correctly."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # 1. The graded framing exists
+        graded_signals = [
+            "GENUINE\nAMBIGUITY",
+            "GENUINE AMBIGUITY",
+            "Genuine ambiguity",
+            "When to confirm specs vs call the tool directly",
+            "Confirm specs back to the customer BEFORE the tool call ONLY when",
+        ]
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in graded_signals), (
+            f"Prompt must include the graded confirm rule "
+            f"(looked for: {graded_signals})."
+        )
+
+    def test_v40_8_7_direct_tool_call_examples_present(self):
+        """v40.8.7 — the prompt must include explicit DIRECT TOOL CALL
+        examples for unambiguous specs across all 3 quote tools so
+        DeepSeek pattern-matches and skips the confirmation step when
+        appropriate."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # At least 3 of the 4 verbatim direct-call examples should be
+        # present (one per quote tool: small_format, large_format,
+        # booklet).
+        direct_examples = [
+            "CALL quote_small_format directly",
+            "CALL quote_large_format directly",
+            "CALL quote_booklet directly",
+            "DIRECT TOOL CALL",
+        ]
+        present = sum(1 for ex in direct_examples if ex in CRAIG_SYSTEM_PROMPT)
+        assert present >= 3, (
+            f"Prompt must contain ≥3 of {direct_examples} (the per-tool "
+            f"DIRECT TOOL CALL examples). Found {present}."
+        )
+
+    def test_v40_8_7_old_always_confirm_rule_gone(self):
+        """v40.8.7 — verify the unconditional 'ALWAYS confirm the
+        specs back to the customer BEFORE calling the pricing tool'
+        rule has been removed (it was the contradiction source vs
+        TOP FACT). Replaced by the graded rule."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        old_rule = "ALWAYS confirm the specs back to the customer BEFORE calling the pricing tool"
+        assert old_rule not in CRAIG_SYSTEM_PROMPT, (
+            f"The old unconditional rule must be removed (was at line ~189 "
+            f"pre-v40.8.7). It conflicted with the TOP FACT tool-first "
+            f"imperative and caused DeepSeek inconsistency."
+        )
+
+    def test_v40_8_7_prompt_size_reduced(self):
+        """v40.8.7 — sanity check that the prompt didn't bloat further.
+        Pre-v40.8.7 was 16,208 chars; v40.8.7 target was <14,000."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        assert len(CRAIG_SYSTEM_PROMPT) < 14500, (
+            f"Prompt is {len(CRAIG_SYSTEM_PROMPT)} chars — v40.8.7 should "
+            f"have shrunk it under 14,500. Check if you accidentally "
+            f"re-added a verbose block."
         )
