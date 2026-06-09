@@ -547,6 +547,40 @@ class TestV408PromptWording:
             "off-tier qtys are OK."
         )
 
+    def test_prompt_disambiguates_silk_paper_vs_finish(self):
+        """v40.8.3 — DeepSeek hallucinates 'silk' as a finish option on
+        flyers because the catalog description says '170gsm silk paper'.
+        The prompt must explicitly disambiguate."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        signals = [
+            "silk\" is the PAPER TYPE",
+            "silk' is the PAPER TYPE",
+            '"silk" is the PAPER TYPE',
+            "Do NOT offer \"silk\"",
+            "Do not offer 'silk'",
+            "do NOT offer 'silk'",
+            "silk-coated 170gsm",
+            "NOT a finish option",
+        ]
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in signals), (
+            "Prompt must disambiguate 'silk paper' (the paper type) "
+            f"from 'silk finish' (looked for any of: {signals})."
+        )
+
+    def test_prompt_has_explicit_what_to_say_examples_for_flyer_finishes(self):
+        """v40.8.3 — the rule alone wasn't enough to inhibit DeepSeek.
+        The prompt now includes explicit ❌ WRONG / ✓ RIGHT example
+        replies for when customers ask about flyer finishes."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # Look for the wrong/right example pattern in the finishes section.
+        assert "❌ WRONG" in CRAIG_SYSTEM_PROMPT, "Prompt should have ❌ WRONG examples"
+        assert "✓ RIGHT" in CRAIG_SYSTEM_PROMPT, "Prompt should have ✓ RIGHT examples"
+        # The flyer-specific WRONG/RIGHT block should mention silk.
+        assert "no finish options needed" in CRAIG_SYSTEM_PROMPT, (
+            "Prompt should give Craig the exact safe-reply pattern for "
+            "'what finishes do you have?' on flyers."
+        )
+
     def test_prompt_forbids_pushing_laminate_unprompted(self):
         """v40.8.1 — Craig should NOT push laminate unprompted on
         business cards. Wait for the customer to mention it."""
