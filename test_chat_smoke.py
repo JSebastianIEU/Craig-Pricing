@@ -581,6 +581,47 @@ class TestV408PromptWording:
             "'what finishes do you have?' on flyers."
         )
 
+    def test_prompt_explicitly_says_no_laminate_is_supported_no_escalation(self):
+        """v40.8.4 — Justin reported (post-D3 smoke): customer says
+        '530 cards, no laminate' and Craig replies "I'll need to get
+        Justin to check that for you" instead of just calling the tool
+        with finish=uncoated. The prompt rule from v40.8.1 was there but
+        DeepSeek kept being cautious. PR 4.4 adds explicit WHAT-TO-SAY
+        examples to make it airtight."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # The explicit "valid, common, supported choice" framing
+        positive_signals = [
+            "valid, common, supported choice",
+            "valid common supported choice",
+            "JUST PRICE IT",
+            "Do NOT escalate to Justin",
+            "Do not escalate to Justin",
+            "do NOT escalate to Justin",
+        ]
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in positive_signals), (
+            "Prompt must frame 'no laminate' as supported (not requiring "
+            f"escalation). Looked for any of: {positive_signals}."
+        )
+
+    def test_prompt_has_no_laminate_what_to_say_examples(self):
+        """v40.8.4 — explicit ❌ WRONG / ✓ RIGHT examples for the
+        'no laminate' case. Without these the rule keeps being ignored."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # Specific WRONG-example phrases that v40.8.4 forbids
+        wrong_examples = [
+            "I'll need to get Justin to check that for you",
+            "Would you like me to go with one of those finishes anyway",
+            "Plain unlaminated business cards aren't a standard option",
+            "Most people go with soft-touch",
+        ]
+        # At least 2 of the forbidden examples should be present in the
+        # ❌ WRONG list so DeepSeek pattern-matches when generating.
+        present = sum(1 for w in wrong_examples if w in CRAIG_SYSTEM_PROMPT)
+        assert present >= 2, (
+            f"Prompt should contain at least 2 explicit ❌ WRONG examples "
+            f"for 'no laminate' escalation patterns (found {present}/4)."
+        )
+
     def test_prompt_forbids_pushing_laminate_unprompted(self):
         """v40.8.1 — Craig should NOT push laminate unprompted on
         business cards. Wait for the customer to mention it."""
