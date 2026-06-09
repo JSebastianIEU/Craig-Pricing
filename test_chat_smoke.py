@@ -508,6 +508,45 @@ class TestV408PromptWording:
             f"(looked for any of: {default_unlaminated_signals})."
         )
 
+    def test_prompt_forbids_asking_customer_to_round_off_tier_qty(self):
+        """v40.8.2 — Justin's conv #188 bug: customer asked for 80 booklets,
+        Craig replied "our quantities go by 25, 50, 100, 250, 500 — would
+        100 work?". That's wrong: the engine has _stack_tiers (v34) which
+        handles ANY qty by stack-billing to the nearest tier combination.
+        Craig must always pass the customer's exact qty to the tool."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # The rule should explicitly forbid asking the customer to round.
+        no_round_signals = [
+            "DO NOT ask the customer to round",
+            "Do not ask the customer to round",
+            "do not ask the customer to round",
+            "tier breakpoints, not restrictive options",
+            "stack-combining tiers",
+            "stack-bill",
+            "stack-billed",
+            "automatically handles ANY quantity",
+        ]
+        assert any(s in CRAIG_SYSTEM_PROMPT for s in no_round_signals), (
+            "Prompt should forbid asking the customer to round off-tier "
+            f"qtys (looked for any of: {no_round_signals})."
+        )
+
+    def test_catalog_context_calls_qtys_tier_breakpoints(self):
+        """v40.8.2 — _build_catalog_context should label the qty list as
+        'tier breakpoints' (with auto-stacking hint), not 'quantities'
+        (which the LLM was reading as a restrictive enum)."""
+        from llm.craig_agent import _build_catalog_context
+        from db import db_session
+        with db_session() as db:
+            ctx = _build_catalog_context(db, "just-print")
+        assert "tier breakpoints" in ctx, (
+            "Catalog context should say 'tier breakpoints', not just 'quantities'."
+        )
+        assert "stack" in ctx.lower(), (
+            "Catalog context should mention auto-stacking so the LLM knows "
+            "off-tier qtys are OK."
+        )
+
     def test_prompt_forbids_pushing_laminate_unprompted(self):
         """v40.8.1 — Craig should NOT push laminate unprompted on
         business cards. Wait for the customer to mention it."""
