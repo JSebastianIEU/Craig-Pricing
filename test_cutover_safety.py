@@ -297,3 +297,53 @@ class TestV36DoesNotRevertTieredBoards:
             # we don't pollute test ordering.
             from scripts.v38_widget_fixes import migrate as v38_migrate
             v38_migrate()
+
+
+class TestV2DoesNotRevertTieredBoards:
+    """v40.8.13 — protects against v2_multitenancy_pricing.py reverting
+    operator-set 'tiered' pricing_strategy back to category-inferred
+    default. This was the OTHER half of the board-revert bug — v36's
+    fix in v40.8.11 alone wasn't enough because v2 runs first and
+    flips tiered → bulk_break, then v36 flips bulk_break → per_sheet."""
+
+    def test_v2_skips_products_already_on_tiered(self):
+        """If corri_boards is on `tiered` (post-D3 state), v2 must
+        leave it alone — NOT reset to category-inferred 'bulk_break'."""
+        from db import db_session
+        from db.models import Product
+        from scripts.v2_multitenancy_pricing import migrate as v2_migrate
+
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="corri_boards",
+            ).first()
+            if p is None:
+                import pytest
+                pytest.skip("corri_boards missing")
+            orig_strategy = p.pricing_strategy
+            # Put it in the post-D3 state.
+            p.pricing_strategy = "tiered"
+            db.commit()
+
+        try:
+            v2_migrate()
+            with db_session() as db:
+                p2 = db.query(Product).filter_by(
+                    organization_slug="just-print", key="corri_boards",
+                ).first()
+                assert p2.pricing_strategy == "tiered", (
+                    f"v2_multitenancy_pricing reverted strategy from "
+                    f"'tiered' to {p2.pricing_strategy!r} — this is the "
+                    f"2026-06-10 board-revert bug (paired with v36)."
+                )
+        finally:
+            with db_session() as db:
+                p3 = db.query(Product).filter_by(
+                    organization_slug="just-print", key="corri_boards",
+                ).first()
+                p3.pricing_strategy = orig_strategy
+                db.commit()
+            # v2 also seeds business_rules-adjacent things; restore via
+            # v38 (the canonical content for TestV38PromptContracts).
+            from scripts.v38_widget_fixes import migrate as v38_migrate
+            v38_migrate()
