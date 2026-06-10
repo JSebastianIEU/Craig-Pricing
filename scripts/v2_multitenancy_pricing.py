@@ -131,7 +131,21 @@ def migrate() -> None:
             "SELECT id, category, pricing_strategy FROM products"
         )).fetchall()
         for pid, category, current in rows:
-            if not current or current == "tiered":
+            # v40.8.13 — only override pricing_strategy when it's NULL/empty
+            # (genuine bootstrap state). The original `current == "tiered"`
+            # clause was paired with the DB DEFAULT 'tiered' (line 105
+            # above) — v2 wanted to "upgrade" products that had the column
+            # default to their inferred-from-category strategy. But that
+            # clause now overrides ANY operator-set 'tiered' value (the
+            # v40.7 board pricing model uses 'tiered' on corri / foamex /
+            # dibond boards). Combined with v36's same-bug safelist
+            # (fixed in v40.8.11), this caused board strategy to silently
+            # revert on every container boot: v2 reverted tiered →
+            # bulk_break, then v36 reverted bulk_break → per_sheet.
+            #
+            # New behavior: leave 'tiered' alone. Only set inferred
+            # strategy if `current` is NULL or empty string.
+            if not current:
                 inferred = infer_pricing_strategy(category)
                 if current != inferred:
                     conn.execute(
