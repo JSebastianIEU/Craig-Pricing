@@ -1144,15 +1144,47 @@ class TestV408PromptWording:
                 p.pricing_strategy = orig_strat
                 db.commit()
 
+    def test_v40_8_12_booklet_card_cover_default_unlaminated_rule(self):
+        """v40.8.12 — extend the 'default unlaminated' rule from
+        business cards to booklet card covers. Justin reported (post-
+        v40.8.11 smoke) that Craig asked 'laminated or unlaminated?'
+        when the customer said 'card cover' — same push-laminate
+        anti-pattern we forbid for cards. Booklets have 3 cover_type
+        values: self_cover, card_cover (UNLAMINATED, default),
+        card_cover_lam (laminated). Customer saying 'card cover' must
+        route to cover_type='card_cover', not trigger a clarification."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # The rule body
+        booklet_rule_signals = [
+            "default unlaminated",
+            "card_cover\" (300gsm card cover, UNLAMINATED",
+            "cover_type=\"card_cover\"",
+            "Do NOT ask \"laminated or unlaminated?\"",
+        ]
+        # At least 2 of the 4 markers should be in the prompt.
+        present = sum(1 for s in booklet_rule_signals if s in CRAIG_SYSTEM_PROMPT)
+        assert present >= 2, (
+            f"Prompt must include the booklet card-cover default-unlaminated "
+            f"rule. Found {present}/{len(booklet_rule_signals)} markers."
+        )
+        # And the explicit ❌ WRONG / ✓ RIGHT pattern.
+        assert (
+            "would you like that laminated or unlaminated" in CRAIG_SYSTEM_PROMPT
+            or "would you like that laminated" in CRAIG_SYSTEM_PROMPT
+        ), (
+            "Prompt should contain the verbatim ❌ WRONG example showing "
+            "Craig pushing the laminate question on booklets."
+        )
+
     def test_v40_8_7_prompt_size_reduced(self):
         """v40.8.7 — sanity check that the prompt didn't bloat further.
         Pre-v40.8.7 was 16,208 chars; v40.8.7 shrunk to 13,454.
-        v40.8.9 added ~1,400 chars of board examples + anti-pattern
-        warning (necessary to fix Justin's board escalation bug).
-        Guardrail raised to 15,500 to accommodate."""
+        v40.8.9 added ~1,400 chars (board examples + anti-pattern).
+        v40.8.12 added ~600 chars (booklet card-cover default rule).
+        Guardrail raised to 16,500."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
-        assert len(CRAIG_SYSTEM_PROMPT) < 15500, (
+        assert len(CRAIG_SYSTEM_PROMPT) < 16500, (
             f"Prompt is {len(CRAIG_SYSTEM_PROMPT)} chars — should stay "
-            f"under 15,500. Check if you accidentally re-added a "
+            f"under 16,500. Check if you accidentally re-added a "
             f"verbose block."
         )
