@@ -1800,12 +1800,38 @@ def quote_large_format(
             product_name=product.name,
         )
 
-    if quantity >= (product.bulk_threshold or 1):
+    # v41.2 — bulk pricing only applies when a bulk_price is actually
+    # configured. The old condition `quantity >= (bulk_threshold or 1)`
+    # selected product.bulk_price whenever the threshold was unset, which
+    # made a pure `per_unit` product (only unit_price configured) crash on
+    # `None * quantity`. Now: bulk_price set + (no threshold OR qty at/over
+    # threshold) → bulk rate (preserves the historical always-bulk behavior
+    # for thresholdless bulk products); otherwise the plain unit price.
+    if product.bulk_price is not None and (
+        not product.bulk_threshold or quantity >= product.bulk_threshold
+    ):
         unit_price = product.bulk_price
-        applied = [f"Bulk pricing applied ({quantity} >= {product.bulk_threshold})"]
+        applied = (
+            [f"Bulk pricing applied ({quantity} >= {product.bulk_threshold})"]
+            if product.bulk_threshold else []
+        )
     else:
         unit_price = product.unit_price
         applied = []
+
+    if unit_price is None:
+        return EscalationResult(
+            reason=(
+                f"{product.key} has no unit_price configured — cannot "
+                "price on the per-unit path."
+            ),
+            product_name=product.name,
+            manual_review=True,
+            message=(
+                "This product is missing its price configuration — "
+                "Justin to confirm the price."
+            ),
+        )
 
     total_ex = round(unit_price * quantity, 2)
 
