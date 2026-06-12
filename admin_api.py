@@ -334,6 +334,13 @@ def _product_to_dict(p: Product, tiers: list[PriceTier]) -> dict[str, Any]:
         # quantity, the engine returns EscalationResult before pricing.
         "min_order_value_eur": getattr(p, "min_order_value_eur", None),
         "max_qty_for_auto_quote": getattr(p, "max_qty_for_auto_quote", None),
+        # v41.11 — sizes + finishes were ALWAYS on the model but never
+        # serialized, so the dashboard showed None for products the
+        # engine actively validates against (e.g. brochures reject
+        # finish="silk" because finishes=['gloss','matte']). This display
+        # gap also sent the v41.7 audit down a wrong path.
+        "sizes": getattr(p, "sizes", None),
+        "finishes": getattr(p, "finishes", None),
         "tiers": [
             {"id": t.id, "spec_key": t.spec_key, "quantity": t.quantity, "price": t.price}
             for t in tiers
