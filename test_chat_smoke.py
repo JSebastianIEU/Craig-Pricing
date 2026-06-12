@@ -1211,22 +1211,30 @@ class TestV408PromptWording:
             "extractor must map '3-part' → triplicate."
         )
 
-    def test_v40_8_14_premature_artwork_upload_guard_present(self):
-        """v40.8.14 — Justin's NCR test: customer said 'don't have
-        artwork yet', Craig replied 'send your artwork over
-        [ARTWORK_UPLOAD]' with no other option. The guard replaces a
-        premature [ARTWORK_UPLOAD] (when customer_has_own_artwork is
-        None) with [ARTWORK_CHOICE] so the customer sees the 3 buttons."""
+    def test_v40_8_15_unified_artwork_choice_gate_covers_prose_and_upload(self):
+        """v40.8.15 — the adversarial smoke showed the v40.8.14 guard
+        only caught a premature [ARTWORK_UPLOAD], but Craig also
+        improvised PLAIN TEXT about the design service ('we've got a
+        designer, €65') with no marker, still removing the 3 buttons.
+        The unified gate must cover BOTH: spurious upload marker AND
+        artwork/design prose, while still suppressing pure spec-confirm
+        (no artwork mention)."""
         import inspect
         from llm.craig_agent import chat_with_craig
         src = inspect.getsource(chat_with_craig)
-        # The guard must exist and reference both markers + the None state
-        assert "REPLACED premature [ARTWORK_UPLOAD]" in src, (
-            "The premature-upload guard (v40.8.14) must be present in "
-            "chat_with_craig."
+        # The unified gate must detect artwork mention in prose.
+        assert "_reply_touches_artwork" in src, (
+            "The unified artwork gate (v40.8.15) must compute "
+            "_reply_touches_artwork to catch design-service prose."
         )
-        assert "premature-upload guard" in src or "v40.8.14" in src, (
-            "The guard block should be documented."
+        # It must still keep the spec-confirm suppression path.
+        assert "SUPPRESSED [ARTWORK_CHOICE]" in src, (
+            "The gate must still suppress on pure spec-confirm (no "
+            "artwork mention)."
+        )
+        # And it must handle the premature-upload (case c) by stripping.
+        assert 'replace("[ARTWORK_UPLOAD]", "")' in src or "premature upload" in src, (
+            "The gate must handle the premature [ARTWORK_UPLOAD] case."
         )
 
     def test_v40_8_7_prompt_size_reduced(self):
