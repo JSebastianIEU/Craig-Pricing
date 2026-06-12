@@ -136,6 +136,11 @@ class QuoteLargeFormatRequest(BaseModel):
     width_mm: int | None = None
     height_mm: int | None = None
     area_sqm: float | None = None
+    # v41.4 — standard size for tiered-by-size products (boards, posters):
+    # A4/A3/A2/A1/A0/2440x1220/1220x1220. The engine and the LLM tool have
+    # supported this since v40.7; the HTTP surface never got it, so boards
+    # and posters couldn't be quoted by size through the raw API at all.
+    size: str | None = None
 
 
 class QuoteBookletRequest(BaseModel):
@@ -305,6 +310,7 @@ def api_large_format(req: QuoteLargeFormatRequest, db: Session = Depends(get_db)
         width_mm=req.width_mm,
         height_mm=req.height_mm,
         area_sqm=req.area_sqm,
+        size=req.size,
     )
     return result.to_dict()
 

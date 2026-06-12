@@ -579,10 +579,16 @@ def _build_description(quote, product=None) -> str:
             w = specs.get("width_mm")
             h = specs.get("height_mm")
             area = specs.get("area_sqm")
+            std_size = specs.get("size")
             if w and h:
                 spec_extras.append(f"Size: {w} × {h} mm")
             elif area:
                 spec_extras.append(f"Area: {area} m²")
+            elif std_size:
+                # v41.4 — standard size on tiered-by-size products (boards,
+                # posters). Justin: catalog descriptions carry SPECS only,
+                # so the chosen size must come from the quote itself.
+                spec_extras.append(f"Size: {str(std_size).upper()}")
             if spec_extras:
                 lines.append(" · ".join(spec_extras))
             return "<br/>".join(lines)

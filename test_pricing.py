@@ -864,6 +864,90 @@ class TestSanityMaxUnitPrice:
 
 
 # =============================================================================
+# v41.4 — `size` on the HTTP quote API + "Size:" line on the PDF
+# =============================================================================
+
+
+def test_large_format_api_accepts_standard_size():
+    """v41.4 — the engine + LLM tool have supported `size` (tiered-by-size
+    boards/posters) since v40.7, but the HTTP endpoint never exposed it,
+    so the raw API could not quote those products at all. Self-contained:
+    creates a temp tiered product + size tiers, quotes via the API,
+    cleans up."""
+    from db import db_session
+    from db.models import Product, PriceTier
+
+    key = "test_sizeparam_boards"
+    with db_session() as db:
+        # Clean slate in case a previous run died mid-test.
+        old = db.query(Product).filter_by(
+            organization_slug="just-print", key=key,
+        ).first()
+        if old:
+            db.query(PriceTier).filter_by(product_id=old.id).delete()
+            db.delete(old)
+            db.commit()
+        p = Product(
+            organization_slug="just-print", key=key,
+            name="Size-param test boards", category="large_format",
+            pricing_strategy="tiered",
+        )
+        db.add(p)
+        db.flush()
+        db.add(PriceTier(product_id=p.id, organization_slug="just-print",
+                         spec_key="A3", quantity=5, price=70.0))
+        db.commit()
+        pid = p.id
+
+    try:
+        r = client.post("/quote/large-format", json={
+            "product_key": key, "quantity": 5, "size": "A3",
+        })
+        data = r.json()
+        assert data.get("success") is True, f"expected quote, got {data}"
+        assert data["base_price"] == 70.0
+        # Without size, the tiered path must NOT price — it escalates
+        # asking for the size.
+        r2 = client.post("/quote/large-format", json={
+            "product_key": key, "quantity": 5,
+        })
+        assert r2.json().get("success") is not True
+    finally:
+        with db_session() as db:
+            db.query(PriceTier).filter_by(product_id=pid).delete()
+            db.query(Product).filter_by(id=pid).delete()
+            db.commit()
+
+
+def test_pdf_build_description_renders_standard_size():
+    """v41.4 — Justin: catalog descriptions carry SPECS only, so the
+    chosen standard size must come from the quote itself. The PDF line
+    item must render `specs.size` as "Size: A1" (uppercased), alongside
+    the existing custom-dimension rendering."""
+    from types import SimpleNamespace
+    from pdf_generator import _build_description
+
+    product = SimpleNamespace(
+        name="Corri Boards",
+        description="Printed full colour one side on vinyl, matt laminated "
+                    "and mounted on 5mm corriboard.",
+    )
+    quote = SimpleNamespace(
+        specs={"size": "a1", "quantity": 5}, product_key="corri_boards",
+    )
+    out = _build_description(quote, product=product)
+    assert "Size: A1" in out, f"standard size missing from PDF line: {out!r}"
+    assert "corriboard" in out  # description still present
+
+    # Custom dimensions still take precedence over (absent) standard size.
+    quote2 = SimpleNamespace(
+        specs={"width_mm": 800, "height_mm": 600}, product_key="corri_boards",
+    )
+    out2 = _build_description(quote2, product=product)
+    assert "Size: 800 × 600 mm" in out2
+
+
+# =============================================================================
 # RUN
 # =============================================================================
 
