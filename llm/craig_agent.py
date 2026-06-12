@@ -3104,28 +3104,12 @@ def chat_with_craig(
                 f"marker_only={_reply_touches_artwork}).",
                 flush=True,
             )
-        elif _any_quote_exists or _reply_touches_artwork:
-            # (b)/(c)/(d) — replace whatever the LLM said with the
-            # canonical NEUTRAL 3-button choice. Covers: a prior
-            # product quote exists but this reply has no price;
-            # a premature [ARTWORK_UPLOAD]; OR Craig improvising
-            # artwork/design prose (incl. the €65 design upsell)
-            # without a marker. Replacing wipes any pushy design-
-            # service prose so the customer just gets a clean choice.
-            #
-            # v41.6 — ANTI-HIJACK carve-out. The Product Test Report
-            # reproduced a deadlock (letterheads, both runs): the raw
-            # reply asked the missing SPEC ("single or double sided?")
-            # while also touching the artwork topic — replacing it wiped
-            # the spec question, the customer's answer ("single sided")
-            # isn't an artwork answer, and the gate replaced the next
-            # reply too. Pre-quote spec questions must pass through:
-            # specs first → price → THEN the buttons via case (a).
-            # Design-service upsell prose (the v40.8.15 bug class) is
-            # still always replaced. After a quote exists, a spec
-            # question only passes if the buttons were already shown in
-            # the previous turn (no information is lost — the widget
-            # keeps them on screen).
+        elif _any_quote_exists:
+            # (b) — a price was shown on a PRIOR turn but not this one.
+            # The customer has seen a number, so now surface the artwork
+            # choice. v41.6 anti-hijack: if this reply is still gathering
+            # specs and the buttons were already shown last turn, keep
+            # the spec question (the widget keeps the buttons on screen).
             _prev_assistant = ""
             for _pm in reversed(conversation.messages or []):
                 if isinstance(_pm, dict) and _pm.get("role") == "assistant":
@@ -3135,14 +3119,12 @@ def chat_with_craig(
             if (
                 _reply_asks_spec_question(final_reply)
                 and not _reply_is_design_upsell(final_reply)
-                and (not _any_quote_exists or _choice_already_shown)
+                and _choice_already_shown
             ):
                 final_reply = final_reply.replace("[ARTWORK_UPLOAD]", "").rstrip()
                 print(
                     f"[craig] v41.6 ANTI-HIJACK: kept spec question on conv "
-                    f"{conversation.id} instead of replacing with "
-                    f"[ARTWORK_CHOICE] (pre-quote spec gathering / choice "
-                    f"already shown).",
+                    f"{conversation.id} (post-quote, buttons already shown).",
                     flush=True,
                 )
             else:
@@ -3153,10 +3135,45 @@ def chat_with_craig(
                 )
                 print(
                     f"[craig] EMITTED [ARTWORK_CHOICE] on conv "
-                    f"{conversation.id} (prior quote / artwork mention / "
-                    f"premature upload — v40.8.15).",
+                    f"{conversation.id} (prior quote, no price this turn — "
+                    f"v40.8.15).",
                     flush=True,
                 )
+        elif _reply_is_design_upsell(final_reply):
+            # (d) — NO quote yet, but Craig is pushing the €65 design
+            # service in prose (the v40.8.15 bug: customer said "don't
+            # have artwork yet", Craig upsold design and removed the
+            # buttons). Replace with the neutral choice so the customer
+            # isn't upsold before they've even seen a price.
+            final_reply = (
+                "No problem 👍 Do you have your own print-ready artwork, "
+                "would you like our design service, or will you send the "
+                "artwork on later?\n\n[ARTWORK_CHOICE]"
+            )
+            print(
+                f"[craig] EMITTED [ARTWORK_CHOICE] on conv "
+                f"{conversation.id} (pre-quote design-service upsell — "
+                f"v40.8.15).",
+                flush=True,
+            )
+        elif _reply_touches_artwork:
+            # (c)/neutral — NO quote yet, NOT an upsell, but the reply
+            # mentions artwork (e.g. "what size, and do you have artwork
+            # ready?"). v41.9 — do NOT force [ARTWORK_CHOICE] here:
+            # emitting the buttons before any price is premature, and if
+            # the customer answers a SPEC (dimensions/qty) instead of the
+            # artwork question, the old gate re-fired every turn →
+            # deadlock (per-sqm window graphics never reached a price).
+            # Just strip any premature [ARTWORK_UPLOAD] and let the reply
+            # (which is still gathering specs) through. The buttons appear
+            # once a real price exists (case a).
+            final_reply = final_reply.replace("[ARTWORK_UPLOAD]", "").rstrip()
+            print(
+                f"[craig] v41.9 NEUTRAL ARTWORK MENTION: let through on conv "
+                f"{conversation.id} (no quote, no upsell — specs first, "
+                f"buttons after price).",
+                flush=True,
+            )
         else:
             # (e) — no price, no artwork mention. It's a spec-confirm
             # ("just to confirm: ... ?"), exactly what Rule 3 calls for.
