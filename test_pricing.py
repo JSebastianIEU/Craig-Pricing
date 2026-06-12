@@ -189,6 +189,40 @@ def test_ncr_a4_20_triplicate():
     assert data["final_price_ex_vat"] == 374.00  # 340 * 1.10
 
 
+def test_negative_quantity_rejected_small_format():
+    """v41.1 — Justin's bug: the quote API must reject negative / zero
+    quantities (Pydantic Field(gt=0)) instead of computing a negative
+    price."""
+    for bad in (-50, 0):
+        r = client.post("/quote/small-format", json={
+            "product_key": "business_cards", "quantity": bad, "finish": "matte",
+        })
+        assert r.status_code == 422, f"quantity={bad} must 422, got {r.status_code}"
+
+
+def test_negative_quantity_rejected_large_format():
+    r = client.post("/quote/large-format", json={
+        "product_key": "vinyl_labels", "quantity": -5,
+        "width_mm": 100, "height_mm": 100,
+    })
+    assert r.status_code == 422
+
+
+def test_negative_quantity_and_pages_rejected_booklet():
+    # negative quantity
+    r = client.post("/quote/booklet", json={
+        "format": "a5", "binding": "saddle_stitch", "pages": 16,
+        "cover_type": "self_cover", "quantity": -5,
+    })
+    assert r.status_code == 422
+    # negative pages
+    r2 = client.post("/quote/booklet", json={
+        "format": "a5", "binding": "saddle_stitch", "pages": -16,
+        "cover_type": "self_cover", "quantity": 50,
+    })
+    assert r2.status_code == 422
+
+
 def test_letterheads_250():
     """250 letterheads @ €55/100 = €137.50."""
     r = client.post("/quote/small-format", json={

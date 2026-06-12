@@ -118,7 +118,7 @@ class ChatRequest(BaseModel):
 
 class QuoteSmallFormatRequest(BaseModel):
     product_key: str
-    quantity: int
+    quantity: int = Field(gt=0)  # reject 0 / negative — no negative-price quotes
     double_sided: bool = False
     finish: Optional[str] = None
     needs_artwork: bool = False
@@ -127,7 +127,7 @@ class QuoteSmallFormatRequest(BaseModel):
 
 class QuoteLargeFormatRequest(BaseModel):
     product_key: str
-    quantity: int
+    quantity: int = Field(gt=0)  # reject 0 / negative
     needs_artwork: bool = False
     artwork_hours: float = 0.0
     # v36 — dimensions for per-sq/m + per-sheet products. Optional;
@@ -141,9 +141,9 @@ class QuoteLargeFormatRequest(BaseModel):
 class QuoteBookletRequest(BaseModel):
     format: str
     binding: str
-    pages: int
+    pages: int = Field(gt=0)  # reject 0 / negative
     cover_type: str
-    quantity: int
+    quantity: int = Field(gt=0)  # reject 0 / negative
     needs_artwork: bool = False
     artwork_hours: float = 0.0
 
