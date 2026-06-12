@@ -499,6 +499,19 @@ _ADDITIVE_INTENT_RX = re.compile(
     r"\b(also|as\s+well|aswell|plus|both|too|another|add|in\s+addition)\b",
     re.IGNORECASE,
 )
+# v41.12b — cross-product mind-changes. Posters' papers (and boards'
+# substrates) are SEPARATE products, so "190gsm… actually the matt
+# laminated ones" creates the new quote under a DIFFERENT product_key and
+# the same-product rule misses it (verified live: JP-0493 + JP-0494 both
+# stayed pending). Replacement language supersedes the MOST RECENT older
+# pending quote — the line being replaced is virtually always the latest;
+# earlier multi-item lines stay untouched.
+_REPLACEMENT_INTENT_RX = re.compile(
+    r"\b(actually|instead|rather|on second thought|scrap (?:that|it)|"
+    r"forget (?:that|the)|change (?:it|that|them|to)|switch (?:it|to)|"
+    r"make (?:it|them))\b",
+    re.IGNORECASE,
+)
 
 
 def _supersede_older_pending_quotes(
@@ -509,30 +522,44 @@ def _supersede_older_pending_quotes(
     keep_quote_id: int,
     latest_user_message: str | None,
 ) -> int:
-    """Mark older pending quotes of the SAME product in the SAME
-    conversation as 'superseded' (changed-mind), keeping `keep_quote_id`.
-    Skipped entirely when the customer's latest message reads additive.
+    """Changed-mind guard for the multi-quote PDF. Two rules, both
+    skipped when the customer's latest message reads ADDITIVE
+    ("also/both/as well" — they genuinely want both variants):
+
+    1. SAME product_key → all older pending rows superseded (a re-spec
+       of the same product is always a replacement).
+    2. DIFFERENT product_key + REPLACEMENT language ("actually/instead/
+       make them…") → only the MOST RECENT older pending row is
+       superseded (that's the line being replaced; earlier multi-item
+       lines stay).
+
     Returns how many rows were superseded."""
     if not product_key:
         return 0
     if _ADDITIVE_INTENT_RX.search(latest_user_message or ""):
         return 0
-    olders = (
+    pending = (
         db.query(Quote)
         .filter_by(
             conversation_id=conversation_id,
             organization_slug=organization_slug,
-            product_key=product_key,
             status="pending_approval",
         )
         .filter(Quote.id != keep_quote_id)
+        .order_by(Quote.created_at.desc(), Quote.id.desc())
         .all()
     )
-    for o in olders:
-        o.status = "superseded"
-    if olders:
+    same_product = [o for o in pending if o.product_key == product_key]
+    if same_product:
+        for o in same_product:
+            o.status = "superseded"
         db.flush()
-    return len(olders)
+        return len(same_product)
+    if pending and _REPLACEMENT_INTENT_RX.search(latest_user_message or ""):
+        pending[0].status = "superseded"
+        db.flush()
+        return 1
+    return 0
 
 
 # Contact-info sniffers. LLMs sometimes claim "I've saved your details" without
