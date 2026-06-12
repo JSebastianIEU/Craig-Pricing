@@ -2744,69 +2744,77 @@ def chat_with_craig(
                 )
                 final_reply = kept[0]
 
-    # v40.8.14 — premature-upload guard. The LLM sometimes emits
-    # [ARTWORK_UPLOAD] on its own when the customer hasn't yet told us
-    # whether they HAVE artwork (customer_has_own_artwork is None). That
-    # is illogical — you can't ask someone to upload artwork before
-    # they've said they have any. It traps the customer in an upload-
-    # only flow with no "design service" / "send later" buttons.
+    # v38.7 + v40.8.14 — [ARTWORK_CHOICE] auto-emit (UNIFIED gate).
     #
-    # Reported by Justin (NCR docket-books test, conv 380): customer
-    # said "don't have artwork yet", Craig replied "send your artwork
-    # over [ARTWORK_UPLOAD]" with no other option. Replace that with
-    # the 3-button artwork choice so the customer picks first.
+    # When the customer hasn't yet chosen an artwork option
+    # (customer_has_own_artwork is None), the widget must show the
+    # 3-button artwork choice (have own / send later / design service)
+    # whenever Craig touches the artwork topic. There are several ways
+    # Craig lands here, and historically each leaked a different bug:
     #
-    # The legitimate [ARTWORK_UPLOAD] gates downstream (Phase F/G) all
-    # require customer_has_own_artwork is True, so this only fires on
-    # the spurious LLM-emitted marker.
-    if (
-        (channel or "").lower() in ("web", "")
-        and conversation.customer_has_own_artwork is None
-        and "[ARTWORK_UPLOAD]" in final_reply
-        and "[ARTWORK_CHOICE]" not in final_reply
-    ):
-        final_reply = (
-            "No problem 👍 Do you have your own print-ready artwork, "
-            "would you like our design service, or will you send the "
-            "artwork on later?\n\n[ARTWORK_CHOICE]"
-        )
-        print(
-            f"[craig] v40.8.14: REPLACED premature [ARTWORK_UPLOAD] with "
-            f"[ARTWORK_CHOICE] on conv {conversation.id} — customer "
-            f"hasn't chosen an artwork option yet.",
-            flush=True,
-        )
-
-    # v38.7 — [ARTWORK_CHOICE] auto-emit. Restructured out of the
-    # spec-recap trim block above, where it was previously nested
-    # inside `if not _reply_has_price`. That nesting was the root
-    # cause of the production bug: when the LLM's reply ALREADY had
-    # a price (€), the outer block was skipped, the [ARTWORK_CHOICE]
-    # marker never fired, and the downstream [ARTWORK_UPLOAD] gate
-    # took over — trapping customers in an upload-only flow with no
-    # "design service" / "send later" buttons. Symptom: customer
-    # priced 100 vinyl labels at €13.84, widget showed only the
-    # upload area and refused to submit the form. Reported May 13.
+    #   (a) Craig gives a PRICE this turn → append [ARTWORK_CHOICE]
+    #       after the price so the customer sees the number first
+    #       (v38.7 — reported May 13, vinyl labels trapped upload-only).
+    #   (b) A price was given in a PRIOR turn → replace with the choice
+    #       prompt (v38.7).
+    #   (c) Craig emits a premature [ARTWORK_UPLOAD] (you can't ask to
+    #       upload artwork before the customer says they have any) →
+    #       replace with choice (v40.8.14, NCR docket-books conv 380).
+    #   (d) Craig improvises PLAIN TEXT about artwork/design — e.g.
+    #       "we've got a designer, it's €65 + VAT" — with NO marker →
+    #       replace with choice. This was the v40.8.14 follow-up bug:
+    #       customer said "don't have artwork yet" (an answer the
+    #       sniffer can't classify), so customer_has_own_artwork stayed
+    #       None and Craig upsold the design service in prose, removing
+    #       the buttons. Found by the adversarial smoke run.
+    #   (e) Craig is doing a PURE spec-confirm ("just to confirm: 100
+    #       cards, single sided, matte?") with NO artwork mention →
+    #       SUPPRESS, let it through (Rule 3 spec-confirm).
     #
-    # New behaviour: fire [ARTWORK_CHOICE] whenever artwork hasn't
-    # been answered, web channel, the marker isn't already present,
-    # and EITHER (a) this turn has a price OR (b) a prior quote
-    # exists. If neither, suppress (LLM is doing spec-confirm).
+    # The signal separating (d) from (e): does the reply mention
+    # artwork / design at all? If yes → the customer needs the buttons.
+    # If no → it's a spec-confirm, leave the LLM's text alone.
+    #
+    # NOTE: the entry condition deliberately does NOT exclude
+    # [ARTWORK_UPLOAD] (unlike the old v38.7 gate) — case (c) needs to
+    # catch and rewrite the spurious upload marker. The legitimate
+    # downstream [ARTWORK_UPLOAD] gates (Phase F/G) all require
+    # customer_has_own_artwork is True, so they never collide with this.
     if (
         (channel or "").lower() in ("web", "")
         and conversation.customer_has_own_artwork is None
         and "[ARTWORK_CHOICE]" not in final_reply
-        and "[ARTWORK_UPLOAD]" not in final_reply
     ):
         # v38.3 — `_had_prior_quote` is defined later in this fn,
         # so compute the equivalent inline using `existing_quotes`.
         _any_quote_exists = bool(quote_generated or existing_quotes)
-        if _reply_has_price:
-            # Append the artwork-choice marker to the price reply
-            # so the customer sees the number FIRST, then picks
-            # how to proceed (own artwork / design service / later).
+        _reply_lower = final_reply.lower()
+        _reply_touches_artwork = (
+            "[artwork_upload]" in _reply_lower
+            or "artwork" in _reply_lower
+            or "design service" in _reply_lower
+            or "design help" in _reply_lower
+            or "designer" in _reply_lower
+            or "design team" in _reply_lower
+            or "design work" in _reply_lower
+            or "print-ready" in _reply_lower
+            or "print ready" in _reply_lower
+        )
+        # IMPORTANT: `_reply_has_price` is just "€ appears in the reply",
+        # which is ALSO true when Craig merely mentions the €65 design
+        # service in prose. So the price-first append (case a) must
+        # additionally require a real PRODUCT quote (this turn or a
+        # prior one). Otherwise the €65-design-upsell prose would be
+        # treated as a product price and kept, when we actually want to
+        # strip that prose and show the neutral 3-button choice.
+        if _any_quote_exists and _reply_has_price:
+            # (a) Real product price shown → append the artwork-choice
+            # marker AFTER it so the customer sees the number first.
+            # Strip any spurious [ARTWORK_UPLOAD] (can't upload before
+            # choosing).
+            final_reply = final_reply.replace("[ARTWORK_UPLOAD]", "").rstrip()
             final_reply = (
-                final_reply.rstrip()
+                final_reply
                 + "\n\nQuick one before I wrap the full quote 👇 "
                 "Do you have your own print-ready artwork, or would "
                 "you like our design service (€65 ex VAT for one "
@@ -2817,28 +2825,33 @@ def chat_with_craig(
                 f"{conversation.id} (v38.7 — price-first flow).",
                 flush=True,
             )
-        elif _any_quote_exists:
-            # A price was given in a prior turn — replace with the
-            # canned artwork choice so the widget renders buttons.
+        elif _any_quote_exists or _reply_touches_artwork:
+            # (b)/(c)/(d) — replace whatever the LLM said with the
+            # canonical NEUTRAL 3-button choice. Covers: a prior
+            # product quote exists but this reply has no price;
+            # a premature [ARTWORK_UPLOAD]; OR Craig improvising
+            # artwork/design prose (incl. the €65 design upsell)
+            # without a marker. Replacing wipes any pushy design-
+            # service prose so the customer just gets a clean choice.
             final_reply = (
-                "Quick question before I price it 👇 Do you have your "
-                "own print-ready artwork, or would you like our design "
-                "service?\n\n[ARTWORK_CHOICE]"
+                "No problem 👍 Do you have your own print-ready artwork, "
+                "would you like our design service, or will you send the "
+                "artwork on later?\n\n[ARTWORK_CHOICE]"
             )
             print(
                 f"[craig] EMITTED [ARTWORK_CHOICE] on conv "
-                f"{conversation.id} (prior quote exists).",
+                f"{conversation.id} (prior quote / artwork mention / "
+                f"premature upload — v40.8.15).",
                 flush=True,
             )
         else:
-            # No price yet anywhere in the conversation — don't
-            # clobber whatever the LLM said. It's probably a spec
-            # confirmation ("just to confirm: ... ?") which is
-            # exactly what Rule 3 calls for. Let it through.
+            # (e) — no price, no artwork mention. It's a spec-confirm
+            # ("just to confirm: ... ?"), exactly what Rule 3 calls for.
+            # Let the LLM's text through unchanged.
             print(
                 f"[craig] SUPPRESSED [ARTWORK_CHOICE] auto-emit on conv "
-                f"{conversation.id} — no price yet, letting LLM's "
-                f"spec-confirm pass through (v38.7 — price-first flow).",
+                f"{conversation.id} — no price, no artwork mention "
+                f"(spec-confirm pass-through).",
                 flush=True,
             )
 
