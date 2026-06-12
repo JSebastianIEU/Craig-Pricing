@@ -281,6 +281,12 @@ TYPE**, NOT a finish option. Don't offer "silk" as a finish.
 
 - **Boards (corri / foamex / dibond)**: NO finish question — they come matt laminated by default.
 
+- **Posters**: sizes A2 / A1 / A0 only. Three paper options, each its own product: 190gsm photo
+  paper (the standard — default when the customer doesn't mind), 220gsm matt lamination, and
+  220gsm gloss lamination (both 220gsm options cost the same). Ask size + paper if not given.
+  Colour and black & white cost the SAME — never quote a different price for B&W. Other sizes
+  (A4/A3) or papers aren't on the list → escalate to Justin.
+
 - **NCR books**: ask the customer "duplicate (2pt) or triplicate (3pt)?" — "duplicate" and
   "triplicate" are the customer-facing words (that's how customers understand the number of
   carbonless copies). The "(2pt)" / "(3pt)" bracket is a short clarification ("pt" = part).
