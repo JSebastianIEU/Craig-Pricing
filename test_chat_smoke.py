@@ -1249,6 +1249,36 @@ class TestV408PromptWording:
         # Explicit "I have artwork" → True (unchanged).
         assert _sniff_artwork_answer(last_q, "I have my own artwork") is True
 
+    def test_v40_8_17_ncr_sanitizer_strips_forbidden_parenthetical(self):
+        """v40.8.17 — deterministic server-side sanitizer. The prompt
+        forbids 'duplicate'/'triplicate' to the customer, but DeepSeek
+        still occasionally adds '(that's duplicate or triplicate)'. The
+        _humanize_reply sanitizer strips any parenthetical containing the
+        forbidden terms, while leaving legitimate text untouched."""
+        from llm.craig_agent import _humanize_reply
+
+        # Forbidden parentheticals get stripped; 2-part/3-part survives.
+        out = _humanize_reply(
+            "Are you looking for 2-part or 3-part? "
+            "(That's duplicate or triplicate copies per set)"
+        )
+        assert "duplicate" not in out.lower()
+        assert "triplicate" not in out.lower()
+        assert "2-part or 3-part" in out
+
+        out2 = _humanize_reply("2-part or 3-part? (that is duplicate or triplicate)")
+        assert "duplicate" not in out2.lower() and "2-part or 3-part" in out2
+
+        # 2-ply / 3-ply parentheticals too.
+        out3 = _humanize_reply("2-part or 3-part? (2-ply or 3-ply)")
+        assert "ply" not in out3.lower() and "2-part or 3-part" in out3
+
+        # Legitimate text is untouched.
+        assert _humanize_reply("That's €180 + VAT") == "That's €180 + VAT"
+        assert _humanize_reply(
+            "We offer gloss, matte, or soft-touch"
+        ) == "We offer gloss, matte, or soft-touch"
+
     def test_v40_8_16_ncr_no_parenthetical_leak_rule(self):
         """v40.8.16 — Craig leaked '(that's duplicate or triplicate)' in
         brackets. The prompt must forbid the bracketed explanation
