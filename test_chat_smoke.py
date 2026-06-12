@@ -1264,6 +1264,73 @@ class TestV408PromptWording:
         # Explicit "I have artwork" → True (unchanged).
         assert _sniff_artwork_answer(last_q, "I have my own artwork") is True
 
+    def test_v41_7_design_charge_guard_strips_unrequested_design(self):
+        """v41.7 — the LLM passed needs_artwork=true after the customer
+        said "I'll send the artwork later" (booklet JP-0346: €65 design
+        billed, never requested). The tool boundary now strips
+        needs_artwork when customer_has_own_artwork is True (own artwork
+        OR pending-later). A later definitive design request flips the
+        flag to False before the next tool call, so a genuine design
+        line is never stripped."""
+        from db import db_session
+        from db.models import Conversation, Quote
+        from llm.craig_agent import _exec_tool
+
+        with db_session() as db:
+            conv = Conversation(
+                organization_slug="just-print",
+                external_id="test-design-guard",
+                channel="web",
+                customer_has_own_artwork=True,   # pending-later / own artwork
+                messages=[],
+            )
+            db.add(conv)
+            db.flush()
+            cid = conv.id
+            try:
+                result = _exec_tool(
+                    db, "quote_small_format",
+                    {"product_key": "business_cards", "quantity": 100,
+                     "finish": "matte", "needs_artwork": True,
+                     "artwork_hours": 1.0},
+                    conversation_id=cid,
+                    organization_slug="just-print",
+                )
+                assert result.get("success") is True, f"got {result}"
+                assert not result.get("artwork_cost_ex_vat"), (
+                    "design line billed despite customer having own artwork: "
+                    f"{result.get('artwork_cost_ex_vat')}"
+                )
+
+                # Control: customer explicitly needs design → line stays.
+                conv2 = db.query(Conversation).filter_by(id=cid).first()
+                conv2.customer_has_own_artwork = False  # asked for design
+                db.flush()
+                result2 = _exec_tool(
+                    db, "quote_small_format",
+                    {"product_key": "business_cards", "quantity": 100,
+                     "finish": "matte", "needs_artwork": True,
+                     "artwork_hours": 1.0},
+                    conversation_id=cid,
+                    organization_slug="just-print",
+                )
+                assert result2.get("artwork_cost_ex_vat") == 65.0, (
+                    f"design line missing when requested: {result2}"
+                )
+            finally:
+                db.query(Quote).filter_by(conversation_id=cid).delete()
+                db.query(Conversation).filter_by(id=cid).delete()
+                db.commit()
+
+    def test_v41_7_prompt_rules_unit_priced_and_no_finish(self):
+        """v41.7 — prompt bullets from the test-report findings: roller
+        banners / canvas / magnetics are unit-priced (never invent sizes),
+        and the no-finish rule carries an explicit anti-example."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        assert "Roller banners, canvas prints, vehicle magnetics" in CRAIG_SYSTEM_PROMPT
+        assert "NEVER invent or list sizes" in CRAIG_SYSTEM_PROMPT
+        assert "NEVER offer gloss/matte on these" in CRAIG_SYSTEM_PROMPT
+
     def test_v41_6_verbal_price_detection(self):
         """v41.6 — the verbal-price hallucination gate. The test-report
         suite caught Craig saying '€38 + VAT' for 250 business cards in
@@ -1272,7 +1339,7 @@ class TestV408PromptWording:
         one of the fixed prompt-sourced figures (design €65/€79.95,
         delivery €15/€100, minimums €25/€45)."""
         from llm.craig_agent import (
-            _contains_unverified_price, _PRICE_CORRECTION_MSG,
+            _contains_unverified_price, _PRICE_CORRECTION_TEMPLATE,
             _PRICE_FALLBACK_TEXT,
         )
 
@@ -1297,8 +1364,21 @@ class TestV408PromptWording:
         assert _contains_unverified_price("what size are you after?") is False
         assert _contains_unverified_price("") is False
 
+        # v41.7 — symbol-evasion: the audit caught "about 81 per m²
+        # roughly" (no € sign) slipping past the detector.
+        assert _contains_unverified_price(
+            "Vinyl labels are about 81 per m² roughly"
+        ) is True
+        assert _contains_unverified_price("it's 120 euros for the pair") is True
+        assert _contains_unverified_price("roughly 30/m2 for mesh") is True
+        # Allowlisted rate without symbol still passes (vinyl €45/m²):
+        assert _contains_unverified_price("that's 45 per m²") is False
+        # Plain counts must NOT trip it:
+        assert _contains_unverified_price("50 sets per book, 3-5 working days") is False
+        assert _contains_unverified_price("85mm x 55mm, 400gsm silk") is False
+
         # The correction + fallback constants must keep their contracts.
-        assert "NEVER state a price" in _PRICE_CORRECTION_MSG
+        assert "NEVER state a price" in _PRICE_CORRECTION_TEMPLATE
         assert "€" not in _PRICE_FALLBACK_TEXT.replace("👍", "")  # fallback never names a price
 
     def test_v41_6_artwork_gate_anti_hijack_helpers(self):
@@ -1404,10 +1484,13 @@ class TestV408PromptWording:
         Pre-v40.8.7 was 16,208 chars; v40.8.7 shrunk to 13,454.
         v40.8.9 added ~1,400 chars (board examples + anti-pattern).
         v40.8.12 added ~600 chars (booklet card-cover default rule).
-        Guardrail raised to 16,500."""
+        v41.3 added the posters rule; v41.7 added the unit-priced display
+        products rule, the brochures anti-example and the "here's your
+        quote" timing rule (all from Product-Test-Report findings).
+        Guardrail raised to 18,000."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
-        assert len(CRAIG_SYSTEM_PROMPT) < 17500, (
+        assert len(CRAIG_SYSTEM_PROMPT) < 18000, (
             f"Prompt is {len(CRAIG_SYSTEM_PROMPT)} chars — should stay "
-            f"under 17,500. Check if you accidentally re-added a "
-            f"verbose block. (v40.8.14 added the NCR 2-part/3-part rule.)"
+            f"under 18,000. Check if you accidentally re-added a "
+            f"verbose block."
         )

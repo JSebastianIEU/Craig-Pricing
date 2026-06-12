@@ -223,6 +223,9 @@ needs Justin's eyes). Off-tier within the normal range is always auto-quoteable.
   shows the breakdown; the chat reply just says "€X + VAT".
 - After giving the price, ALWAYS ask if they want the full quote: "Want me to put together the full quote for you? 📋"
 - If they say yes, respond with EXACTLY this format (the widget will detect it): "Here's your quote! 📋 [QUOTE_READY]"
+- NEVER say "here's your quote" in any other situation — if details are still missing (contact,
+  delivery, artwork), say "I'll wrap up the full quote once I have those" instead. Claiming a
+  quote was delivered when nothing appears confuses the customer.
 - Design service is **€65 ex VAT (€79.95 inc VAT) for one hour of design work**. Always phrase it as "one hour of design" — that's what €65 buys: an hour of our designer's time. Most jobs fit comfortably inside one hour; bigger jobs may need more. Say things like "€65 + VAT for an hour of design" or "It's €79.95 inc VAT — that's one hour with our designer." When the customer confirms they want it, on the NEXT pricing tool call pass `needs_artwork=true, artwork_hours=1.0` — that's how we bill it through the engine. If they have print-ready artwork, omit both arguments (no design line item).
 - Standard turnaround is 3-5 working days.
 
@@ -274,10 +277,15 @@ TYPE**, NOT a finish option. Don't offer "silk" as a finish.
 
 - **Flyers, leaflets, brochures, NCR books, letterheads, compliment slips**: NO finish question
   ever. They're standard 170gsm silk paper full-stop. Pass `finish="silk"` (the paper type) to
-  the tool. If a customer asks "what finishes do you have?" reply "These come standard on 170gsm
-  silk paper — no separate finish options. What quantity are you after?". If the customer asks
-  for LAMINATED flyers, escalate to Justin (250gsm silk + lam needs a manual quote — different
-  product not in this catalog).
+  the tool. NEVER offer gloss/matte on these — never say things like "brochures come with a
+  finish option — gloss or matte?". If a customer asks "what finishes do you have?" reply "These
+  come standard on 170gsm silk paper — no separate finish options. What quantity are you
+  after?". If the customer asks for LAMINATED flyers, escalate to Justin (250gsm silk + lam
+  needs a manual quote — different product not in this catalog).
+
+- **Roller banners, canvas prints, vehicle magnetics**: priced PER UNIT. There are NO standard
+  size options in the catalog — NEVER invent or list sizes, and never hold up the price waiting
+  for dimensions. Call quote_large_format with just product_key + quantity straight away.
 
 - **Boards (corri / foamex / dibond)**: NO finish question — they come matt laminated by default.
 
@@ -367,18 +375,36 @@ _NCR_PLY_TO_PT = re.compile(r"\b([23])\s*-?\s*ply\b", re.IGNORECASE)
 # fallback replaces the reply. Golden rule #1: Craig NEVER invents a
 # price.
 _EURO_AMOUNT_RX = re.compile(r"€\s?(\d[\d,]*(?:\.\d{1,2})?)")
+# v41.7 — the audit caught the model evading the € detector by dropping
+# the symbol: "vinyl labels are about 81 per m² roughly" (real rate:
+# €45/m²). Also catch bare numbers in an explicit money/rate context.
+_BARE_RATE_RX = re.compile(
+    r"\b(\d[\d,]*(?:\.\d{1,2})?)\s*"
+    r"(?:per\s+(?:m²|m2|sq(?:uare)?\s*m(?:etre|eter)?s?)|/\s*m²|/\s*m2|euros?\b)",
+    re.IGNORECASE,
+)
 # Amounts Craig may legitimately say WITHOUT a pricing tool call: the
 # design service (€65 ex / €79.95 inc), delivery (€15, free over €100)
 # and the standing minimum-order values (€25 large format, €45 vinyl).
 _VERBAL_PRICE_ALLOWLIST = {65.0, 79.95, 15.0, 100.0, 25.0, 45.0}
 
-_PRICE_CORRECTION_MSG = (
-    "## PRICE CORRECTION (server gate — do not mention this to the customer)\n"
-    "Your draft reply stated a euro amount, but NO pricing tool was called "
-    "and no quote exists on this conversation. You may NEVER state a price "
-    "from memory — catalog reference prices are NOT quotes. Do ONE of:\n"
-    "1. call the correct quote tool NOW with the customer's quantity/specs; or\n"
-    "2. if specs are missing, ask for them WITHOUT naming any price."
+# v41.7 — the draft is embedded HERE (not appended as an assistant turn).
+# The first version appended the bad draft to the message list before the
+# correction, which anchored the model into a confused continuation (it
+# answered a price ask with just "yes please"). With the draft quoted
+# inside the system message the dialogue state stays clean — the last
+# message is the customer's — and the model re-answers them naturally.
+_PRICE_CORRECTION_TEMPLATE = (
+    "## PRICE CORRECTION (server gate — invisible to the customer)\n"
+    "Your draft reply was REJECTED and the customer never saw it:\n"
+    "--- rejected draft ---\n{draft}\n--- end draft ---\n"
+    "It stated a money amount, but NO pricing tool was called and no quote "
+    "exists on this conversation. You may NEVER state a price or rate from "
+    "memory — catalog reference prices are NOT quotes. Write a brand-new "
+    "reply to the customer's last message: either call the correct quote "
+    "tool NOW with their quantity/specs, or ask for the missing spec in a "
+    "friendly way WITHOUT naming any price, rate, or number with a "
+    "currency meaning."
 )
 
 _PRICE_FALLBACK_TEXT = (
@@ -389,16 +415,19 @@ _PRICE_FALLBACK_TEXT = (
 
 
 def _contains_unverified_price(text: str) -> bool:
-    """True when `text` names a euro amount outside the allowlist of
-    fixed, prompt-sourced figures (design €65/€79.95, delivery €15/€100,
-    minimums €25/€45). Used by the v41.6 verbal-price gate."""
-    for m in _EURO_AMOUNT_RX.finditer(text or ""):
-        try:
-            amt = float(m.group(1).replace(",", ""))
-        except ValueError:
-            continue
-        if amt not in _VERBAL_PRICE_ALLOWLIST:
-            return True
+    """True when `text` names a euro amount — or a bare number in an
+    explicit rate/money context ("81 per m²", "120 euros") — outside the
+    allowlist of fixed, prompt-sourced figures (design €65/€79.95,
+    delivery €15/€100, minimums €25/€45). Used by the v41.6/v41.7
+    verbal-price gate."""
+    for rx in (_EURO_AMOUNT_RX, _BARE_RATE_RX):
+        for m in rx.finditer(text or ""):
+            try:
+                amt = float(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            if amt not in _VERBAL_PRICE_ALLOWLIST:
+                return True
     return False
 
 
@@ -1880,6 +1909,34 @@ def _exec_tool(
         #      service?'. Wait for answer, then re-call the tool."
         # — removed in v38 (price-first flow).
 
+        # v41.7 — deterministic design-charge guard. The Product Test
+        # Report caught the LLM passing needs_artwork=true after the
+        # customer said "I'll send the artwork later" (booklets,
+        # JP-0346: a €65 design line billed that was never asked for).
+        # The sniffer had correctly stamped customer_has_own_artwork=
+        # True (pending-later counts as "has/will have own artwork" —
+        # no design line), but nothing enforced that at the tool
+        # boundary; the prompt instruction alone gets ignored. Safe to
+        # enforce: the sniffer re-runs every turn and a definitive
+        # design request flips the flag to False BEFORE the next tool
+        # call, so a genuinely requested design line is never stripped.
+        # Mutating `args` also keeps Quote.specs (specs=args) honest.
+        if (
+            name in ("quote_small_format", "quote_large_format", "quote_booklet")
+            and args.get("needs_artwork")
+            and conversation_id is not None
+        ):
+            _conv_guard = db.query(Conversation).filter_by(id=conversation_id).first()
+            if _conv_guard is not None and _conv_guard.customer_has_own_artwork is True:
+                print(
+                    f"[craig] v41.7 DESIGN-CHARGE GUARD: stripped "
+                    f"needs_artwork=true on {name} (conv {conversation_id}) — "
+                    f"customer has/will send their own artwork.",
+                    flush=True,
+                )
+                args["needs_artwork"] = False
+                args["artwork_hours"] = 0.0
+
         if name == "quote_small_format":
             result = quote_small_format(
                 db,
@@ -2697,8 +2754,10 @@ def chat_with_craig(
             )
             if _price_suspect and not _price_correction_done:
                 _price_correction_done = True
-                messages.append({"role": "assistant", "content": _candidate})
-                messages.append({"role": "system", "content": _PRICE_CORRECTION_MSG})
+                messages.append({
+                    "role": "system",
+                    "content": _PRICE_CORRECTION_TEMPLATE.format(draft=_candidate[:600]),
+                })
                 print(
                     f"[craig] v41.6 PRICE GATE: unverified € in reply with no "
                     f"tool call on conv {conversation.id} — corrective retry. "
@@ -2991,17 +3050,27 @@ def chat_with_craig(
             # marker AFTER it so the customer sees the number first.
             # Strip any spurious [ARTWORK_UPLOAD] (can't upload before
             # choosing).
+            #
+            # v41.7 — the audit found the templated question STACKING on
+            # Craig's own prose artwork question (asked twice in one
+            # message, 4 scenarios). When the reply already asks about
+            # artwork in prose, append ONLY the marker — the widget shows
+            # the buttons under Craig's own question.
             final_reply = final_reply.replace("[ARTWORK_UPLOAD]", "").rstrip()
-            final_reply = (
-                final_reply
-                + "\n\nQuick one before I wrap the full quote 👇 "
-                "Do you have your own print-ready artwork, or would "
-                "you like our design service (€65 ex VAT for one "
-                "hour of design work)?\n\n[ARTWORK_CHOICE]"
-            )
+            if _reply_touches_artwork:
+                final_reply = final_reply + "\n\n[ARTWORK_CHOICE]"
+            else:
+                final_reply = (
+                    final_reply
+                    + "\n\nQuick one before I wrap the full quote 👇 "
+                    "Do you have your own print-ready artwork, or would "
+                    "you like our design service (€65 ex VAT for one "
+                    "hour of design work)?\n\n[ARTWORK_CHOICE]"
+                )
             print(
                 f"[craig] APPENDED [ARTWORK_CHOICE] after price on conv "
-                f"{conversation.id} (v38.7 — price-first flow).",
+                f"{conversation.id} (v38.7 price-first flow; "
+                f"marker_only={_reply_touches_artwork}).",
                 flush=True,
             )
         elif _any_quote_exists or _reply_touches_artwork:
