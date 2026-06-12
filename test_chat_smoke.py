@@ -1211,6 +1211,54 @@ class TestV408PromptWording:
             "extractor must map '3-part' → triplicate."
         )
 
+    def test_v40_8_16_dont_have_artwork_is_ambiguous_not_design(self):
+        """v40.8.16 — root cause of the persistent artwork-choice bug.
+        'don't have artwork yet' was classified as NEED_DESIGN (False),
+        so customer_has_own_artwork became False (not None) and the
+        artwork-choice gate never fired. These ambiguous negations must
+        now return None so the 3-button choice appears. Explicit design
+        requests must STILL return False."""
+        from llm.craig_agent import _sniff_artwork_answer
+        last_q = "do you have print-ready artwork, or would you like our design service?"
+
+        # Ambiguous negations → None (show the 3-button choice).
+        for msg in [
+            "don't have artwork yet",
+            "dont have artwork",
+            "I don't have the artwork",
+            "no artwork yet",
+            "I don't have a design",
+        ]:
+            assert _sniff_artwork_answer(last_q, msg) is None, (
+                f"{msg!r} must be ambiguous (None), not classified as "
+                f"design — got {_sniff_artwork_answer(last_q, msg)!r}."
+            )
+
+        # Explicit design requests → False (still routed to design).
+        for msg in [
+            "can you design it for me",
+            "I need design help",
+            "I'd like your design service",
+            "you guys design it",
+        ]:
+            assert _sniff_artwork_answer(last_q, msg) is False, (
+                f"{msg!r} is an explicit design request — must stay "
+                f"False, got {_sniff_artwork_answer(last_q, msg)!r}."
+            )
+
+        # Explicit "I have artwork" → True (unchanged).
+        assert _sniff_artwork_answer(last_q, "I have my own artwork") is True
+
+    def test_v40_8_16_ncr_no_parenthetical_leak_rule(self):
+        """v40.8.16 — Craig leaked '(that's duplicate or triplicate)' in
+        brackets. The prompt must forbid the bracketed explanation
+        explicitly, not just forbid the bare terms."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        assert "not even in brackets" in CRAIG_SYSTEM_PROMPT, (
+            "Prompt must forbid the bracketed duplicate/triplicate "
+            "explanation for NCR."
+        )
+
     def test_v40_8_15_unified_artwork_choice_gate_covers_prose_and_upload(self):
         """v40.8.15 — the adversarial smoke showed the v40.8.14 guard
         only caught a premature [ARTWORK_UPLOAD], but Craig also

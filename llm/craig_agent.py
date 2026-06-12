@@ -283,10 +283,12 @@ TYPE**, NOT a finish option. Don't offer "silk" as a finish.
 
 - **NCR books**: ask the customer "2-part or 3-part?" — that's how the Irish print trade
   describes the number of carbonless copies. NEVER say "2-ply" / "3-ply" / "duplicate" /
-  "triplicate" to the customer; those are internal terms. When you call the tool, map their
-  answer to the finish value: "2-part" / "two part" / "duplicate" → finish="duplicate";
-  "3-part" / "three part" / "triplicate" → finish="triplicate". So the customer hears
-  "2-part / 3-part" but the engine still receives "duplicate" / "triplicate".
+  "triplicate" to the customer — not even in brackets as an explanation. Do NOT write things
+  like "2-part or 3-part? (that's duplicate or triplicate)". Just say "2-part or 3-part?" and
+  nothing more. When you call the tool, map their answer to the finish value silently:
+  "2-part" / "two part" → finish="duplicate"; "3-part" / "three part" → finish="triplicate".
+  The customer only ever hears "2-part / 3-part"; the duplicate/triplicate mapping stays
+  invisible to them.
 
 - **Booklets (A5/A4 saddle-stitch or perfect-bound)**: same "default unlaminated" rule as business
   cards, applied to the COVER. The catalog has 3 cover_type values:
@@ -432,8 +434,22 @@ _ARTWORK_PENDING_LATER = (
     "just price",
 )
 _ARTWORK_NEED_DESIGN = (
-    # All patterns MUST clearly reference design service (or explicitly
-    # disclaim having artwork) — never bare "i need" or "need help".
+    # All patterns MUST be a POSITIVE request for the design service —
+    # never a bare "i need" / "need help", and never a mere NEGATION of
+    # having artwork.
+    #
+    # v40.8.16 — REMOVED the ambiguous "no artwork" / "don't have
+    # artwork" / "don't have a design" negations. Saying "I don't have
+    # artwork yet" does NOT mean "I want to pay €65 for design" — it's
+    # ambiguous (the customer might send it later, or want design help,
+    # or just not know). Classifying it as design (False) was the root
+    # cause of Justin's NCR docket-books bug: customer said "don't have
+    # artwork yet", sniffer stamped False, Craig pitched the €65
+    # designer instead of showing the 3-button artwork choice. Now
+    # these negations fall through to None, so the unified artwork gate
+    # (v40.8.15) fires [ARTWORK_CHOICE] and the customer picks: have own
+    # / send later / design service. Explicit design requests below
+    # ("can you design", "need design") still classify correctly.
     "need design", "need the design",
     "need help with the design", "need help designing",
     "need help with design", "need design help",
@@ -442,12 +458,29 @@ _ARTWORK_NEED_DESIGN = (
     "design the artwork", "design the file",
     "you design", "you guys design", "you can design",
     "i need it designed", "need it designed",
-    "no artwork", "don't have artwork", "dont have artwork",
-    "no design", "don't have a design", "dont have a design",
-    "don't have the artwork", "dont have the artwork",
-    "don't have the design", "dont have the design",
     "can you design", "can you make me", "can you create the design",
     "use your design", "your design service",
+)
+
+# v40.8.16 — ambiguous artwork negations. "I don't have artwork yet"
+# CONTAINS the substring "have artwork", which would false-match
+# _ARTWORK_HAVE_AFFIRMATIVE and stamp customer_has_own_artwork=True.
+# A negated possession is genuinely ambiguous (send later? want design?
+# just unsure?), so it must return None and let the artwork-choice gate
+# show the 3 buttons. Checked AFTER _ARTWORK_NEED_DESIGN (so explicit
+# "don't have it, can you design?" still routes to design) but BEFORE
+# _ARTWORK_HAVE_AFFIRMATIVE (to beat the "have artwork" substring trap).
+_ARTWORK_NEGATIONS = (
+    "don't have artwork", "dont have artwork", "do not have artwork",
+    "don't have the artwork", "dont have the artwork",
+    "don't have any artwork", "dont have any artwork",
+    "don't have my artwork", "dont have my artwork",
+    "haven't got artwork", "havent got artwork",
+    "haven't got the artwork", "havent got the artwork",
+    "no artwork", "without artwork", "no design yet",
+    "don't have a design", "dont have a design",
+    "don't have the design", "dont have the design",
+    "don't have any design", "dont have any design",
 )
 
 
@@ -481,6 +514,13 @@ def _sniff_artwork_answer(
     # ── Strategy 1: direct phrases (always trust) ────────────────────
     if any(p in user for p in _ARTWORK_NEED_DESIGN):
         return False
+    # v40.8.16 — negation guard. Runs BEFORE the affirmative check so
+    # "I don't have artwork yet" (which contains the substring "have
+    # artwork") is treated as ambiguous (None), not as "has own
+    # artwork" (True). Explicit design requests already returned False
+    # just above, so reaching here means a bare negation → ambiguous.
+    if any(p in user for p in _ARTWORK_NEGATIONS):
+        return None
     if any(p in user for p in _ARTWORK_HAVE_AFFIRMATIVE):
         return True
     # v30 — pending-later phrases also count as "have own artwork"
