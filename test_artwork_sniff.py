@@ -114,14 +114,45 @@ class TestSniffNeedsDesign:
             "design service please",
         ) is False
 
-    def test_no_artwork(self):
-        assert _sniff_artwork_answer(None, "no artwork — can you make it?") is False
+    def test_no_artwork_with_explicit_design_request(self):
+        # v40.8.16 — a bare negation ("no artwork") is now ambiguous
+        # (→ None, see TestSniffAmbiguousNegations), but a negation
+        # PAIRED with an explicit design request still routes to design.
+        # _ARTWORK_NEED_DESIGN is checked BEFORE _ARTWORK_NEGATIONS, so
+        # "can you design it?" wins → False.
+        assert _sniff_artwork_answer(None, "no artwork — can you design it?") is False
 
     def test_can_you_design(self):
         assert _sniff_artwork_answer(None, "can you design the cards for me?") is False
 
-    def test_dont_have_artwork(self):
-        assert _sniff_artwork_answer(None, "i don't have artwork yet") is False
+
+# ---------------------------------------------------------------------------
+# v40.8.16 — ambiguous negations: "I don't have artwork yet" is NOT a
+# design-service request. It must return None so the artwork-choice gate
+# shows the 3 buttons (have own / send later / design service) and the
+# customer picks. Classifying these as design (False) was the root cause
+# of Justin's NCR docket-books bug (conv 380): the customer said "don't
+# have artwork yet" and the buttons never appeared.
+# ---------------------------------------------------------------------------
+
+
+class TestSniffAmbiguousNegations:
+    def test_dont_have_artwork_yet_is_ambiguous(self):
+        assert _sniff_artwork_answer(None, "i don't have artwork yet") is None
+
+    def test_bare_no_artwork_is_ambiguous(self):
+        assert _sniff_artwork_answer(None, "no artwork") is None
+
+    def test_havent_got_the_artwork_is_ambiguous(self):
+        assert _sniff_artwork_answer(None, "haven't got the artwork") is None
+
+    def test_dont_have_a_design_is_ambiguous(self):
+        assert _sniff_artwork_answer(None, "i don't have a design") is None
+
+    def test_negation_does_not_false_match_have_affirmative(self):
+        # "don't have artwork" CONTAINS the substring "have artwork";
+        # the negation guard must beat _ARTWORK_HAVE_AFFIRMATIVE.
+        assert _sniff_artwork_answer(None, "i don't have artwork") is None
 
 
 # ---------------------------------------------------------------------------

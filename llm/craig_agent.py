@@ -340,6 +340,21 @@ _MD_NUMBERED_LINE = re.compile(r"^[ \t]*\d+[.)][ \t]+", re.MULTILINE)           
 _MD_HEADING = re.compile(r"^[ \t]*#{1,6}[ \t]+", re.MULTILINE)                   # "## Heading"
 _EXCESS_BLANK_LINES = re.compile(r"\n{3,}")
 
+# v40.8.17 — NCR forbidden-term sanitizer. Justin: customers must never
+# see "duplicate" / "triplicate" / "2-ply" / "3-ply" — only "2-part" /
+# "3-part". The prompt forbids it (incl. "not even in brackets"), but
+# DeepSeek still occasionally "helpfully" explains: "2-part or 3-part?
+# (that's duplicate or triplicate)". This deterministic regex strips any
+# PARENTHETICAL that contains one of the forbidden terms — the only
+# place those words legitimately appear in a customer-facing quote is
+# never, so a parenthetical mentioning them is always the leak. Belt-
+# and-suspenders over the prompt rule (same lesson as the board-size
+# gate: intercept server-side, don't rely on the LLM).
+_NCR_FORBIDDEN_PARENS = re.compile(
+    r"\s*[\(\[][^)\]]*\b(?:duplicate|triplicate|2-ply|3-ply|2 ply|3 ply)\b[^)\]]*[\)\]]",
+    re.IGNORECASE,
+)
+
 # Contact-info sniffers. LLMs sometimes claim "I've saved your details" without
 # actually calling save_customer_info, which previously left the conversation
 # anonymous and the [QUOTE_READY] gate stuck shut. These regexes scan the
@@ -577,6 +592,10 @@ def _humanize_reply(text: str) -> str:
     text = _MD_NUMBERED_LINE.sub("", text)
     # ATX-style headings (## Foo) — drop the #s.
     text = _MD_HEADING.sub("", text)
+    # v40.8.17 — strip any parenthetical that explains NCR copies with
+    # the forbidden internal terms ("...(that's duplicate or
+    # triplicate)..."). Customers only ever see "2-part / 3-part".
+    text = _NCR_FORBIDDEN_PARENS.sub("", text)
     # Collapse runs of 3+ newlines to 2 (keeps paragraph breaks, kills gaps).
     text = _EXCESS_BLANK_LINES.sub("\n\n", text)
     return text.strip()
