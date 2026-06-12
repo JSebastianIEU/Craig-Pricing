@@ -574,17 +574,39 @@ def apply_shipping_to_quote(
 # =============================================================================
 
 
-def _check_qty_ceiling(product, quantity: int) -> Optional["EscalationResult"]:
-    """v41 — early-exit ceiling check. Returns an EscalationResult when
-    ``product.max_qty_for_auto_quote`` is set and ``quantity`` exceeds
-    it. Used at the top of every quote_* path. Returns None for legacy
-    products (max_qty unset) — engine continues as before.
+def _check_quantity_bounds(product, quantity: int) -> Optional["EscalationResult"]:
+    """Quantity bounds guard at the top of every quote_* path. Returns an
+    EscalationResult when the quantity is out of bounds, else None.
 
-    The escalation carries ``manual_review=True`` so the LLM shell
-    auto-creates a ``Quote(status='needs_revision')`` row and pings
-    Justin via the v33 notification pipeline. Customer sees Craig say
-    "let me get Justin to confirm the price on this", no number quoted.
+    FLOOR (v41.1) — a non-positive quantity is invalid input. The engine
+    must NEVER run pricing math on it: a negative qty would otherwise flow
+    through the ``quantity / unit_base`` multiplier and produce a NEGATIVE
+    price (e.g. -50 → -€25). Justin flagged this directly. We return a
+    *soft* escalation (``manual_review=False``) so the LLM shell simply
+    re-asks the customer for a real quantity instead of pinging Justin or
+    quoting a number. Belt-and-suspenders with the API-layer
+    ``Field(gt=0)`` and the tool-schema ``minimum: 1`` — this one also
+    covers the in-process LLM tool path, which never touches Pydantic.
+
+    CEILING (v41) — when ``product.max_qty_for_auto_quote`` is set and
+    ``quantity`` exceeds it, escalate BEFORE any pricing math with
+    ``manual_review=True`` so the LLM auto-creates a
+    ``Quote(status='needs_revision')`` and pings Justin via the v33
+    notification pipeline (customer sees "let me get Justin to confirm",
+    no number quoted). Returns None for legacy products (max_qty unset).
     """
+    # FLOOR — reject non-positive (or missing) quantities everywhere.
+    if quantity is None or quantity <= 0:
+        return EscalationResult(
+            reason=(
+                f"invalid quantity {quantity!r} on {product.name} — "
+                "must be a positive whole number"
+            ),
+            product_name=product.name,
+            manual_review=False,
+            message="That quantity doesn't look right — how many did you need?",
+        )
+
     cap = getattr(product, "max_qty_for_auto_quote", None)
     if not cap:
         return None
@@ -694,7 +716,7 @@ def quote_small_format(
     # v41 — qty ceiling check. If the product has a max_qty_for_auto_quote
     # set and the requested quantity is above it, escalate BEFORE any
     # pricing math (don't quote a huge job Justin needs to confirm).
-    _ceil = _check_qty_ceiling(product, quantity)
+    _ceil = _check_quantity_bounds(product, quantity)
     if _ceil is not None:
         return _ceil
 
@@ -925,7 +947,7 @@ def _quote_per_sqm(
         )
 
     # v41 — qty ceiling check at the top of per_sqm path.
-    _ceil = _check_qty_ceiling(product, quantity)
+    _ceil = _check_quantity_bounds(product, quantity)
     if _ceil is not None:
         return _ceil
 
@@ -1203,7 +1225,7 @@ def _quote_per_sheet(
         )
 
     # v41 — qty ceiling check at the top of per_sheet path.
-    _ceil = _check_qty_ceiling(product, quantity)
+    _ceil = _check_quantity_bounds(product, quantity)
     if _ceil is not None:
         return _ceil
 
@@ -1365,7 +1387,7 @@ def _quote_large_format_tiered_by_size(
     """
     # Defensive ceiling check (the caller — quote_large_format — also
     # checks, but keep this here for tests that hit the helper directly).
-    _ceil = _check_qty_ceiling(product, quantity)
+    _ceil = _check_quantity_bounds(product, quantity)
     if _ceil is not None:
         return _ceil
 
@@ -1502,7 +1524,7 @@ def _quote_large_format_with_laydown(
       - no tier exists at the full-sheet spec_key
     """
     # Defensive ceiling (same as the by-size helper).
-    _ceil = _check_qty_ceiling(product, quantity)
+    _ceil = _check_quantity_bounds(product, quantity)
     if _ceil is not None:
         return _ceil
 
@@ -1696,9 +1718,9 @@ def quote_large_format(
     # v41 — qty ceiling check at the top of quote_large_format. Covers
     # ALL 3 dispatch paths (per_sqm, per_sheet, legacy bulk_break) in
     # one place so we don't have to repeat the guard inside each helper.
-    # (The helpers also call _check_qty_ceiling defensively in case
+    # (The helpers also call _check_quantity_bounds defensively in case
     # they're invoked directly from a test or future code path.)
-    _ceil = _check_qty_ceiling(product, quantity)
+    _ceil = _check_quantity_bounds(product, quantity)
     if _ceil is not None:
         return _ceil
 
@@ -1890,7 +1912,7 @@ def quote_booklet(
 
     # v41 — qty ceiling check on booklets (symmetric with the other
     # two quote_* entry points).
-    _ceil = _check_qty_ceiling(product, quantity)
+    _ceil = _check_quantity_bounds(product, quantity)
     if _ceil is not None:
         return _ceil
 

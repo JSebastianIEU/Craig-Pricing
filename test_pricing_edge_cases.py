@@ -278,6 +278,61 @@ class TestPerSqmZeroOrNegativeQuantity:
         assert isinstance(result, EscalationResult)
 
 
+class TestTieredZeroOrNegativeQuantity:
+    """v41.1 — non-positive quantity must NEVER produce a price on the
+    TIERED paths either. Before the floor guard, a negative qty flowed
+    through the `quantity / unit_base` multiplier and yielded a NEGATIVE
+    price (e.g. -50 business cards → -€19). Justin flagged this. The
+    `_check_quantity_bounds` floor now escalates (soft, manual_review
+    =False) on every quote_* path."""
+
+    def _assert_floor_escalation(self, result, qty):
+        assert isinstance(result, EscalationResult), (
+            f"qty={qty} must escalate, not price — got {result!r}"
+        )
+        # Must be THE floor guard (reason mentions the positive-qty rule),
+        # not an incidental escalation (e.g. an unseeded product) — that
+        # would make this test pass for the wrong reason.
+        assert "positive" in result.reason.lower(), (
+            f"expected the quantity floor escalation, got reason={result.reason!r}"
+        )
+        # And never a negative price.
+        assert not (isinstance(result, QuoteResult) and result.final_price_ex_vat < 0)
+
+    def test_small_format_negative_quantity_escalates(self):
+        with db_session() as db:
+            result = quote_small_format(
+                db, product_key="business_cards", quantity=-50,
+                finish="matte", organization_slug=ORG,
+            )
+        self._assert_floor_escalation(result, -50)
+
+    def test_small_format_zero_quantity_escalates(self):
+        with db_session() as db:
+            result = quote_small_format(
+                db, product_key="business_cards", quantity=0,
+                finish="matte", organization_slug=ORG,
+            )
+        self._assert_floor_escalation(result, 0)
+
+    def test_ncr_negative_quantity_escalates(self):
+        with db_session() as db:
+            result = quote_small_format(
+                db, product_key="ncr_books_a5", quantity=-10,
+                finish="duplicate", organization_slug=ORG,
+            )
+        self._assert_floor_escalation(result, -10)
+
+    def test_booklet_negative_quantity_escalates(self):
+        with db_session() as db:
+            result = quote_booklet(
+                db, format="a5", binding="saddle_stitch",
+                pages=16, cover_type="self_cover",
+                quantity=-5, organization_slug=ORG,
+            )
+        self._assert_floor_escalation(result, -5)
+
+
 # ===========================================================================
 # Per-sheet engine edge cases (foamex, dibond, corri panels)
 # ===========================================================================

@@ -1208,7 +1208,8 @@ TOOLS = [
                     },
                     "quantity": {
                         "type": "integer",
-                        "description": "Number of items. Must match a tier on the pricing sheet.",
+                        "minimum": 1,
+                        "description": "Number of items (positive whole number). Must match a tier on the pricing sheet.",
                     },
                     "double_sided": {
                         "type": "boolean",
@@ -1258,7 +1259,8 @@ TOOLS = [
                     },
                     "quantity": {
                         "type": "integer",
-                        "description": "Number of units. For per-sq/m products this is the count of items the customer wants, NOT the area.",
+                        "minimum": 1,
+                        "description": "Number of units (positive whole number). For per-sq/m products this is the count of items the customer wants, NOT the area.",
                     },
                     "size": {
                         "type": "string",
@@ -1318,7 +1320,8 @@ TOOLS = [
                     },
                     "quantity": {
                         "type": "integer",
-                        "description": "Number of copies. Must be 25, 50, 100, 250, or 500.",
+                        "minimum": 1,
+                        "description": "Number of copies (positive whole number). Must be 25, 50, 100, 250, or 500.",
                     },
                     "needs_artwork": {"type": "boolean"},
                     "artwork_hours": {"type": "number"},
