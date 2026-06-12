@@ -1264,6 +1264,112 @@ class TestV408PromptWording:
         # Explicit "I have artwork" → True (unchanged).
         assert _sniff_artwork_answer(last_q, "I have my own artwork") is True
 
+    def test_v41_12_changed_mind_supersede(self):
+        """v41.12 — a NEW quote for a product that already has older
+        pending quotes in the conversation supersedes them (changed
+        mind), so the customer PDF never sums both variants. An ADDITIVE
+        message ("also/both/as well") keeps both."""
+        from db import db_session
+        from db.models import Conversation, Quote
+        from llm.craig_agent import _supersede_older_pending_quotes
+        from pdf_generator import _conversation_quotes_for_pdf
+
+        with db_session() as db:
+            conv = Conversation(
+                organization_slug="just-print",
+                external_id="test-supersede", channel="web", messages=[],
+            )
+            db.add(conv)
+            db.flush()
+            cid = conv.id
+            try:
+                def mk(product, finish, price):
+                    q = Quote(
+                        organization_slug="just-print", conversation_id=cid,
+                        product_key=product,
+                        specs={"quantity": 10, "finish": finish},
+                        base_price=price, surcharges=[],
+                        final_price_ex_vat=price, vat_amount=price * 0.23,
+                        final_price_inc_vat=round(price * 1.23, 2),
+                        artwork_cost=0.0, total=round(price * 1.23, 2),
+                        status="pending_approval",
+                    )
+                    db.add(q)
+                    db.flush()
+                    return q
+
+                a = mk("posters", "190gsm", 140.0)
+                b = mk("posters", "gloss", 168.0)   # changed mind
+                n = _supersede_older_pending_quotes(
+                    db, cid, "just-print", "posters", b.id,
+                    "actually make them the glossy ones",
+                )
+                assert n == 1
+                db.refresh(a)
+                assert a.status == "superseded"
+
+                # The PDF only renders the live quote.
+                renderable = _conversation_quotes_for_pdf(b)
+                assert [q.id for q in renderable] == [b.id], (
+                    f"PDF must exclude superseded rows, got "
+                    f"{[(q.id, q.status) for q in renderable]}"
+                )
+
+                # ADDITIVE intent keeps both variants.
+                c = mk("flyers_a5", "gloss", 110.0)
+                d2 = mk("flyers_a5", "matte", 110.0)
+                n2 = _supersede_older_pending_quotes(
+                    db, cid, "just-print", "flyers_a5", d2.id,
+                    "and also 500 in matte as well please",
+                )
+                assert n2 == 0
+                db.refresh(c)
+                assert c.status == "pending_approval"
+
+                # Different product is never touched.
+                db.refresh(b)
+                assert b.status == "pending_approval"
+            finally:
+                db.query(Quote).filter_by(conversation_id=cid).delete()
+                db.query(Conversation).filter_by(id=cid).delete()
+                db.commit()
+
+    def test_v41_12_business_cards_uncoated_prices(self):
+        """v41.12 — Justin's rule: business cards default UNLAMINATED.
+        The prompt already passes finish="uncoated" for "plain/no
+        laminate", but the finishes data lacked 'uncoated' so the engine
+        ESCALATED the default instead of pricing it. Self-contained:
+        sets the finishes list (mirroring the data-op), prices, restores."""
+        from db import db_session
+        from db.models import Product
+        from pricing_engine import quote_small_format, QuoteResult
+
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="business_cards",
+            ).first()
+            if p is None:
+                import pytest
+                pytest.skip("business_cards missing from local seed")
+            saved = p.finishes
+            p.finishes = ["uncoated", "gloss", "matte", "soft-touch"]
+            db.commit()
+            try:
+                r = quote_small_format(
+                    db, product_key="business_cards", quantity=100,
+                    finish="uncoated", organization_slug="just-print",
+                )
+                assert isinstance(r, QuoteResult), f"uncoated must price: {r}"
+                # Same as base (no surcharge for uncoated).
+                base = quote_small_format(
+                    db, product_key="business_cards", quantity=100,
+                    organization_slug="just-print",
+                )
+                assert r.final_price_ex_vat == base.final_price_ex_vat
+            finally:
+                p.finishes = saved
+                db.commit()
+
     def test_v41_7_design_charge_guard_strips_unrequested_design(self):
         """v41.7 — the LLM passed needs_artwork=true after the customer
         said "I'll send the artwork later" (booklet JP-0346: €65 design

@@ -7,6 +7,7 @@
       "90x50mm"
     ],
     "finishes": [
+      "uncoated",
       "gloss",
       "matte",
       "soft-touch"
@@ -23,7 +24,7 @@
     "notes": "Double-sided no extra charge. Soft-touch +25%."
   },
   "flyers_a6": {
-    "name": "Flyers \u2014 A6",
+    "name": "Flyers — A6",
     "description": "170gsm Gloss or matte finish. 148x105mm.",
     "sizes": [
       "A6 (148x105mm)"
@@ -45,7 +46,7 @@
     "notes": "Double-sided add 20%. Good for inserts and handouts."
   },
   "flyers_a5": {
-    "name": "Flyers \u2014 A5",
+    "name": "Flyers — A5",
     "description": "170gsm Gloss or matte finish. 210x148mm.",
     "sizes": [
       "A5 (210x148mm)"
@@ -67,7 +68,7 @@
     "notes": "Double-sided add 20%. Most popular flyer size."
   },
   "flyers_a4": {
-    "name": "Flyers \u2014 A4",
+    "name": "Flyers — A4",
     "description": "170gsm Gloss or matte finish. 297x210mm.",
     "sizes": [
       "A4 (297x210mm)"
@@ -89,7 +90,7 @@
     "notes": "Double-sided add 20%. Confirm with supplier for larger runs."
   },
   "flyers_dl": {
-    "name": "Flyers \u2014 DL",
+    "name": "Flyers — DL",
     "description": "170gsm Gloss or matte finish. 210x99mm.",
     "sizes": [
       "DL (210x99mm)"
@@ -111,7 +112,7 @@
     "notes": "Double-sided add 20%. Fits standard DL envelope."
   },
   "brochures_a4": {
-    "name": "Brochures \u2014 A4 (folds to A5/DL)",
+    "name": "Brochures — A4 (folds to A5/DL)",
     "description": "170gsm Bi-fold or tri-fold, includes folding. 297x210mm flat.",
     "sizes": [
       "A4 folded"
@@ -173,7 +174,7 @@
     "notes": "Min qty 100. Double-sided add 20%."
   },
   "ncr_books_a5": {
-    "name": "NCR Books \u2014 A5",
+    "name": "NCR Books — A5",
     "description": "Duplicate - perforated & stitched - 50 sets per book. A5 size.",
     "sizes": [
       "A5"
@@ -194,7 +195,7 @@
     "notes": "Standard one side. Black & sequential numbering. Triplicate add 10%."
   },
   "ncr_books_a4": {
-    "name": "NCR Books \u2014 A4",
+    "name": "NCR Books — A4",
     "description": "Duplicate - perforated & stitched - 50 sets per book. A4 size.",
     "sizes": [
       "A4"
