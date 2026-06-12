@@ -132,13 +132,15 @@ GROUPS = [
             {
                 "name": "Letterheads — direct",
                 "style": "direct",
-                "turns": ["250 letterheads for our office please", "single sided"],
+                "turns": ["250 letterheads for our office please", "single sided",
+                          "I'll send the artwork on later"],
                 "expect": {"quote_created": True},
             },
             {
                 "name": "Comp slips — vague + qty later",
                 "style": "vague",
-                "turns": ["do you print compliment slips?", "500", "DL size, single sided"],
+                "turns": ["do you print compliment slips?", "500", "DL size, single sided",
+                          "I'll send the artwork on later"],
                 "expect": {"quote_created": True},
             },
         ],
@@ -343,7 +345,8 @@ GROUPS = [
             {
                 "name": "Window graphics — vague",
                 "style": "vague",
-                "turns": ["we want our shop window branded", "about 2m by 1.5m, solid vinyl"],
+                "turns": ["we want our shop window branded", "just the one window",
+                          "about 2m by 1.5m, solid vinyl"],
                 "expect": {"quote_created": True},
             },
             {
