@@ -1329,7 +1329,11 @@ class TestV408PromptWording:
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
         assert "Roller banners, canvas prints, vehicle magnetics" in CRAIG_SYSTEM_PROMPT
         assert "NEVER invent or list sizes" in CRAIG_SYSTEM_PROMPT
-        assert "NEVER offer gloss/matte on these" in CRAIG_SYSTEM_PROMPT
+        assert "NEVER offer gloss/matte on THESE" in CRAIG_SYSTEM_PROMPT
+        # v41.7 correction — brochures genuinely have gloss/matte (the
+        # engine rejects "silk"); the old bullet wrongly lumped them in
+        # with the no-finish products.
+        assert "Brochures" in CRAIG_SYSTEM_PROMPT and "gloss or matte" in CRAIG_SYSTEM_PROMPT
 
     def test_v41_6_verbal_price_detection(self):
         """v41.6 — the verbal-price hallucination gate. The test-report
