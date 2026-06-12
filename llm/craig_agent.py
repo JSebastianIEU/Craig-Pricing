@@ -281,7 +281,12 @@ TYPE**, NOT a finish option. Don't offer "silk" as a finish.
 
 - **Boards (corri / foamex / dibond)**: NO finish question — they come matt laminated by default.
 
-- **NCR books**: ask `duplicate` or `triplicate` (carbonless layers, not finish).
+- **NCR books**: ask the customer "2-part or 3-part?" — that's how the Irish print trade
+  describes the number of carbonless copies. NEVER say "2-ply" / "3-ply" / "duplicate" /
+  "triplicate" to the customer; those are internal terms. When you call the tool, map their
+  answer to the finish value: "2-part" / "two part" / "duplicate" → finish="duplicate";
+  "3-part" / "three part" / "triplicate" → finish="triplicate". So the customer hears
+  "2-part / 3-part" but the engine still receives "duplicate" / "triplicate".
 
 - **Booklets (A5/A4 saddle-stitch or perfect-bound)**: same "default unlaminated" rule as business
   cards, applied to the COVER. The catalog has 3 cover_type values:
@@ -1160,7 +1165,7 @@ TOOLS = [
                     },
                     "finish": {
                         "type": "string",
-                        "description": "Finish option. Valid: gloss, matte, soft-touch, uncoated, duplicate, triplicate.",
+                        "description": "Finish option. Valid: gloss, matte, soft-touch, uncoated, duplicate, triplicate. For NCR books, the customer says '2-part' or '3-part' — map '2-part'→duplicate, '3-part'→triplicate (the engine needs the duplicate/triplicate value, the customer hears 2-part/3-part).",
                     },
                     "needs_artwork": {
                         "type": "boolean",
@@ -2738,6 +2743,39 @@ def chat_with_craig(
                     flush=True,
                 )
                 final_reply = kept[0]
+
+    # v40.8.14 — premature-upload guard. The LLM sometimes emits
+    # [ARTWORK_UPLOAD] on its own when the customer hasn't yet told us
+    # whether they HAVE artwork (customer_has_own_artwork is None). That
+    # is illogical — you can't ask someone to upload artwork before
+    # they've said they have any. It traps the customer in an upload-
+    # only flow with no "design service" / "send later" buttons.
+    #
+    # Reported by Justin (NCR docket-books test, conv 380): customer
+    # said "don't have artwork yet", Craig replied "send your artwork
+    # over [ARTWORK_UPLOAD]" with no other option. Replace that with
+    # the 3-button artwork choice so the customer picks first.
+    #
+    # The legitimate [ARTWORK_UPLOAD] gates downstream (Phase F/G) all
+    # require customer_has_own_artwork is True, so this only fires on
+    # the spurious LLM-emitted marker.
+    if (
+        (channel or "").lower() in ("web", "")
+        and conversation.customer_has_own_artwork is None
+        and "[ARTWORK_UPLOAD]" in final_reply
+        and "[ARTWORK_CHOICE]" not in final_reply
+    ):
+        final_reply = (
+            "No problem 👍 Do you have your own print-ready artwork, "
+            "would you like our design service, or will you send the "
+            "artwork on later?\n\n[ARTWORK_CHOICE]"
+        )
+        print(
+            f"[craig] v40.8.14: REPLACED premature [ARTWORK_UPLOAD] with "
+            f"[ARTWORK_CHOICE] on conv {conversation.id} — customer "
+            f"hasn't chosen an artwork option yet.",
+            flush=True,
+        )
 
     # v38.7 — [ARTWORK_CHOICE] auto-emit. Restructured out of the
     # spec-recap trim block above, where it was previously nested

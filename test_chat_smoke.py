@@ -1176,6 +1176,59 @@ class TestV408PromptWording:
             "Craig pushing the laminate question on booklets."
         )
 
+    def test_v40_8_14_ncr_part_terminology_in_prompt(self):
+        """v40.8.14 — Justin's NCR docket-books test: Craig said
+        "duplicate (2-ply) or triplicate (3-ply)". The Irish trade says
+        "2-part / 3-part". Prompt must instruct Craig to use 2-part/
+        3-part with the customer while still passing duplicate/triplicate
+        to the engine."""
+        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
+        # Must instruct the 2-part/3-part customer-facing wording
+        assert "2-part or 3-part" in CRAIG_SYSTEM_PROMPT, (
+            "Prompt must tell Craig to ask '2-part or 3-part?' for NCR books."
+        )
+        # Must forbid the ply/internal terms to the customer
+        assert "NEVER say" in CRAIG_SYSTEM_PROMPT and "2-ply" in CRAIG_SYSTEM_PROMPT, (
+            "Prompt must forbid '2-ply'/'3-ply' wording to the customer."
+        )
+        # Must keep the engine mapping (duplicate/triplicate)
+        assert 'finish="duplicate"' in CRAIG_SYSTEM_PROMPT and 'finish="triplicate"' in CRAIG_SYSTEM_PROMPT, (
+            "Prompt must still map 2-part→duplicate, 3-part→triplicate for "
+            "the engine."
+        )
+
+    def test_v40_8_14_extractor_maps_part_terminology(self):
+        """v40.8.14 — the extractor already maps '2-part'/'3-part' to
+        the engine finish values. Guard against regression."""
+        from extractor import FINISH_ALIASES
+        # FINISH_ALIASES maps canonical finish → list of synonyms
+        dup_aliases = FINISH_ALIASES.get("duplicate", [])
+        trip_aliases = FINISH_ALIASES.get("triplicate", [])
+        assert "2-part" in dup_aliases and "2 part" in dup_aliases, (
+            "extractor must map '2-part' → duplicate."
+        )
+        assert "3-part" in trip_aliases and "3 part" in trip_aliases, (
+            "extractor must map '3-part' → triplicate."
+        )
+
+    def test_v40_8_14_premature_artwork_upload_guard_present(self):
+        """v40.8.14 — Justin's NCR test: customer said 'don't have
+        artwork yet', Craig replied 'send your artwork over
+        [ARTWORK_UPLOAD]' with no other option. The guard replaces a
+        premature [ARTWORK_UPLOAD] (when customer_has_own_artwork is
+        None) with [ARTWORK_CHOICE] so the customer sees the 3 buttons."""
+        import inspect
+        from llm.craig_agent import chat_with_craig
+        src = inspect.getsource(chat_with_craig)
+        # The guard must exist and reference both markers + the None state
+        assert "REPLACED premature [ARTWORK_UPLOAD]" in src, (
+            "The premature-upload guard (v40.8.14) must be present in "
+            "chat_with_craig."
+        )
+        assert "premature-upload guard" in src or "v40.8.14" in src, (
+            "The guard block should be documented."
+        )
+
     def test_v40_8_7_prompt_size_reduced(self):
         """v40.8.7 — sanity check that the prompt didn't bloat further.
         Pre-v40.8.7 was 16,208 chars; v40.8.7 shrunk to 13,454.
@@ -1183,8 +1236,8 @@ class TestV408PromptWording:
         v40.8.12 added ~600 chars (booklet card-cover default rule).
         Guardrail raised to 16,500."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
-        assert len(CRAIG_SYSTEM_PROMPT) < 16500, (
+        assert len(CRAIG_SYSTEM_PROMPT) < 17500, (
             f"Prompt is {len(CRAIG_SYSTEM_PROMPT)} chars — should stay "
-            f"under 16,500. Check if you accidentally re-added a "
-            f"verbose block."
+            f"under 17,500. Check if you accidentally re-added a "
+            f"verbose block. (v40.8.14 added the NCR 2-part/3-part rule.)"
         )
