@@ -654,6 +654,39 @@ def _build_description(quote, product=None) -> str:
     return "<br/>".join(lines)
 
 
+# v41.12 — only these statuses ever reach a customer-facing PDF. Excludes
+# 'superseded' (changed-mind rows replaced by a newer quote — including
+# them double-counted the job in the grand total), plus needs_revision /
+# rejected (no live commercial standing).
+PDF_RENDERABLE_STATUSES = ("pending_approval", "approved")
+
+
+def _conversation_quotes_for_pdf(quote) -> list:
+    """All RENDERABLE quotes of `quote`'s conversation, oldest-first —
+    the line items of the PDF. Falls back to [quote] when no session is
+    attached (test fixtures) or the quote has no conversation, or when
+    the conversation has no renderable rows at all (legacy behaviour:
+    render the anchor quote rather than an empty document)."""
+    from sqlalchemy.orm import object_session
+    from db.models import Quote as _Quote
+
+    try:
+        sess = object_session(quote)
+    except Exception:
+        sess = None
+    if sess is not None and getattr(quote, "conversation_id", None):
+        fetched = (
+            sess.query(_Quote)
+            .filter_by(conversation_id=quote.conversation_id)
+            .filter(_Quote.status.in_(PDF_RENDERABLE_STATUSES))
+            .order_by(_Quote.created_at.asc(), _Quote.id.asc())
+            .all()
+        )
+        if fetched:
+            return fetched
+    return [quote]
+
+
 # ───────────────────────── main entry ─────────────────────────
 
 def generate_quote_pdf(quote) -> bytes:
@@ -672,26 +705,8 @@ def generate_quote_pdf(quote) -> bytes:
     buf = io.BytesIO()
     page_w, page_h = A4
 
-    # Collect all quotes in the same conversation, ordered oldest-first so
-    # the table reads chronologically. Falls back to [quote] if no session
-    # is attached (e.g. test fixture) or the quote has no conversation.
-    from sqlalchemy.orm import object_session
-    from db.models import Quote as _Quote
-
-    all_quotes: list = [quote]
-    try:
-        sess = object_session(quote)
-    except Exception:
-        sess = None
-    if sess is not None and getattr(quote, "conversation_id", None):
-        fetched = (
-            sess.query(_Quote)
-            .filter_by(conversation_id=quote.conversation_id)
-            .order_by(_Quote.created_at.asc(), _Quote.id.asc())
-            .all()
-        )
-        if fetched:
-            all_quotes = fetched
+    # Collect the conversation's RENDERABLE quotes, oldest-first.
+    all_quotes = _conversation_quotes_for_pdf(quote)
 
     # Frame geometry:
     # - left margin = sidebar (11mm) + breathing room (15mm)

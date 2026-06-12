@@ -485,6 +485,56 @@ def _reply_is_design_upsell(text: str) -> bool:
     return any(k in low for k in _DESIGN_UPSELL_MARKS)
 
 
+# v41.12 — changed-mind supersede. The PDF renders ALL of a conversation's
+# quotes as line items with a grand total (designed for multi-item orders:
+# cards + flyers). But when the customer CHANGES THEIR MIND on the same
+# product ("posters on 190gsm… actually make them the gloss ones"), both
+# pending rows survive and the released PDF sums BOTH variants — an
+# inflated total in front of the customer. When a NEW quote is created for
+# a product that already has older pending quotes in the conversation, the
+# older ones are marked status='superseded' — UNLESS the customer's
+# message signals an ADDITIVE order ("also", "as well", "both"…), in which
+# case both variants are genuinely wanted and both stay.
+_ADDITIVE_INTENT_RX = re.compile(
+    r"\b(also|as\s+well|aswell|plus|both|too|another|add|in\s+addition)\b",
+    re.IGNORECASE,
+)
+
+
+def _supersede_older_pending_quotes(
+    db: Session,
+    conversation_id: int,
+    organization_slug: str,
+    product_key: str | None,
+    keep_quote_id: int,
+    latest_user_message: str | None,
+) -> int:
+    """Mark older pending quotes of the SAME product in the SAME
+    conversation as 'superseded' (changed-mind), keeping `keep_quote_id`.
+    Skipped entirely when the customer's latest message reads additive.
+    Returns how many rows were superseded."""
+    if not product_key:
+        return 0
+    if _ADDITIVE_INTENT_RX.search(latest_user_message or ""):
+        return 0
+    olders = (
+        db.query(Quote)
+        .filter_by(
+            conversation_id=conversation_id,
+            organization_slug=organization_slug,
+            product_key=product_key,
+            status="pending_approval",
+        )
+        .filter(Quote.id != keep_quote_id)
+        .all()
+    )
+    for o in olders:
+        o.status = "superseded"
+    if olders:
+        db.flush()
+    return len(olders)
+
+
 # Contact-info sniffers. LLMs sometimes claim "I've saved your details" without
 # actually calling save_customer_info, which previously left the conversation
 # anonymous and the [QUOTE_READY] gate stuck shut. These regexes scan the
@@ -2944,6 +2994,22 @@ def chat_with_craig(
                     db.add(q)
                     db.flush()  # get the ID
                     last_quote_id = q.id
+                    # v41.12 — changed-mind guard: a NEW quote for a
+                    # product that already has older pending rows in this
+                    # conversation supersedes them (unless the customer's
+                    # message reads additive — "also/both/as well").
+                    _n_sup = _supersede_older_pending_quotes(
+                        db, conversation.id, organization_slug,
+                        _product_key, q.id, _latest_user_msg,
+                    )
+                    if _n_sup:
+                        print(
+                            f"[craig] v41.12 SUPERSEDED {_n_sup} older "
+                            f"pending quote(s) for {_product_key!r} on conv "
+                            f"{conversation.id} (changed mind — new quote "
+                            f"JP-{q.id:04d} wins).",
+                            flush=True,
+                        )
 
             messages.append({
                 "role": "tool",

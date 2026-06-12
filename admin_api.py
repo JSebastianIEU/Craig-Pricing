@@ -515,6 +515,11 @@ class UpdateProductRequest(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     notes: Optional[str] = None
+    # v41.12 — sizes/finishes were serialized in v41.11 but not writable;
+    # the engine validates finishes against these (business cards needed
+    # 'uncoated' added to honour Justin's unlaminated-by-default rule).
+    sizes: Optional[list[str]] = None
+    finishes: Optional[list[str]] = None
     category: Optional[str] = None
     pricing_strategy: Optional[str] = None
     metric_unit: Optional[str] = None
