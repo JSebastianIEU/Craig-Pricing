@@ -1628,7 +1628,7 @@ def _handle_manual_review_escalation(
     specs: dict = {}
     for key in (
         "quantity", "double_sided", "finish",
-        "width_mm", "height_mm", "area_sqm",
+        "width_mm", "height_mm", "area_sqm", "size",
         "format", "binding", "pages", "cover_type",
         "needs_artwork", "artwork_hours",
     ):
@@ -1859,6 +1859,11 @@ def _exec_tool(
                         flush=True,
                     )
                     _size = _extracted
+                    # v41.4 — persist the injected size into args so the
+                    # Quote row (specs=args) records it and the PDF can
+                    # print "Size: A3". Local-var-only injection left
+                    # gate-rescued quotes with no size in their specs.
+                    args["size"] = _extracted
             result = quote_large_format(
                 db,
                 product_key=args["product_key"],
