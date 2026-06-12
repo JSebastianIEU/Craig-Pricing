@@ -386,10 +386,21 @@ _BARE_RATE_RX = re.compile(
     r"(?:per\s+(?:m²|m2|sq(?:uare)?\s*m(?:etre|eter)?s?)|/\s*m²|/\s*m2|euros?\b)",
     re.IGNORECASE,
 )
-# Amounts Craig may legitimately say WITHOUT a pricing tool call: the
-# design service (€65 ex / €79.95 inc), delivery (€15, free over €100)
-# and the standing minimum-order values (€25 large format, €45 vinyl).
-_VERBAL_PRICE_ALLOWLIST = {65.0, 79.95, 15.0, 100.0, 25.0, 45.0}
+# Amounts Craig may legitimately say WITHOUT a pricing tool call — but
+# ONLY in their proper context. v41.8: the report caught Craig pricing a
+# roller banner at "€65 + VAT each" (the DESIGN fee) with no tool call;
+# €65 was on the flat allowlist so the gate waved it through. Now each
+# allowlisted figure is permitted only when its context keyword is in the
+# reply, so a €65 used as a PRODUCT price (no "design"/"hour" nearby) is
+# still flagged.
+_VERBAL_PRICE_CONTEXT = {
+    65.0: ("design", "designer", "artwork", "hour"),
+    79.95: ("design", "designer", "artwork", "hour"),
+    15.0: ("delivery", "shipping", "postage", "courier", "free", "collect"),
+    100.0: ("delivery", "shipping", "free over", "over €100", "over 100"),
+    25.0: ("minimum", "min order", "min "),
+    45.0: ("minimum", "min order", "min "),
+}
 
 # v41.7 — the draft is embedded HERE (not appended as an assistant turn).
 # The first version appended the bad draft to the message list before the
@@ -419,18 +430,24 @@ _PRICE_FALLBACK_TEXT = (
 
 def _contains_unverified_price(text: str) -> bool:
     """True when `text` names a euro amount — or a bare number in an
-    explicit rate/money context ("81 per m²", "120 euros") — outside the
-    allowlist of fixed, prompt-sourced figures (design €65/€79.95,
-    delivery €15/€100, minimums €25/€45). Used by the v41.6/v41.7
-    verbal-price gate."""
+    explicit rate/money context ("81 per m²", "120 euros") — that isn't a
+    fixed, prompt-sourced figure used IN ITS OWN CONTEXT. The allowlisted
+    figures (design €65/€79.95, delivery €15/€100, minimums €25/€45) only
+    pass when their context keyword is in the reply; a €65 used as a
+    product price (no "design"/"hour" nearby) is still flagged. Used by
+    the v41.6/v41.7/v41.8 verbal-price gate."""
+    low = (text or "").lower()
     for rx in (_EURO_AMOUNT_RX, _BARE_RATE_RX):
         for m in rx.finditer(text or ""):
             try:
                 amt = float(m.group(1).replace(",", ""))
             except ValueError:
                 continue
-            if amt not in _VERBAL_PRICE_ALLOWLIST:
-                return True
+            ctx = _VERBAL_PRICE_CONTEXT.get(amt)
+            if ctx is None:
+                return True  # not an allowlisted figure at all
+            if not any(k in low for k in ctx):
+                return True  # allowlisted figure used OUT of its context
     return False
 
 

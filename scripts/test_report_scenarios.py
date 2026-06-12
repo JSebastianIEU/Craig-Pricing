@@ -138,7 +138,7 @@ GROUPS = [
             {
                 "name": "Comp slips — vague + qty later",
                 "style": "vague",
-                "turns": ["do you print compliment slips?", "500"],
+                "turns": ["do you print compliment slips?", "500", "DL size, single sided"],
                 "expect": {"quote_created": True},
             },
         ],

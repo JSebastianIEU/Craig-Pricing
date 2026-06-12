@@ -1354,7 +1354,15 @@ class TestV408PromptWording:
         assert _contains_unverified_price("that comes to €150 + VAT") is True
         assert _contains_unverified_price("from €1,200 for the full run") is True
 
-        # Allowlisted fixed figures pass:
+        # v41.8 — an allowlisted figure used OUT of context is still
+        # flagged: the report caught "roller banners are €65 each" (the
+        # design fee) recited as a product price with no tool call.
+        assert _contains_unverified_price(
+            "Roller banners are €65 + VAT each, hardware included"
+        ) is True
+        assert _contains_unverified_price("that's €15 for the labels") is True
+
+        # Allowlisted fixed figures pass IN their context:
         assert _contains_unverified_price(
             "our design service is €65 ex VAT (€79.95 inc VAT)"
         ) is False
@@ -1375,8 +1383,10 @@ class TestV408PromptWording:
         ) is True
         assert _contains_unverified_price("it's 120 euros for the pair") is True
         assert _contains_unverified_price("roughly 30/m2 for mesh") is True
-        # Allowlisted rate without symbol still passes (vinyl €45/m²):
-        assert _contains_unverified_price("that's 45 per m²") is False
+        # v41.8 — reciting a per-m² rate is flagged even at an allowlisted
+        # value: "45 per m²" is the vinyl rate, not a "minimum order €45",
+        # so without minimum context it must trip (the engine must price).
+        assert _contains_unverified_price("that's 45 per m²") is True
         # Plain counts must NOT trip it:
         assert _contains_unverified_price("50 sets per book, 3-5 working days") is False
         assert _contains_unverified_price("85mm x 55mm, 400gsm silk") is False
