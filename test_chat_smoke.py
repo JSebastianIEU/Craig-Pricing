@@ -1264,6 +1264,73 @@ class TestV408PromptWording:
         # Explicit "I have artwork" → True (unchanged).
         assert _sniff_artwork_answer(last_q, "I have my own artwork") is True
 
+    def test_v41_6_verbal_price_detection(self):
+        """v41.6 — the verbal-price hallucination gate. The test-report
+        suite caught Craig saying '€38 + VAT' for 250 business cards in
+        prose without any pricing tool call (real price €150).
+        _contains_unverified_price must flag every € amount that isn't
+        one of the fixed prompt-sourced figures (design €65/€79.95,
+        delivery €15/€100, minimums €25/€45)."""
+        from llm.craig_agent import (
+            _contains_unverified_price, _PRICE_CORRECTION_MSG,
+            _PRICE_FALLBACK_TEXT,
+        )
+
+        # The actual hallucination from the report run:
+        assert _contains_unverified_price(
+            "250 business cards, double-sided — that's €38 + VAT."
+        ) is True
+        assert _contains_unverified_price("that comes to €150 + VAT") is True
+        assert _contains_unverified_price("from €1,200 for the full run") is True
+
+        # Allowlisted fixed figures pass:
+        assert _contains_unverified_price(
+            "our design service is €65 ex VAT (€79.95 inc VAT)"
+        ) is False
+        assert _contains_unverified_price(
+            "delivery is €15, free over €100"
+        ) is False
+        assert _contains_unverified_price(
+            "minimum order is €45 for vinyl, €25 for large format"
+        ) is False
+        # No euro amount at all:
+        assert _contains_unverified_price("what size are you after?") is False
+        assert _contains_unverified_price("") is False
+
+        # The correction + fallback constants must keep their contracts.
+        assert "NEVER state a price" in _PRICE_CORRECTION_MSG
+        assert "€" not in _PRICE_FALLBACK_TEXT.replace("👍", "")  # fallback never names a price
+
+    def test_v41_6_artwork_gate_anti_hijack_helpers(self):
+        """v41.6 — the unified artwork gate must NOT wipe pre-quote spec
+        questions (letterheads deadlock: 'single or double sided?' was
+        replaced by [ARTWORK_CHOICE] twice in a row), while design-service
+        upsell prose (the v40.8.15 bug class) must STILL be replaced."""
+        from llm.craig_agent import (
+            _reply_asks_spec_question, _reply_is_design_upsell,
+        )
+
+        # The letterheads raw-reply shape: spec question + artwork touch.
+        letterheads = ("Sure! Are they single-sided or double-sided? "
+                       "And do you have print-ready artwork?")
+        assert _reply_asks_spec_question(letterheads) is True
+        assert _reply_is_design_upsell(letterheads) is False
+
+        # Pure upsell prose (conv-380 class) — must still be replaced.
+        upsell = ("No worries! Our designer can sort that — it's €65 ex VAT "
+                  "for an hour of design work. Want me to add it?")
+        assert _reply_is_design_upsell(upsell) is True
+
+        # A spec question fused WITH upsell still counts as upsell.
+        fused = ("Single or double sided? Our design service is €65 if you "
+                 "need artwork made.")
+        assert _reply_asks_spec_question(fused) is True
+        assert _reply_is_design_upsell(fused) is True
+
+        # Non-spec chatter is not a spec question.
+        assert _reply_asks_spec_question("Want me to wrap the quote?") is False
+        assert _reply_asks_spec_question("Got it, thanks!") is False
+
     def test_v40_8_18_ncr_ply_rewritten_to_pt_and_duplicate_preserved(self):
         """v40.8.18 — the _humanize_reply sanitizer now REWRITES the one
         banned token "ply" → "pt" and PRESERVES duplicate/triplicate (the
