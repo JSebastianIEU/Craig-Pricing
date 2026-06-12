@@ -278,6 +278,60 @@ class TestPerSqmZeroOrNegativeQuantity:
         assert isinstance(result, EscalationResult)
 
 
+class TestPerUnitWithoutBulkConfig:
+    """v41.2 — a pure `per_unit` product (only unit_price configured, no
+    bulk_price / bulk_threshold) must price unit_price × qty. The old
+    legacy condition picked product.bulk_price whenever the threshold was
+    unset, so a per_unit product crashed on `None * quantity`. Uses
+    roller_banners mutated in a try/finally so the suite is unaffected."""
+
+    def test_per_unit_only_unit_price_prices_correctly(self):
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug=ORG, key="roller_banners",
+            ).first()
+            saved = (p.pricing_strategy, p.bulk_price, p.bulk_threshold)
+            p.pricing_strategy = "per_unit"
+            p.bulk_price = None
+            p.bulk_threshold = None
+            db.commit()
+            try:
+                result = quote_large_format(
+                    db, product_key="roller_banners", quantity=3,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, QuoteResult), f"got {result}"
+                # unit_price €120 × 3 — bulk must NOT fire (none configured)
+                assert result.final_price_ex_vat == 360.0
+                assert not any("Bulk" in s for s in result.surcharges_applied)
+            finally:
+                p.pricing_strategy, p.bulk_price, p.bulk_threshold = saved
+                db.commit()
+
+    def test_no_prices_at_all_escalates_not_crashes(self):
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug=ORG, key="roller_banners",
+            ).first()
+            saved = (p.pricing_strategy, p.unit_price, p.bulk_price, p.bulk_threshold)
+            p.pricing_strategy = "per_unit"
+            p.unit_price = None
+            p.bulk_price = None
+            p.bulk_threshold = None
+            db.commit()
+            try:
+                result = quote_large_format(
+                    db, product_key="roller_banners", quantity=3,
+                    organization_slug=ORG,
+                )
+                assert isinstance(result, EscalationResult), f"got {result}"
+                assert "unit_price" in result.reason
+            finally:
+                (p.pricing_strategy, p.unit_price,
+                 p.bulk_price, p.bulk_threshold) = saved
+                db.commit()
+
+
 class TestTieredZeroOrNegativeQuantity:
     """v41.1 — non-positive quantity must NEVER produce a price on the
     TIERED paths either. Before the floor guard, a negative qty flowed
