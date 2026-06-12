@@ -1326,9 +1326,27 @@ class TestV408PromptWording:
                 db.refresh(c)
                 assert c.status == "pending_approval"
 
-                # Different product is never touched.
+                # Different product withOUT replacement language is
+                # never touched ("b" survived c/d2's creation).
                 db.refresh(b)
                 assert b.status == "pending_approval"
+
+                # v41.12b — CROSS-PRODUCT mind-change: posters' papers
+                # are separate products ("190gsm… actually the matt
+                # ones" → posters → posters_220gsm_matt). Replacement
+                # language supersedes the MOST RECENT pending row only.
+                e = mk("posters_220gsm_matt", None, 168.0)
+                n3 = _supersede_older_pending_quotes(
+                    db, cid, "just-print", "posters_220gsm_matt", e.id,
+                    "actually make them the 220gsm matt laminated ones instead",
+                )
+                assert n3 == 1
+                # Most recent pending was d2 (flyers matte) — superseded;
+                # the EARLIER multi-item line (c, flyers gloss) stays.
+                db.refresh(d2)
+                db.refresh(c)
+                assert d2.status == "superseded"
+                assert c.status == "pending_approval"
             finally:
                 db.query(Quote).filter_by(conversation_id=cid).delete()
                 db.query(Conversation).filter_by(id=cid).delete()
