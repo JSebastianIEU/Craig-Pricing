@@ -354,6 +354,87 @@ _EXCESS_BLANK_LINES = re.compile(r"\n{3,}")
 # Requires a leading 2/3, so a plain "ply" in unrelated text is left alone.
 _NCR_PLY_TO_PT = re.compile(r"\b([23])\s*-?\s*ply\b", re.IGNORECASE)
 
+# v41.6 — verbal-price hallucination gate. The Product Test Report suite
+# caught Craig answering "250 bizz cards dubble sided?" with "€38 + VAT"
+# in PROSE — no pricing tool call, no Quote row (€38 is the per-100 rate
+# of the 500 tier, leaked from the catalog context; the real price is
+# €150). The existing hallucinated-quote gate only strips [QUOTE_READY]
+# markers, never verbal prices. This gate fires inside the tool loop:
+# a final reply that names a euro amount with NO successful pricing tool
+# call this turn AND no prior quote on the conversation gets ONE
+# corrective retry (system message ordering a tool call or a price-free
+# re-ask); if the retry still names a price, a deterministic safe
+# fallback replaces the reply. Golden rule #1: Craig NEVER invents a
+# price.
+_EURO_AMOUNT_RX = re.compile(r"€\s?(\d[\d,]*(?:\.\d{1,2})?)")
+# Amounts Craig may legitimately say WITHOUT a pricing tool call: the
+# design service (€65 ex / €79.95 inc), delivery (€15, free over €100)
+# and the standing minimum-order values (€25 large format, €45 vinyl).
+_VERBAL_PRICE_ALLOWLIST = {65.0, 79.95, 15.0, 100.0, 25.0, 45.0}
+
+_PRICE_CORRECTION_MSG = (
+    "## PRICE CORRECTION (server gate — do not mention this to the customer)\n"
+    "Your draft reply stated a euro amount, but NO pricing tool was called "
+    "and no quote exists on this conversation. You may NEVER state a price "
+    "from memory — catalog reference prices are NOT quotes. Do ONE of:\n"
+    "1. call the correct quote tool NOW with the customer's quantity/specs; or\n"
+    "2. if specs are missing, ask for them WITHOUT naming any price."
+)
+
+_PRICE_FALLBACK_TEXT = (
+    "Let me double-check that exact price for you rather than guess it 👍 "
+    "Can you confirm the quantity and spec you're after, and I'll get you "
+    "the precise figure?"
+)
+
+
+def _contains_unverified_price(text: str) -> bool:
+    """True when `text` names a euro amount outside the allowlist of
+    fixed, prompt-sourced figures (design €65/€79.95, delivery €15/€100,
+    minimums €25/€45). Used by the v41.6 verbal-price gate."""
+    for m in _EURO_AMOUNT_RX.finditer(text or ""):
+        try:
+            amt = float(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        if amt not in _VERBAL_PRICE_ALLOWLIST:
+            return True
+    return False
+
+
+# v41.6 — artwork-gate anti-hijack helpers. The Product Test Report suite
+# reproduced (twice) a deadlock on letterheads: "250 letterheads please"
+# → Craig's raw reply asked the missing spec ("single or double sided?")
+# but ALSO touched the artwork topic → the unified gate REPLACED the whole
+# reply with the neutral 3-button choice → the spec question was wiped →
+# the customer's answer ("single sided") isn't an artwork answer, so the
+# gate replaced the next reply too → loop, no price ever. The carve-out:
+# pre-quote replies that ask a SPEC question (and aren't a design-service
+# upsell) must pass through — specs first, price next, THEN the buttons
+# (appended by case (a) of the gate).
+_SPEC_QUESTION_RX = re.compile(
+    r"single|double|sided|size|how many|quantity|finish|gloss|matte|"
+    r"soft[- ]touch|pages|cover|binding|paper|dimensions|\bmm\b|format|"
+    r"\ba[0-6]\b|duplicate|triplicate",
+    re.IGNORECASE,
+)
+_DESIGN_UPSELL_MARKS = (
+    "design service", "€65", "design work", "hour of design", "our designer",
+)
+
+
+def _reply_asks_spec_question(text: str) -> bool:
+    """True when the reply is asking the customer for product specs."""
+    return "?" in (text or "") and bool(_SPEC_QUESTION_RX.search(text or ""))
+
+
+def _reply_is_design_upsell(text: str) -> bool:
+    """True when the reply pitches the paid design service in prose —
+    the v40.8.15 bug class that the unified gate MUST keep replacing."""
+    low = (text or "").lower()
+    return any(k in low for k in _DESIGN_UPSELL_MARKS)
+
+
 # Contact-info sniffers. LLMs sometimes claim "I've saved your details" without
 # actually calling save_customer_info, which previously left the conversation
 # anonymous and the [QUOTE_READY] gate stuck shut. These regexes scan the
@@ -2557,6 +2638,8 @@ def chat_with_craig(
     tool_calls_audit: list[dict] = []
     quote_generated = False
     escalated = False
+    # v41.6 — one-shot flag for the verbal-price hallucination gate.
+    _price_correction_done = False
     order_confirmed = False
     last_quote_id: int | None = None
 
@@ -2600,7 +2683,38 @@ def chat_with_craig(
 
         # If no tool calls, we have the final reply
         if not msg.tool_calls:
-            final_reply = msg.content or ""
+            _candidate = msg.content or ""
+            # v41.6 — verbal-price hallucination gate. A euro amount with
+            # no successful pricing tool call this turn and no quote on
+            # the conversation means the model invented (or echoed from
+            # catalog context) a price. One corrective retry; then a
+            # deterministic safe fallback. See _contains_unverified_price.
+            _price_suspect = (
+                not quote_generated
+                and not existing_quotes
+                and not escalated
+                and _contains_unverified_price(_candidate)
+            )
+            if _price_suspect and not _price_correction_done:
+                _price_correction_done = True
+                messages.append({"role": "assistant", "content": _candidate})
+                messages.append({"role": "system", "content": _PRICE_CORRECTION_MSG})
+                print(
+                    f"[craig] v41.6 PRICE GATE: unverified € in reply with no "
+                    f"tool call on conv {conversation.id} — corrective retry. "
+                    f"reply={_candidate[:140]!r}",
+                    flush=True,
+                )
+                continue
+            if _price_suspect and _price_correction_done:
+                print(
+                    f"[craig] v41.6 PRICE GATE: retry STILL contained an "
+                    f"unverified € on conv {conversation.id} — deterministic "
+                    f"fallback. reply={_candidate[:140]!r}",
+                    flush=True,
+                )
+                _candidate = _PRICE_FALLBACK_TEXT
+            final_reply = _candidate
             break
 
         # Append assistant message with tool calls
@@ -2898,17 +3012,51 @@ def chat_with_craig(
             # artwork/design prose (incl. the €65 design upsell)
             # without a marker. Replacing wipes any pushy design-
             # service prose so the customer just gets a clean choice.
-            final_reply = (
-                "No problem 👍 Do you have your own print-ready artwork, "
-                "would you like our design service, or will you send the "
-                "artwork on later?\n\n[ARTWORK_CHOICE]"
-            )
-            print(
-                f"[craig] EMITTED [ARTWORK_CHOICE] on conv "
-                f"{conversation.id} (prior quote / artwork mention / "
-                f"premature upload — v40.8.15).",
-                flush=True,
-            )
+            #
+            # v41.6 — ANTI-HIJACK carve-out. The Product Test Report
+            # reproduced a deadlock (letterheads, both runs): the raw
+            # reply asked the missing SPEC ("single or double sided?")
+            # while also touching the artwork topic — replacing it wiped
+            # the spec question, the customer's answer ("single sided")
+            # isn't an artwork answer, and the gate replaced the next
+            # reply too. Pre-quote spec questions must pass through:
+            # specs first → price → THEN the buttons via case (a).
+            # Design-service upsell prose (the v40.8.15 bug class) is
+            # still always replaced. After a quote exists, a spec
+            # question only passes if the buttons were already shown in
+            # the previous turn (no information is lost — the widget
+            # keeps them on screen).
+            _prev_assistant = ""
+            for _pm in reversed(conversation.messages or []):
+                if isinstance(_pm, dict) and _pm.get("role") == "assistant":
+                    _prev_assistant = _pm.get("content") or ""
+                    break
+            _choice_already_shown = "[ARTWORK_CHOICE]" in _prev_assistant
+            if (
+                _reply_asks_spec_question(final_reply)
+                and not _reply_is_design_upsell(final_reply)
+                and (not _any_quote_exists or _choice_already_shown)
+            ):
+                final_reply = final_reply.replace("[ARTWORK_UPLOAD]", "").rstrip()
+                print(
+                    f"[craig] v41.6 ANTI-HIJACK: kept spec question on conv "
+                    f"{conversation.id} instead of replacing with "
+                    f"[ARTWORK_CHOICE] (pre-quote spec gathering / choice "
+                    f"already shown).",
+                    flush=True,
+                )
+            else:
+                final_reply = (
+                    "No problem 👍 Do you have your own print-ready artwork, "
+                    "would you like our design service, or will you send the "
+                    "artwork on later?\n\n[ARTWORK_CHOICE]"
+                )
+                print(
+                    f"[craig] EMITTED [ARTWORK_CHOICE] on conv "
+                    f"{conversation.id} (prior quote / artwork mention / "
+                    f"premature upload — v40.8.15).",
+                    flush=True,
+                )
         else:
             # (e) — no price, no artwork mention. It's a spec-confirm
             # ("just to confirm: ... ?"), exactly what Rule 3 calls for.
