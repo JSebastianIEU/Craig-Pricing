@@ -281,14 +281,12 @@ TYPE**, NOT a finish option. Don't offer "silk" as a finish.
 
 - **Boards (corri / foamex / dibond)**: NO finish question — they come matt laminated by default.
 
-- **NCR books**: ask the customer "2-part or 3-part?" — that's how the Irish print trade
-  describes the number of carbonless copies. NEVER say "2-ply" / "3-ply" / "duplicate" /
-  "triplicate" to the customer — not even in brackets as an explanation. Do NOT write things
-  like "2-part or 3-part? (that's duplicate or triplicate)". Just say "2-part or 3-part?" and
-  nothing more. When you call the tool, map their answer to the finish value silently:
-  "2-part" / "two part" → finish="duplicate"; "3-part" / "three part" → finish="triplicate".
-  The customer only ever hears "2-part / 3-part"; the duplicate/triplicate mapping stays
-  invisible to them.
+- **NCR books**: ask the customer "duplicate (2pt) or triplicate (3pt)?" — "duplicate" and
+  "triplicate" are the customer-facing words (that's how customers understand the number of
+  carbonless copies). The "(2pt)" / "(3pt)" bracket is a short clarification ("pt" = part).
+  NEVER say "ply" — not "2-ply", "3-ply", "2 ply" or "3 ply". When you call the tool, finish is
+  the same word the customer uses: finish="duplicate" or finish="triplicate" (the customer may
+  also say "2pt"/"3pt"/"2-part"/"3-part" — all mean the same thing).
 
 - **Booklets (A5/A4 saddle-stitch or perfect-bound)**: same "default unlaminated" rule as business
   cards, applied to the COVER. The catalog has 3 cover_type values:
@@ -340,20 +338,15 @@ _MD_NUMBERED_LINE = re.compile(r"^[ \t]*\d+[.)][ \t]+", re.MULTILINE)           
 _MD_HEADING = re.compile(r"^[ \t]*#{1,6}[ \t]+", re.MULTILINE)                   # "## Heading"
 _EXCESS_BLANK_LINES = re.compile(r"\n{3,}")
 
-# v40.8.17 — NCR forbidden-term sanitizer. Justin: customers must never
-# see "duplicate" / "triplicate" / "2-ply" / "3-ply" — only "2-part" /
-# "3-part". The prompt forbids it (incl. "not even in brackets"), but
-# DeepSeek still occasionally "helpfully" explains: "2-part or 3-part?
-# (that's duplicate or triplicate)". This deterministic regex strips any
-# PARENTHETICAL that contains one of the forbidden terms — the only
-# place those words legitimately appear in a customer-facing quote is
-# never, so a parenthetical mentioning them is always the leak. Belt-
-# and-suspenders over the prompt rule (same lesson as the board-size
-# gate: intercept server-side, don't rely on the LLM).
-_NCR_FORBIDDEN_PARENS = re.compile(
-    r"\s*[\(\[][^)\]]*\b(?:duplicate|triplicate|2-ply|3-ply|2 ply|3 ply)\b[^)\]]*[\)\]]",
-    re.IGNORECASE,
-)
+# v40.8.18 — NCR "ply" → "pt". Justin's rule (clarified in the 2026-06-12
+# meeting): customers SEE "duplicate (2pt)" / "triplicate (3pt)" — those
+# words are fine and understood. The ONE banned token is "ply": DeepSeek
+# sometimes improvises a "(2 ply)" / "(3 ply)" bracket. This rewrites any
+# "2 ply" / "3-ply" → "2pt" / "3pt" and leaves duplicate/triplicate
+# untouched. (Replaces the v40.8.17 parenthetical stripper, which wrongly
+# deleted duplicate/triplicate — the over-correction we're undoing.)
+# Requires a leading 2/3, so a plain "ply" in unrelated text is left alone.
+_NCR_PLY_TO_PT = re.compile(r"\b([23])\s*-?\s*ply\b", re.IGNORECASE)
 
 # Contact-info sniffers. LLMs sometimes claim "I've saved your details" without
 # actually calling save_customer_info, which previously left the conversation
@@ -592,10 +585,9 @@ def _humanize_reply(text: str) -> str:
     text = _MD_NUMBERED_LINE.sub("", text)
     # ATX-style headings (## Foo) — drop the #s.
     text = _MD_HEADING.sub("", text)
-    # v40.8.17 — strip any parenthetical that explains NCR copies with
-    # the forbidden internal terms ("...(that's duplicate or
-    # triplicate)..."). Customers only ever see "2-part / 3-part".
-    text = _NCR_FORBIDDEN_PARENS.sub("", text)
+    # v40.8.18 — rewrite any improvised "2 ply"/"3-ply" to "2pt"/"3pt";
+    # duplicate/triplicate stay (they're the customer-facing words).
+    text = _NCR_PLY_TO_PT.sub(r"\1pt", text)
     # Collapse runs of 3+ newlines to 2 (keeps paragraph breaks, kills gaps).
     text = _EXCESS_BLANK_LINES.sub("\n\n", text)
     return text.strip()
@@ -1224,7 +1216,7 @@ TOOLS = [
                     },
                     "finish": {
                         "type": "string",
-                        "description": "Finish option. Valid: gloss, matte, soft-touch, uncoated, duplicate, triplicate. For NCR books, the customer says '2-part' or '3-part' — map '2-part'→duplicate, '3-part'→triplicate (the engine needs the duplicate/triplicate value, the customer hears 2-part/3-part).",
+                        "description": "Finish option. Valid: gloss, matte, soft-touch, uncoated, duplicate, triplicate. For NCR books the customer says 'duplicate (2pt)' or 'triplicate (3pt)' — pass finish='duplicate' or finish='triplicate' (also accept 2pt/3pt/2-part/3-part as the same values).",
                     },
                     "needs_artwork": {
                         "type": "boolean",

@@ -167,8 +167,11 @@ FINISH_ALIASES = {
     "matte": ["matte", "matt", "mat", "satin"],
     "soft_touch": ["soft touch", "soft-touch", "softouch", "velvet", "velvet touch", "soft feel"],
     "uncoated": ["uncoated", "plain", "bond", "natural"],
-    "duplicate": ["duplicate", "dup", "2-part", "2 part", "two part"],
-    "triplicate": ["triplicate", "trip", "3-part", "3 part", "three part"],
+    # v40.8.18 — "2pt"/"3pt" + "ply" forms added so we still UNDERSTAND a
+    # customer who types them (Craig never SAYS "ply"). Closes the gap
+    # where "2pt"/"3pt" fell through to fuzzy-match.
+    "duplicate": ["duplicate", "dup", "2-part", "2 part", "two part", "2pt", "2 pt", "2-ply", "2 ply"],
+    "triplicate": ["triplicate", "trip", "3-part", "3 part", "three part", "3pt", "3 pt", "3-ply", "3 ply"],
 }
 
 _FINISH_TO_KEY = {}

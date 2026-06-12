@@ -1176,39 +1176,54 @@ class TestV408PromptWording:
             "Craig pushing the laminate question on booklets."
         )
 
-    def test_v40_8_14_ncr_part_terminology_in_prompt(self):
-        """v40.8.14 — Justin's NCR docket-books test: Craig said
-        "duplicate (2-ply) or triplicate (3-ply)". The Irish trade says
-        "2-part / 3-part". Prompt must instruct Craig to use 2-part/
-        3-part with the customer while still passing duplicate/triplicate
-        to the engine."""
+    def test_v40_8_18_ncr_duplicate_triplicate_terminology_in_prompt(self):
+        """v40.8.18 — Justin clarified (2026-06-12 meeting) that
+        "duplicate"/"triplicate" ARE the correct customer-facing words.
+        The v40.8.14 over-correction (forcing "2-part/3-part" and banning
+        duplicate/triplicate "not even in brackets") is reverted. The
+        prompt must lead with duplicate/triplicate, clarify with the
+        "(2pt)"/"(3pt)" bracket, and ban only "ply"."""
         from llm.craig_agent import CRAIG_SYSTEM_PROMPT
-        # Must instruct the 2-part/3-part customer-facing wording
-        assert "2-part or 3-part" in CRAIG_SYSTEM_PROMPT, (
-            "Prompt must tell Craig to ask '2-part or 3-part?' for NCR books."
+        # Customer-facing wording: duplicate (2pt) or triplicate (3pt)
+        assert "duplicate (2pt)" in CRAIG_SYSTEM_PROMPT, (
+            'Prompt must tell Craig to ask "duplicate (2pt) ...?" for NCR.'
         )
-        # Must forbid the ply/internal terms to the customer
-        assert "NEVER say" in CRAIG_SYSTEM_PROMPT and "2-ply" in CRAIG_SYSTEM_PROMPT, (
-            "Prompt must forbid '2-ply'/'3-ply' wording to the customer."
+        assert "triplicate (3pt)" in CRAIG_SYSTEM_PROMPT, (
+            'Prompt must include the "triplicate (3pt)" wording.'
         )
-        # Must keep the engine mapping (duplicate/triplicate)
+        # "ply" must be banned (the one forbidden token)
+        assert "ply" in CRAIG_SYSTEM_PROMPT and 'NEVER say "ply"' in CRAIG_SYSTEM_PROMPT, (
+            'Prompt must forbid "ply" for NCR books.'
+        )
+        # The over-correction must be gone
+        assert "not even in brackets" not in CRAIG_SYSTEM_PROMPT, (
+            "The v40.8.14 'not even in brackets' ban must be removed — "
+            "duplicate/triplicate are now allowed customer-facing."
+        )
+        # Engine finish values stay duplicate/triplicate
         assert 'finish="duplicate"' in CRAIG_SYSTEM_PROMPT and 'finish="triplicate"' in CRAIG_SYSTEM_PROMPT, (
-            "Prompt must still map 2-part→duplicate, 3-part→triplicate for "
-            "the engine."
+            "Prompt must still pass finish=duplicate/triplicate to the engine."
         )
 
     def test_v40_8_14_extractor_maps_part_terminology(self):
-        """v40.8.14 — the extractor already maps '2-part'/'3-part' to
-        the engine finish values. Guard against regression."""
+        """v40.8.14/v40.8.18 — the extractor maps every customer phrasing
+        for NCR copies to the engine finish values. The customer may now
+        say 'duplicate'/'triplicate' directly, or '2pt'/'3pt', or the
+        older '2-part'/'3-part'. Guard against regression."""
         from extractor import FINISH_ALIASES
         # FINISH_ALIASES maps canonical finish → list of synonyms
         dup_aliases = FINISH_ALIASES.get("duplicate", [])
         trip_aliases = FINISH_ALIASES.get("triplicate", [])
+        # Canonical word itself + part forms + v40.8.18 "2pt"/"3pt"
+        assert "duplicate" in dup_aliases and "triplicate" in trip_aliases
         assert "2-part" in dup_aliases and "2 part" in dup_aliases, (
             "extractor must map '2-part' → duplicate."
         )
         assert "3-part" in trip_aliases and "3 part" in trip_aliases, (
             "extractor must map '3-part' → triplicate."
+        )
+        assert "2pt" in dup_aliases and "3pt" in trip_aliases, (
+            "v40.8.18 — extractor must map '2pt'/'3pt' → duplicate/triplicate."
         )
 
     def test_v40_8_16_dont_have_artwork_is_ambiguous_not_design(self):
@@ -1249,29 +1264,27 @@ class TestV408PromptWording:
         # Explicit "I have artwork" → True (unchanged).
         assert _sniff_artwork_answer(last_q, "I have my own artwork") is True
 
-    def test_v40_8_17_ncr_sanitizer_strips_forbidden_parenthetical(self):
-        """v40.8.17 — deterministic server-side sanitizer. The prompt
-        forbids 'duplicate'/'triplicate' to the customer, but DeepSeek
-        still occasionally adds '(that's duplicate or triplicate)'. The
-        _humanize_reply sanitizer strips any parenthetical containing the
-        forbidden terms, while leaving legitimate text untouched."""
+    def test_v40_8_18_ncr_ply_rewritten_to_pt_and_duplicate_preserved(self):
+        """v40.8.18 — the _humanize_reply sanitizer now REWRITES the one
+        banned token "ply" → "pt" and PRESERVES duplicate/triplicate (the
+        customer-facing words). This replaces the v40.8.17 stripper, which
+        wrongly deleted duplicate/triplicate."""
         from llm.craig_agent import _humanize_reply
 
-        # Forbidden parentheticals get stripped; 2-part/3-part survives.
-        out = _humanize_reply(
-            "Are you looking for 2-part or 3-part? "
-            "(That's duplicate or triplicate copies per set)"
-        )
-        assert "duplicate" not in out.lower()
-        assert "triplicate" not in out.lower()
-        assert "2-part or 3-part" in out
+        # "ply" bracket → "pt"; duplicate/triplicate survive.
+        out = _humanize_reply("duplicate (2 ply) or triplicate (3 ply)?")
+        assert "ply" not in out.lower(), f"'ply' must be rewritten: {out!r}"
+        assert "duplicate" in out and "triplicate" in out
+        assert "2pt" in out and "3pt" in out
 
-        out2 = _humanize_reply("2-part or 3-part? (that is duplicate or triplicate)")
-        assert "duplicate" not in out2.lower() and "2-part or 3-part" in out2
+        # Hyphenated and no-space ply forms too.
+        assert "2pt" in _humanize_reply("duplicate (2-ply)") and "ply" not in _humanize_reply("duplicate (2-ply)").lower()
+        assert "3pt" in _humanize_reply("triplicate 3ply")
 
-        # 2-ply / 3-ply parentheticals too.
-        out3 = _humanize_reply("2-part or 3-part? (2-ply or 3-ply)")
-        assert "ply" not in out3.lower() and "2-part or 3-part" in out3
+        # Bare duplicate/triplicate is NOT stripped (the bug we're undoing).
+        assert _humanize_reply(
+            "Are these duplicate or triplicate?"
+        ) == "Are these duplicate or triplicate?"
 
         # Legitimate text is untouched.
         assert _humanize_reply("That's €180 + VAT") == "That's €180 + VAT"
@@ -1279,15 +1292,19 @@ class TestV408PromptWording:
             "We offer gloss, matte, or soft-touch"
         ) == "We offer gloss, matte, or soft-touch"
 
-    def test_v40_8_16_ncr_no_parenthetical_leak_rule(self):
-        """v40.8.16 — Craig leaked '(that's duplicate or triplicate)' in
-        brackets. The prompt must forbid the bracketed explanation
-        explicitly, not just forbid the bare terms."""
-        from llm.craig_agent import CRAIG_SYSTEM_PROMPT
-        assert "not even in brackets" in CRAIG_SYSTEM_PROMPT, (
-            "Prompt must forbid the bracketed duplicate/triplicate "
-            "explanation for NCR."
-        )
+    def test_v40_8_18_extractor_understands_ply_input(self):
+        """v40.8.18 — Craig never SAYS "ply", but if a customer types it
+        we must still understand them. The extractor maps the "ply" input
+        forms to the right finish value (the complement to the prompt ban
+        + the _humanize_reply ply→pt rewrite)."""
+        from extractor import match_finish
+        assert match_finish("2 ply") == "duplicate"
+        assert match_finish("2-ply") == "duplicate"
+        assert match_finish("3 ply") == "triplicate"
+        assert match_finish("2pt") == "duplicate"
+        assert match_finish("3pt") == "triplicate"
+        assert match_finish("duplicate") == "duplicate"
+        assert match_finish("triplicate") == "triplicate"
 
     def test_v40_8_15_unified_artwork_choice_gate_covers_prose_and_upload(self):
         """v40.8.15 — the adversarial smoke showed the v40.8.14 guard
