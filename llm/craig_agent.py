@@ -275,13 +275,16 @@ TYPE**, NOT a finish option. Don't offer "silk" as a finish.
   Example: customer "500 cards no laminate" → call quote_small_format(finish="uncoated"), give
   the price.
 
-- **Flyers, leaflets, brochures, NCR books, letterheads, compliment slips**: NO finish question
-  ever. They're standard 170gsm silk paper full-stop. Pass `finish="silk"` (the paper type) to
-  the tool. NEVER offer gloss/matte on these — never say things like "brochures come with a
-  finish option — gloss or matte?". If a customer asks "what finishes do you have?" reply "These
-  come standard on 170gsm silk paper — no separate finish options. What quantity are you
-  after?". If the customer asks for LAMINATED flyers, escalate to Justin (250gsm silk + lam
-  needs a manual quote — different product not in this catalog).
+- **Flyers, leaflets, NCR books, letterheads, compliment slips**: NO finish question ever. They
+  come on their standard stock. Pass `finish="silk"` for flyers/leaflets; for the others just
+  omit finish. NEVER offer gloss/matte on THESE — never say "what finish would you like?". If a
+  customer asks "what finishes do you have?" reply "These come on standard stock — no separate
+  finish options. What quantity are you after?". If the customer asks for LAMINATED flyers,
+  escalate to Justin (different product not in this catalog).
+
+- **Brochures**: these DO come in two finishes — **gloss or matte** (same price). Ask the
+  customer which they'd like, then pass `finish="gloss"` or `finish="matte"` to the tool. (Do
+  NOT pass "silk" — brochures aren't a silk product.)
 
 - **Roller banners, canvas prints, vehicle magnetics**: priced PER UNIT. There are NO standard
   size options in the catalog — NEVER invent or list sizes, and never hold up the price waiting
@@ -824,6 +827,17 @@ def _build_catalog_context(db: Session, organization_slug: str) -> str:
                     "OR `width_mm` + `height_mm` for custom panel sizes "
                     "(engine runs the laydown calculator). Ask the customer "
                     "which size or what dimensions in mm."
+                )
+            elif strategy in ("bulk_break", "per_unit"):
+                # v41.7 — unit-priced products (roller banners, canvas,
+                # vehicle magnetics). The Product Test Report showed the
+                # LLM had NO guidance for these, so it invented "standard
+                # sizes" and stalled. They take ONLY a quantity — no size,
+                # no finish, no dimensions. Call the tool straight away.
+                parts.append(
+                    "  pricing: priced per unit — pass ONLY product_key + "
+                    "quantity to quote_large_format. No size, finish or "
+                    "dimensions exist for this product; never ask for them."
                 )
             if p.notes:
                 parts.append(f"  note: {p.notes.strip()}")

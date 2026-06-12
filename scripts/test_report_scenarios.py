@@ -110,9 +110,10 @@ GROUPS = [
         "products": ["brochures_a4"],
         "scenarios": [
             {
-                "name": "Tri-fold — direct",
+                "name": "Tri-fold — direct (brochures come in gloss/matte)",
                 "style": "direct",
-                "turns": ["500 A4 brochures folded to DL, tri-fold, double sided"],
+                "turns": ["500 A4 brochures folded to DL, tri-fold, double sided",
+                          "gloss please"],
                 "expect": {"quote_created": True},
             },
             {
