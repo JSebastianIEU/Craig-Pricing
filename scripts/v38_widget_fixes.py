@@ -269,16 +269,17 @@ def _seed_posters_product(db) -> None:
             organization_slug=org_slug, key="posters",
         ).first()
         if existing:
-            print(f"  - posters (org={org_slug}): already exists")
-            # Still ensure manual_review_required is set in case someone
-            # manually flipped it off.
-            if not existing.manual_review_required:
-                existing.manual_review_required = True
-                existing.manual_review_reason = (
-                    "Poster pricing varies by size, paper weight, "
-                    "finish — needs Justin's quote"
-                )
-                print(f"     (re-set manual_review_required=True)")
+            # v41.5 — DO NOT touch an existing posters row. The original
+            # "re-set manual_review_required=True in case someone manually
+            # flipped it off" branch silently reverted the operator's
+            # configuration on EVERY container boot — exactly the board-
+            # strategy revert bug (v40.8.11/v40.8.13) in a new costume.
+            # It bit for real on 2026-06-12: posters were loaded with 900
+            # price tiers and flipped to auto-quote via the bulk-import
+            # API, and the next deploy's startup pass flipped them back to
+            # manual_review. Seeding is for MISSING rows only; existing
+            # rows belong to the operator.
+            print(f"  - posters (org={org_slug}): already exists (left untouched)")
         else:
             p = Product(
                 organization_slug=org_slug,

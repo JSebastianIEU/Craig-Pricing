@@ -347,3 +347,50 @@ class TestV2DoesNotRevertTieredBoards:
             # v38 (the canonical content for TestV38PromptContracts).
             from scripts.v38_widget_fixes import migrate as v38_migrate
             v38_migrate()
+
+
+class TestV38DoesNotRevertPricedPosters:
+    """v41.5 — protects against the v38 seeder silently flipping the
+    posters product back to manual_review on every container boot. Bit
+    for real on 2026-06-12: posters were loaded with 900 price tiers and
+    flipped to auto-quote via the bulk-import API, and the next deploy's
+    startup pass re-set manual_review_required=True (with the stale
+    reason text), so every 190gsm poster request escalated again. Same
+    class of bug as the v36/v2 board-strategy revert (v40.8.11/13)."""
+
+    def test_v38_leaves_priced_posters_untouched(self):
+        from db import db_session
+        from db.models import Product
+        from scripts.v38_widget_fixes import _seed_posters_product
+
+        with db_session() as db:
+            p = db.query(Product).filter_by(
+                organization_slug="just-print", key="posters",
+            ).first()
+            if p is None:
+                import pytest
+                pytest.skip("posters missing from local seed")
+
+            snap = (p.pricing_strategy, p.manual_review_required,
+                    p.manual_review_reason)
+            try:
+                # Put it in the post-load state: priced, auto-quote ON.
+                p.pricing_strategy = "tiered"
+                p.manual_review_required = False
+                p.manual_review_reason = ""
+                db.commit()
+
+                # Re-run the seeder (what every container boot does).
+                _seed_posters_product(db)
+                db.commit()
+                db.refresh(p)
+
+                assert p.manual_review_required is False, (
+                    "v38 seeder re-flipped posters to manual_review — "
+                    "the boot-revert bug is back."
+                )
+                assert p.pricing_strategy == "tiered"
+            finally:
+                (p.pricing_strategy, p.manual_review_required,
+                 p.manual_review_reason) = snap
+                db.commit()
